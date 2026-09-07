@@ -23,6 +23,7 @@
 | 6 | [sphere.html](sphere.html) | 索引网格 + Blinn-Phong 光照 |
 | 7 | [pick-cpu.html](pick-cpu.html) | CPU 拾取：鼠标反投影成射线，JS 里打球 / AABB |
 | 8 | [pick-gpu.html](pick-gpu.html) | GPU 拾取：离屏 ID 色 + `readPixels` |
+| 8b | [pick-gpu-instance.html](pick-gpu-instance.html) | 上万实例：`drawElementsInstanced` + `gl_InstanceID` 当 id |
 | 9 | [collision.html](collision.html) | 碰撞：球–球 / AABB–AABB / 球–AABB，可分离可弹 |
 | 10 | [shadow-map.html](shadow-map.html) | 阴影：灯光深度图 + 比较，bias / PCF |
 | 11 | [pcss.html](pcss.html) | 软阴影：blocker 搜索 + 半影宽度可变 PCF |
@@ -71,6 +72,7 @@
 | 多套物体 | 多套 program + VAO；每帧 `useProgram` → 绑 VAO → 设 uniform → draw | `wind-field.html`（地形 / 箭头 / 流线） |
 | CPU 拾取 | 鼠标 → NDC → `(P·V)⁻¹` 成射线；JS 里 `hitSphere` / `hitAABB` | `pick-cpu.html` |
 | GPU 拾取 | 离屏 FBO 平涂 ID 色；`readPixels` 1px 还原 id | `pick-gpu.html` |
+| 实例化拾取 | 一次 `drawElementsInstanced`；`gl_InstanceID` 拆成 RGB | `pick-gpu-instance.html` |
 | 碰撞检测 | 球–球中心距；AABB 最短轴；球到盒子最近点；MTV 推开 | `collision.html` |
 | 阴影图 | 灯光正交 VP 写深度；片元变到灯光空间再比较 | `shadow-map.html` |
 | PCSS | 搜 blocker → 估 penumbra → 变半径 PCF | `pcss.html` |

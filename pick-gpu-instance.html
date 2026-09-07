@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>WebGL2 · GPU pick</title>
+  <title>WebGL2 · GPU pick + instancing</title>
   <style>
     :root {
       --bg: #0b0d14;
@@ -64,12 +64,6 @@
       white-space: pre;
     }
     .note { color: var(--muted); font-size: 13px; margin-top: 10px; }
-    .controls {
-      display: flex; flex-wrap: wrap; gap: 10px 16px;
-      margin-top: 12px; align-items: center;
-      color: var(--muted); font-size: 13px;
-    }
-    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
     .hint {
       margin: 10px 0 0;
       padding: 10px 12px;
@@ -90,32 +84,33 @@
 </head>
 <body>
   <header>
-    <h1>GPU pick：离屏平涂 ID 色，readPixels 读 1 个像素</h1>
+    <h1>上万实例：一次 draw，用 gl_InstanceID 当 pick id</h1>
     <p>
-      不在 JS 里求交。用同一套 MVP 把每个物体涂成独一无二的 ID 色，深度测试决定谁留在像素上，再 <b>readPixels</b> 还原 id。
-      对照：<a href="pick-cpu.html">CPU pick</a>。
+      一万个立方体不是循环一万次 <code>draw</code>。位置放在实例缓冲里，
+      <b>drawElementsInstanced(..., 10000)</b> 一次画完。
+      ID 趟同样一次 draw：<code>gl_InstanceID + 1</code> 拆进 RGB。对照：<a href="pick-gpu.html">逐物体 GPU pick</a>。
     </p>
   </header>
 
   <div class="layout">
     <div>
       <section class="stage">
-        <h2>1. ID 缓冲怎么来</h2>
+        <h2>1. 为什么能撑上万</h2>
         <div class="pipe">
-          <span>同一套 MVP</span>
-          <span>→ 离屏 FBO</span>
-          <span class="gpu">每物体一种 ID 色</span>
-          <span class="gpu">深度测试</span>
+          <span>1 个立方体 mesh</span>
+          <span>N 份 offset</span>
+          <span class="gpu">1 次 instanced draw</span>
+          <span class="gpu">gl_InstanceID → RGB</span>
           <span>readPixels 1px</span>
         </div>
         <ol class="steps">
-          <li>FBO 里关掉光照、关掉抗锯齿。片元只输出 <code>id → RGB</code>。</li>
-          <li>深度照常开：谁离相机近，谁的 ID 留在那个像素上。</li>
-          <li><code>readPixels</code> 读鼠标那 1 个像素，把 RGB 还原成整数 id。</li>
-          <li>清成黑色 = id 0 = 背景。本页：<code>id = R + G·256 + B·65536</code>。</li>
+          <li>CPU 只上传一份顶点 + 一份 <code>N×vec3</code> 位置。JS 不再按物体循环 draw。</li>
+          <li>VS 里 <code>a_offset</code> 的 divisor=1：每个实例换一个平移，顶点还是那 24 个。</li>
+          <li>GPU 自动把 <code>gl_InstanceID</code> 编成 0…N−1。Pick 用 <code>id = gl_InstanceID + 1</code>（0 留给背景）。</li>
+          <li>屏幕一趟、ID 一趟，各 <b>1 次</b> draw。上一课 6 个物体是 6 次。</li>
         </ol>
         <p class="note">
-          结果和屏幕像素一致，复杂网格也一样快。代价是多一次 draw，以及 <code>readPixels</code> 会让 GPU 和 CPU 同步。没有 3D 交点。
+          上万个简单盒子，CPU AABB 仍然可以很快。本页要看的是：GPU pick 只有合批 / 实例化之后，才不会被一万次 API 调用拖死。
         </p>
       </section>
     </div>
@@ -123,10 +118,7 @@
     <div>
       <canvas id="c" width="720" height="520"></canvas>
       <div id="err"></div>
-      <p class="legend">移动鼠标拾取 · 拖动旋转相机 · 地面没有 ID</p>
-      <div class="controls">
-        <label><input id="pickDepth" type="checkbox" checked /> pick 开深度</label>
-      </div>
+      <p class="legend">100×100 = 10000 个实例 · 移动鼠标拾取 · 拖动旋转相机</p>
       <p class="hint" id="hint">把鼠标移进画布。</p>
     </div>
   </div>
@@ -134,28 +126,31 @@
   <div class="layout" style="padding-top:0">
     <section class="stage">
       <h2>2. 本页真正在跑的核心</h2>
-<pre><code>bindFramebuffer(pickFbo);
-clear; // 黑 = id 0
-drawEachObject(idColor);   // 无光照，有深度
+<pre><code>// VS：每个实例自动拿到 0,1,2,… 
+int id = gl_InstanceID + 1;
+v_idColor = vec3(
+  float(id & 255) / 255.0,
+  float((id >> 8) & 255) / 255.0,
+  float((id >> 16) & 255) / 255.0
+);
+world = a_pos * size + a_offset;   // a_offset 每实例一份
 
-// GPU Y 在左下，鼠标 Y 在左上，必须翻转
-const px = floor(cssX * canvas.width  / cssW);
-const py = canvas.height - 1 - floor(cssY * canvas.height / cssH);
+vertexAttribDivisor(a_offset, 1);
+drawElementsInstanced(TRIANGLES, cubeIndexCount, UNSIGNED_SHORT, 0, 10000);
+
+// 和上一课一样读 1 个像素
 readPixels(px, py, 1, 1, RGBA, UNSIGNED_BYTE, pixel);
-const id = pixel[0] + pixel[1] * 256 + pixel[2] * 65536;</code></pre>
-      <p class="note">
-        ID 缓冲不要开 MSAA：抗锯齿会把相邻 ID 混成非法颜色。
-        上一课射线求交见 <a href="pick-cpu.html" style="color:#f3d27a">pick-cpu.html</a>。
-        上万个实例见 <a href="pick-gpu-instance.html" style="color:#f3d27a">pick-gpu-instance.html</a>。
-      </p>
+const i = R + G*256 + B*65536 - 1;   // gl_InstanceID
+const model = models[i];             // 业务对象，和 offsets 下标对齐</code></pre>
+      <p class="note">不要在 JS 里按物体循环画 ID。像素里只有整数下标，真正的 <code>node-行-列</code> 在 <code>models[i]</code>。</p>
     </section>
 
     <section class="stage">
-      <h2>3. 对照着拧开关看</h2>
+      <h2>3. 对照着看</h2>
       <ol class="steps">
-        <li>关掉「pick 开深度」：后画的物体会盖住前面的 ID，和没深度的绘制一样。</li>
-        <li>提示里的 rgb 就是刚读到的那一个像素。id 1 的红球是 <code>(1,0,0)</code>。</li>
-        <li>没有黄点：GPU pick 只拿到颜色，不算出 3D 交点。</li>
+        <li>提示里的 <code>model.id</code> 来自 JS 的 <code>models[i]</code>，不是像素里的字符串。</li>
+        <li>打开浏览器 GPU 计时：每帧屏幕 1 次 + pick 1 次，不会出现一万次 draw。</li>
+        <li>上一课每个物体一次 <code>drawElements</code>，到上万就会卡在 CPU 提交，不在求交。</li>
       </ol>
     </section>
   </div>
@@ -164,7 +159,6 @@ const id = pixel[0] + pixel[1] * 256 + pixel[2] * 65536;</code></pre>
 const canvas = document.getElementById("c");
 const errBox = document.getElementById("err");
 const hintEl = document.getElementById("hint");
-const pickDepthEl = document.getElementById("pickDepth");
 
 function fail(msg) {
   errBox.style.display = "block";
@@ -212,18 +206,6 @@ function identity() {
   return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
 }
 
-function translate(m, x, y, z) {
-  const t = identity();
-  t[12] = x; t[13] = y; t[14] = z;
-  return mul(m, t);
-}
-
-function scaleMat(sx, sy, sz) {
-  const m = identity();
-  m[0] = sx; m[5] = sy; m[10] = sz;
-  return m;
-}
-
 function perspective(fovY, aspect, near, far) {
   const f = 1 / Math.tan(fovY / 2);
   const nf = 1 / (near - far);
@@ -252,72 +234,68 @@ function lookAt(eye, center, up) {
   ]);
 }
 
+const COLS = 100;
+const ROWS = 100;
+const COUNT = COLS * ROWS;
+const SIZE = 0.085;
+const GAP = 0.20;
+
 const VS = `#version 300 es
 layout(location = 0) in vec3 a_pos;
 layout(location = 1) in vec3 a_normal;
-uniform mat4 u_mvp;
-uniform mat4 u_model;
+layout(location = 2) in vec3 a_offset;
+uniform mat4 u_vp;
+uniform float u_size;
+uniform int u_highlight;
+flat out vec3 v_idColor;
 out vec3 v_normal;
+out float v_litBoost;
 void main() {
-  v_normal = mat3(u_model) * a_normal;
-  gl_Position = u_mvp * vec4(a_pos, 1.0);
+  int id = gl_InstanceID + 1;
+  v_idColor = vec3(
+    float(id & 255) / 255.0,
+    float((id >> 8) & 255) / 255.0,
+    float((id >> 16) & 255) / 255.0
+  );
+  v_normal = a_normal;
+  v_litBoost = (gl_InstanceID == u_highlight) ? 1.0 : 0.0;
+  vec3 world = a_pos * u_size + a_offset;
+  gl_Position = u_vp * vec4(world, 1.0);
 }`;
 
 const FS = `#version 300 es
 precision mediump float;
+flat in vec3 v_idColor;
 in vec3 v_normal;
-uniform vec3 u_color;
+in float v_litBoost;
+uniform float u_pick;
 uniform vec3 u_lightDir;
-uniform float u_lit;
-uniform float u_emissive;
 out vec4 outColor;
 void main() {
-  if (u_lit < 0.5) {
-    outColor = vec4(u_color, 1.0);
+  if (u_pick > 0.5) {
+    outColor = vec4(v_idColor, 1.0);
     return;
   }
   vec3 N = normalize(v_normal);
   float ndl = max(dot(N, normalize(u_lightDir)), 0.0);
-  outColor = vec4(u_color * (0.28 + 0.72 * ndl) + vec3(u_emissive), 1.0);
+  float h = fract(v_idColor.r * 17.0 + v_idColor.g * 9.0);
+  vec3 albedo = mix(vec3(0.28, 0.50, 0.88), vec3(0.88, 0.48, 0.26), h);
+  if (v_litBoost > 0.5) albedo = vec3(1.0, 0.92, 0.35);
+  outColor = vec4(albedo * (0.22 + 0.78 * ndl), 1.0);
 }`;
 
 const prog = link(VS, FS);
-const uMvp = gl.getUniformLocation(prog, "u_mvp");
-const uModel = gl.getUniformLocation(prog, "u_model");
-const uColor = gl.getUniformLocation(prog, "u_color");
+const uVp = gl.getUniformLocation(prog, "u_vp");
+const uSize = gl.getUniformLocation(prog, "u_size");
+const uHighlight = gl.getUniformLocation(prog, "u_highlight");
+const uPick = gl.getUniformLocation(prog, "u_pick");
 const uLightDir = gl.getUniformLocation(prog, "u_lightDir");
-const uLit = gl.getUniformLocation(prog, "u_lit");
-const uEmissive = gl.getUniformLocation(prog, "u_emissive");
 
-function createSphere(radius, stacks, slices) {
-  const pos = [];
-  const nrm = [];
-  const idx = [];
-  for (let i = 0; i <= stacks; i++) {
-    const theta = (i / stacks) * Math.PI;
-    const sinT = Math.sin(theta), cosT = Math.cos(theta);
-    for (let j = 0; j <= slices; j++) {
-      const phi = (j / slices) * Math.PI * 2;
-      const x = sinT * Math.cos(phi), y = cosT, z = sinT * Math.sin(phi);
-      pos.push(radius * x, radius * y, radius * z);
-      nrm.push(x, y, z);
-    }
-  }
-  const stride = slices + 1;
-  for (let i = 0; i < stacks; i++) {
-    for (let j = 0; j < slices; j++) {
-      const a = i * stride + j;
-      const b = a + stride;
-      idx.push(a, b, a + 1, a + 1, b, b + 1);
-    }
-  }
-  return {
-    positions: new Float32Array(pos),
-    normals: new Float32Array(nrm),
-    indices: new Uint16Array(idx),
-  };
-}
 
+// Float32Array 和 Uint16Array 是两个不同的数组类型，分别用于存储浮点数和无符号16位整数。
+// Float32Array
+// 32 bit = IEEE 754 单精度浮点（1 位符号 + 8 位指数 + 23 位尾数）
+//每个元素占 4 字节（32 bit ÷ 8）
 function createCube() {
   const faces = [
     { n: [ 0, 0, 1], v: [[-1,-1, 1],[ 1,-1, 1],[ 1, 1, 1],[-1, 1, 1]] },
@@ -336,7 +314,9 @@ function createCube() {
       pos.push(p[0], p[1], p[2]);
       nrm.push(f.n[0], f.n[1], f.n[2]);
     }
+    // 0 1 2  0 2 3 代表俩个三角形
     idx.push(base, base+1, base+2, base, base+2, base+3);
+    // 推出了新的顶点，所以base要加4
     base += 4;
   }
   return {
@@ -346,59 +326,58 @@ function createCube() {
   };
 }
 
-function makeMesh(mesh) {
-  const vao = gl.createVertexArray();
-  gl.bindVertexArray(vao);
-  const posBuf = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
-  gl.bufferData(gl.ARRAY_BUFFER, mesh.positions, gl.STATIC_DRAW);
-  gl.enableVertexAttribArray(0);
-  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-  const nrmBuf = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, nrmBuf);
-  gl.bufferData(gl.ARRAY_BUFFER, mesh.normals, gl.STATIC_DRAW);
-  gl.enableVertexAttribArray(1);
-  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-  const ibo = gl.createBuffer();
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
-  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
-  gl.bindVertexArray(null);
-  return { vao, count: mesh.indices.length };
+const cube = createCube();
+const offsets = new Float32Array(COUNT * 3);
+const models = new Array(COUNT);
+for (let i = 0; i < COUNT; i++) {
+  const col = i % COLS;
+  const row = (i / COLS) | 0;
+  offsets[i * 3]     = (col - (COLS - 1) / 2) * GAP;
+  offsets[i * 3 + 1] = SIZE;
+  offsets[i * 3 + 2] = (row - (ROWS - 1) / 2) * GAP;
+  // 和下标 i 对齐。改这里就能换成你的 uuid / 节点名
+  models[i] = {
+    id: `node-${row}-${col}`,
+    row,
+    col,
+  };
 }
 
-const sphereDraw = makeMesh(createSphere(1, 24, 32));
-const cubeDraw = makeMesh(createCube());
-const floorDraw = makeMesh({
-  positions: new Float32Array([-4,0,-4, 4,0,-4, 4,0,4, -4,0,4]),
-  normals: new Float32Array([0,1,0, 0,1,0, 0,1,0, 0,1,0]),
-  indices: new Uint16Array([0, 1, 2, 0, 2, 3]),
-});
+//  bindVertexArray(vao)     
+//  开始往这份记录本上写
+//  bind 位置 / 法线 / offset、divisor
+//  bind ELEMENT_ARRAY_BUFFER  ← 索引也记在这份 VAO 里
+//  bindVertexArray(null)    // 合上记录本
+//  创建时 bind 用来填写；填完 bind(null) 合上；draw 前再 bind 打开。 null ≠ 销毁。
 
-function idColor(id) {
-  return [
-    (id & 255) / 255,
-    ((id >> 8) & 255) / 255,
-    ((id >> 16) & 255) / 255,
-  ];
-}
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+const posBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+gl.bufferData(gl.ARRAY_BUFFER, cube.positions, gl.STATIC_DRAW);
+// 打开第 n 号输入，draw 时从绑定的 VBO 里取数。
+gl.enableVertexAttribArray(0);
+// 同一套 n：告诉 GPU「第 n 号属性，每组 3 个 float，从当前 ARRAY_BUFFER 读」
+gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
 
-const objects = [
-  { id: 1, name: "红球",   kind: "sphere", center: [-0.95, 0.38,  0.15], radius: 0.38, color: [0.86, 0.28, 0.24] },
-  { id: 2, name: "橙立方", kind: "box",    center: [ 0.10, 0.32,  0.70], half: [0.32, 0.32, 0.32], color: [0.90, 0.52, 0.18] },
-  { id: 3, name: "黄球",   kind: "sphere", center: [ 0.95, 0.34, -0.10], radius: 0.34, color: [0.92, 0.78, 0.22] },
-  { id: 4, name: "绿立方", kind: "box",    center: [-0.20, 0.22, -0.90], half: [0.28, 0.22, 0.40], color: [0.28, 0.70, 0.42] },
-  { id: 5, name: "蓝球",   kind: "sphere", center: [ 0.55, 0.72, -0.55], radius: 0.28, color: [0.28, 0.52, 0.92] },
-  { id: 6, name: "紫立方", kind: "box",    center: [-0.78, 0.20, -0.55], half: [0.22, 0.20, 0.22], color: [0.62, 0.36, 0.86] },
-];
+const nrmBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, nrmBuf);
+gl.bufferData(gl.ARRAY_BUFFER, cube.normals, gl.STATIC_DRAW);
+gl.enableVertexAttribArray(1);
+gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
 
-function modelOf(obj) {
-  if (obj.kind === "sphere") {
-    const r = obj.radius;
-    return mul(translate(identity(), obj.center[0], obj.center[1], obj.center[2]), scaleMat(r, r, r));
-  }
-  const h = obj.half;
-  return mul(translate(identity(), obj.center[0], obj.center[1], obj.center[2]), scaleMat(h[0], h[1], h[2]));
-}
+const offBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, offBuf);
+gl.bufferData(gl.ARRAY_BUFFER, offsets, gl.STATIC_DRAW);
+gl.enableVertexAttribArray(2);
+gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
+//每画 1 个实例，偏移就取数组里的下一个 vec3
+gl.vertexAttribDivisor(2, 1);
+
+const ibo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, cube.indices, gl.STATIC_DRAW);
+gl.bindVertexArray(null);
 
 let pickFbo = null;
 let pickTex = null;
@@ -416,74 +395,33 @@ function ensurePickFbo(w, h) {
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  // 创建纹理并设置采样方法以及存储空间
   pickDepthRb = gl.createRenderbuffer();
   gl.bindRenderbuffer(gl.RENDERBUFFER, pickDepthRb);
   gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
-  // 开辟一个存储深度的16bit内存
   pickFbo = gl.createFramebuffer();
   gl.bindFramebuffer(gl.FRAMEBUFFER, pickFbo);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, pickTex, 0);
   gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, pickDepthRb);
-  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
-    fail("pick FBO 不完整");
-  }
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) fail("pick FBO 不完整");
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  // 解绑，绘制目标回到 默认 framebuffer（canvas）。
-  // FBO 已经配好，只是当前不要画进去。真正画 ID 在 renderPick 里再 bind 一次；主场景保持画屏幕。
-
-  // null 不是销毁。对象还在，pickFbo / pickTex / pickDepthRb 都留着。
   fboW = w;
   fboH = h;
 }
 
-function drawMesh(draw, model, mvp, color, lit, emissive) {
-  gl.uniformMatrix4fv(uMvp, false, mvp);
-  gl.uniformMatrix4fv(uModel, false, model);
-  gl.uniform3fv(uColor, color);
-  gl.uniform1f(uLit, lit);
-  gl.uniform1f(uEmissive, emissive);
-  gl.bindVertexArray(draw.vao);
-  gl.drawElements(gl.TRIANGLES, draw.count, gl.UNSIGNED_SHORT, 0);
-}
-
-function drawObjects(viewProj, asId, highlightId) {
-  for (const obj of objects) {
-    const model = modelOf(obj);
-    const mvp = mul(viewProj, model);
-    const draw = obj.kind === "sphere" ? sphereDraw : cubeDraw;
-    if (asId) {
-      drawMesh(draw, model, mvp, idColor(obj.id), 0, 0);
-    } else {
-      const glow = obj.id === highlightId ? 0.22 : 0;
-      const col = obj.id === highlightId
-        ? [Math.min(1, obj.color[0]*1.25), Math.min(1, obj.color[1]*1.25), Math.min(1, obj.color[2]*1.25)]
-        : obj.color;
-      drawMesh(draw, model, mvp, col, 1, glow);
-    }
-  }
-}
-
-function renderPick(viewProj) {
-  gl.bindFramebuffer(gl.FRAMEBUFFER, pickFbo);
-  gl.viewport(0, 0, canvas.width, canvas.height);
-  // 禁用混合，因为不需要混合颜色
-  gl.disable(gl.BLEND);
-  if (pickDepthEl.checked) gl.enable(gl.DEPTH_TEST);
-  else gl.disable(gl.DEPTH_TEST);
-  gl.clearColor(0, 0, 0, 1);
-  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+function drawInstanced(vp, pick, highlight) {
   gl.useProgram(prog);
-  drawObjects(viewProj, true, -1);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.enable(gl.DEPTH_TEST);
+  gl.bindVertexArray(vao);
+  gl.uniformMatrix4fv(uVp, false, vp);
+  gl.uniform1f(uSize, SIZE);
+  gl.uniform1i(uHighlight, highlight);
+  gl.uniform1f(uPick, pick ? 1 : 0);
+  gl.uniform3f(uLightDir, 0.4, 0.85, 0.35);
+  gl.drawElementsInstanced(gl.TRIANGLES, cube.indices.length, gl.UNSIGNED_SHORT, 0, COUNT);
 }
 
 const pixel = new Uint8Array(4);
-let yaw = 0.62;
-let pitch = 0.32;
+let yaw = 0.35;
+let pitch = 0.72;
 let dragging = false;
 let lastX = 0;
 let lastY = 0;
@@ -506,7 +444,7 @@ canvas.addEventListener("pointermove", (e) => {
   mouseInside = cssX >= 0 && cssY >= 0 && cssX < rect.width && cssY < rect.height;
   if (!dragging) return;
   yaw -= (e.clientX - lastX) * 0.005;
-  pitch = Math.max(-0.12, Math.min(1.15, pitch + (e.clientY - lastY) * 0.005));
+  pitch = Math.max(0.12, Math.min(1.35, pitch + (e.clientY - lastY) * 0.005));
   lastX = e.clientX;
   lastY = e.clientY;
 });
@@ -529,20 +467,27 @@ function frame() {
   resize();
   ensurePickFbo(canvas.width, canvas.height);
 
-  const dist = 4.4;
+  const dist = 22;
   const eye = [
     Math.sin(yaw) * Math.cos(pitch) * dist,
-    0.55 + Math.sin(pitch) * dist,
+    1.2 + Math.sin(pitch) * dist,
     Math.cos(yaw) * Math.cos(pitch) * dist,
   ];
-  const proj = perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 50);
-  const view = lookAt(eye, [0, 0.35, 0], [0, 1, 0]);
-  const viewProj = mul(proj, view);
+  const vp = mul(
+    perspective(Math.PI / 4, canvas.width / canvas.height, 0.2, 80),
+    lookAt(eye, [0, 0, 0], [0, 1, 0])
+  );
   const rect = canvas.getBoundingClientRect();
 
-  renderPick(viewProj);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, pickFbo);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.disable(gl.BLEND);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  drawInstanced(vp, true, -1);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-  let hit = null;
+  let hitId = 0;
   let elapsed = 0;
   if (mouseInside) {
     const t0 = performance.now();
@@ -550,34 +495,30 @@ function frame() {
     const py = Math.max(0, Math.min(canvas.height - 1, canvas.height - 1 - Math.floor(cssY * canvas.height / rect.height)));
     gl.bindFramebuffer(gl.FRAMEBUFFER, pickFbo);
     gl.readPixels(px, py, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null); // 解绑，绘制目标回到 默认 framebuffer（canvas）。
-    console.log(pixel);
-    const id = pixel[0] + pixel[1] * 256 + pixel[2] * 65536;
-    const obj = objects.find((o) => o.id === id);
-    hit = obj || null;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    hitId = pixel[0] + pixel[1] * 256 + pixel[2] * 65536;
     elapsed = performance.now() - t0;
   }
 
+  const highlight = hitId >= 1 && hitId <= COUNT ? hitId - 1 : -1;
+
   gl.viewport(0, 0, canvas.width, canvas.height);
-  gl.enable(gl.DEPTH_TEST);
   gl.clearColor(0.045, 0.055, 0.08, 1);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-  gl.useProgram(prog);
-  gl.uniform3f(uLightDir, 0.45, 0.8, 0.35);
-
-  const floorModel = identity();
-  drawMesh(floorDraw, floorModel, mul(viewProj, floorModel), [0.14, 0.16, 0.20], 1, 0);
-  drawObjects(viewProj, false, hit ? hit.id : -1);
+  drawInstanced(vp, false, highlight);
 
   if (!mouseInside) {
     hintEl.className = "hint";
-    hintEl.textContent = "把鼠标移进画布。";
-  } else if (!hit) {
+    hintEl.textContent = `实例 ${COUNT} · 每帧 2 次 drawElementsInstanced`;
+  } else if (!hitId) {
     hintEl.className = "hint";
-    hintEl.textContent = `未击中   ${elapsed.toFixed(2)} ms`;
+    hintEl.textContent = `未击中  ${elapsed.toFixed(2)} ms`;
   } else {
+    const i = hitId - 1;
+    const model = models[i];
     hintEl.className = "hint hit";
-    hintEl.textContent = `${hit.name}  id=${hit.id}  ${elapsed.toFixed(2)} ms`;
+    hintEl.textContent =
+      `gl_InstanceID=${i}  像素id=${hitId}  model.id=${model.id}  ${elapsed.toFixed(2)} ms`;
   }
 }
 
