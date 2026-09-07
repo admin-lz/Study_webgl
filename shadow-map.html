@@ -64,18 +64,6 @@
       white-space: pre;
     }
     .note { color: var(--muted); font-size: 13px; margin-top: 10px; }
-    .stage-wrap { position: relative; }
-    .map-label {
-      display: none;
-      position: absolute;
-      right: 22px;
-      bottom: 16px;
-      color: #c9d6e8;
-      font-size: 11px;
-      text-shadow: 0 1px 4px #000;
-      pointer-events: none;
-    }
-    .map-label.on { display: block; }
     .controls {
       display: flex; flex-wrap: wrap; gap: 10px 16px;
       margin-top: 12px; align-items: center;
@@ -131,17 +119,12 @@
     </div>
 
     <div>
-      <div class="stage-wrap">
-        <canvas id="c" width="720" height="520"></canvas>
-        <div class="map-label" id="mapLabel">右下角 = 灯光深度图</div>
-      </div>
+      <canvas id="c" width="720" height="520"></canvas>
       <div id="err"></div>
       <p class="legend">拖动旋转相机 · 黄球是灯 · 影子边缘发虚是纹素不够细</p>
       <div class="controls">
-        <label><input id="showMap" type="checkbox" checked /> 显示阴影图</label>
         <label><input id="pcf" type="checkbox" /> 3×3 PCF</label>
         <label><input id="cullFront" type="checkbox" checked /> 阴影通道剔正面</label>
-        <label><input id="orbitLight" type="checkbox" checked /> 灯光绕行</label>
         <label>bias <input id="bias" type="range" min="0" max="80" value="12" /> <span id="biasVal">0.006</span></label>
       </div>
       <p class="hint" id="hint"></p>
@@ -175,18 +158,14 @@ color = ambient + diffuse * shadow;</code></pre>
       </ol>
     </section>
   </div>
-
 <script>
 const canvas = document.getElementById("c");
 const errBox = document.getElementById("err");
 const hintEl = document.getElementById("hint");
-const showMapEl = document.getElementById("showMap");
 const pcfEl = document.getElementById("pcf");
 const cullFrontEl = document.getElementById("cullFront");
-const orbitLightEl = document.getElementById("orbitLight");
 const biasEl = document.getElementById("bias");
 const biasVal = document.getElementById("biasVal");
-const mapLabel = document.getElementById("mapLabel");
 
 function fail(msg) {
   errBox.style.display = "block";
@@ -368,29 +347,8 @@ void main() {
   outColor = vec4(color, 1.0);
 }`;
 
-const BLIT_VS = `#version 300 es
-const vec2 pos[3] = vec2[3](vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
-const vec2 uv[3]  = vec2[3](vec2(0.0,0.0), vec2(2.0,0.0), vec2(0.0,2.0));
-out vec2 v_uv;
-void main() {
-  v_uv = uv[gl_VertexID];
-  gl_Position = vec4(pos[gl_VertexID], 0.0, 1.0);
-}`;
-
-const BLIT_FS = `#version 300 es
-precision mediump float;
-in vec2 v_uv;
-uniform sampler2D u_tex;
-out vec4 outColor;
-void main() {
-  float d = texture(u_tex, v_uv).r;
-  outColor = vec4(vec3(d), 1.0);
-}`;
-
 const depthProg = link(DEPTH_VS, DEPTH_FS);
 const prog = link(VS, FS);
-const blitProg = link(BLIT_VS, BLIT_FS);
-const blitVao = gl.createVertexArray();
 const uDepthMvp = gl.getUniformLocation(depthProg, "u_mvp");
 const u = {
   mvp: gl.getUniformLocation(prog, "u_mvp"),
@@ -404,7 +362,6 @@ const u = {
   pcf: gl.getUniformLocation(prog, "u_pcf"),
   shadowSize: gl.getUniformLocation(prog, "u_shadowSize"),
 };
-const uBlitTex = gl.getUniformLocation(blitProg, "u_tex");
 
 function createSphere(radius, stacks, slices) {
   const pos = [];
@@ -568,15 +525,13 @@ function resize() {
   }
 }
 
-function frame(t) {
+function frame() {
   requestAnimationFrame(frame);
   resize();
   const bias = Number(biasEl.value) / 2000;
   biasVal.textContent = bias.toFixed(3);
-  mapLabel.classList.toggle("on", showMapEl.checked);
 
-  const lightAng = orbitLightEl.checked ? t * 0.00035 : 0.9;
-  const lightPos = [Math.sin(lightAng) * 4.2, 5.2, Math.cos(lightAng) * 3.4];
+  const lightPos = [Math.sin(0.9) * 4.2, 5.2, Math.cos(0.9) * 3.4];
   const lightTarget = [0, 0, 0];
   const lightDir = [
     lightTarget[0] - lightPos[0],
@@ -628,20 +583,6 @@ function frame(t) {
   gl.uniformMatrix4fv(u.model, false, lamp);
   gl.bindVertexArray(sphereDraw.vao);
   gl.drawElements(gl.TRIANGLES, sphereDraw.count, gl.UNSIGNED_SHORT, 0);
-
-  if (showMapEl.checked) {
-    const side = Math.floor(Math.min(canvas.width, canvas.height) * 0.28);
-    gl.viewport(canvas.width - side - 12, 12, side, side);
-    gl.disable(gl.DEPTH_TEST);
-    gl.useProgram(blitProg);
-    gl.bindVertexArray(blitVao);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, shadow.depth);
-    gl.uniform1i(uBlitTex, 0);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    gl.enable(gl.DEPTH_TEST);
-    gl.viewport(0, 0, canvas.width, canvas.height);
-  }
 
   if (bias < 0.0015) {
     hintEl.textContent = "bias 很小：地面容易 acne（自己挡住自己）。";
