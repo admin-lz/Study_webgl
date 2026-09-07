@@ -341,9 +341,9 @@ void main() {
   vec3 albedo = u_albedo;
   if (u_checker > 0.5) {
     float k = mod(floor(v_world.x) + floor(v_world.z), 2.0);
-    albedo = mix(vec3(0.38, 0.40, 0.44), vec3(0.52, 0.54, 0.58), k);
+    albedo = mix(vec3(0.72, 0.74, 0.78), vec3(0.92, 0.93, 0.95), k);
   }
-  vec3 color = albedo * (0.18 + 0.82 * ndl * shadow);
+  vec3 color = albedo * (0.42 + 0.68 * ndl * shadow);
   outColor = vec4(color, 1.0);
 }`;
 
@@ -431,7 +431,7 @@ const cubeDraw = makeMesh(createCube());
 const floorDraw = makeMesh({
   positions: new Float32Array([-4,0,-4, 4,0,-4, 4,0,4, -4,0,4]),
   normals: new Float32Array([0,1,0, 0,1,0, 0,1,0, 0,1,0]),
-  indices: new Uint16Array([0, 1, 2, 0, 2, 3]),
+  indices: new Uint16Array([0, 2, 1, 0, 3, 2]),
 });
 
 const casters = [
@@ -570,7 +570,7 @@ function frame() {
   gl.useProgram(prog);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, shadow.depth);
-  drawLit(floorDraw, identity(), viewProj, lightVP, [0.45, 0.45, 0.48], 1, lightDir, bias, pcfEl.checked);
+  drawLit(floorDraw, identity(), viewProj, lightVP, [0.78, 0.80, 0.84], 1, lightDir, bias, pcfEl.checked);
   for (const o of casters) {
     drawLit(o.draw, o.model, viewProj, lightVP, o.color, 0, lightDir, bias, pcfEl.checked);
   }
