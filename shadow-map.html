@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · Shadow Mapping</title>
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --panel: #12151f;
+      --line: #243044;
+      --text: #e8eef8;
+      --muted: #8b97a8;
+      --accent: #9fd4ff;
+      --gold: #f3d27a;
+      --ok: #7dcea0;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 980px; }
+    header b { color: var(--accent); }
+    header a { color: var(--gold); }
+    .layout {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 20px;
+      padding: 20px 24px 40px;
+      align-items: start;
+    }
+    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
+    canvas {
+      width: 100%;
+      height: auto;
+      display: block;
+      background: #08090e;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      cursor: grab;
+    }
+    canvas:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    .pipe { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+    .pipe span {
+      background: #1a2230; border: 1px solid #2c3b52; border-radius: 999px;
+      padding: 4px 10px; font-size: 12px; color: #c9d6e8;
+    }
+    .pipe span.gpu { color: var(--ok); border-color: #2a4a38; background: #102018; }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code, .note code, pre code { color: var(--gold); font-size: 12px; }
+    pre {
+      margin: 10px 0 0;
+      background: #0a0c12;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 12px 14px;
+      overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #d5deea;
+      white-space: pre;
+    }
+    .note { color: var(--muted); font-size: 13px; margin-top: 10px; }
+    .stage-wrap { position: relative; }
+    .map-label {
+      display: none;
+      position: absolute;
+      right: 22px;
+      bottom: 16px;
+      color: #c9d6e8;
+      font-size: 11px;
+      text-shadow: 0 1px 4px #000;
+      pointer-events: none;
+    }
+    .map-label.on { display: block; }
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 10px 16px;
+      margin-top: 12px; align-items: center;
+      color: var(--muted); font-size: 13px;
+    }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls input[type="range"] { width: 110px; accent-color: #4aa3ff; }
+    .hint {
+      margin: 10px 0 0;
+      padding: 10px 12px;
+      border-radius: 6px;
+      background: #1a2230;
+      border: 1px solid #2c3b52;
+      color: var(--text);
+      font-size: 13px;
+      min-height: 3.2em;
+    }
+    .legend { color: var(--muted); font-size: 12px; margin-top: 8px; }
+    #err {
+      display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212;
+      border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Shadow Mapping：从灯光画一张深度图，再比较远近</h1>
+    <p>
+      硬阴影。先从灯光看世界，把最近的深度存进纹理；再从相机画，把片元变到灯光空间，比一比「我比阴影图里记录的更远吗」。
+      更远 = 被挡住。软阴影见 <a href="pcss.html">PCSS</a>。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <section class="stage">
+        <h2>1. 两趟绘制</h2>
+        <div class="pipe">
+          <span>灯光 VP</span>
+          <span class="gpu">深度 FBO</span>
+          <span>相机 VP</span>
+          <span class="gpu">比深度</span>
+          <span>乘进漫反射</span>
+        </div>
+        <ol class="steps">
+          <li>灯光用正交投影（平行光）。阴影图上每个纹素 = 沿光线看到的最近深度。</li>
+          <li>片元世界坐标乘 <code>lightVP</code>，再从 NDC 映到 [0,1]，去采样那张深度图。</li>
+          <li><code>当前深度 − bias &gt; 图上深度</code> → 在阴影里，漫反射打暗。</li>
+          <li><b>bias 太小</b>：地面自己挡住自己（acne）。<b>太大</b>：影子离物体（peter panning）。</li>
+        </ol>
+        <p class="note">阴影图分辨率有限，硬比较的边缘是锯齿。3×3 PCF 只是邻域平均，整圈一样糊，不是真正的半影。</p>
+      </section>
+    </div>
+
+    <div>
+      <div class="stage-wrap">
+        <canvas id="c" width="720" height="520"></canvas>
+        <div class="map-label" id="mapLabel">右下角 = 灯光深度图</div>
+      </div>
+      <div id="err"></div>
+      <p class="legend">拖动旋转相机 · 黄球是灯 · 影子边缘发虚是纹素不够细</p>
+      <div class="controls">
+        <label><input id="showMap" type="checkbox" checked /> 显示阴影图</label>
+        <label><input id="pcf" type="checkbox" /> 3×3 PCF</label>
+        <label><input id="cullFront" type="checkbox" checked /> 阴影通道剔正面</label>
+        <label><input id="orbitLight" type="checkbox" checked /> 灯光绕行</label>
+        <label>bias <input id="bias" type="range" min="0" max="80" value="12" /> <span id="biasVal">0.006</span></label>
+      </div>
+      <p class="hint" id="hint"></p>
+    </div>
+  </div>
+
+  <div class="layout" style="padding-top:0">
+    <section class="stage">
+      <h2>2. 本页真正在跑的核心</h2>
+<pre><code>// ① 灯光视角，只写深度
+bindFramebuffer(shadowFbo);
+viewport(SHADOW_SIZE);
+drawScene(u_mvp = lightVP * model);
+
+// ② 相机视角，采样那张深度图
+vec4 lp = u_lightVP * vec4(world, 1.0);
+vec3 sc = lp.xyz / lp.w * 0.5 + 0.5;   // NDC → [0,1]
+float closest = texture(u_shadow, sc.xy).r;
+float shadow = (sc.z - bias > closest) ? 0.0 : 1.0;
+color = ambient + diffuse * shadow;</code></pre>
+      <p class="note">阴影图不要开 MSAA，过滤用 <code>NEAREST</code>。深度比较不能线性插值出合法 ID，同样也不能插值出合法深度再硬比。</p>
+    </section>
+
+    <section class="stage">
+      <h2>3. 对照着拧开关看</h2>
+      <ol class="steps">
+        <li>bias 拉到 0：地面布满斑点，那就是 acne（自己和自己比深度，精度不够）。</li>
+        <li>bias 拉很大：影子和物体脱开，那就是 peter panning。</li>
+        <li>勾上 3×3 PCF：边缘变软，但近处远处一样软。真正近实远虚见 <a href="pcss.html" style="color:#f3d27a">pcss.html</a>。</li>
+        <li>关掉「剔正面」再把 bias 调小：acne 更明显。背面深度更远，相当于白送一点偏移。</li>
+      </ol>
+    </section>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+const hintEl = document.getElementById("hint");
+const showMapEl = document.getElementById("showMap");
+const pcfEl = document.getElementById("pcf");
+const cullFrontEl = document.getElementById("cullFront");
+const orbitLightEl = document.getElementById("orbitLight");
+const biasEl = document.getElementById("bias");
+const biasVal = document.getElementById("biasVal");
+const mapLabel = document.getElementById("mapLabel");
+
+function fail(msg) {
+  errBox.style.display = "block";
+  errBox.textContent = msg;
+  throw new Error(msg);
+}
+
+const gl = canvas.getContext("webgl2", { antialias: true });
+if (!gl) fail("需要 WebGL2。请用较新的 Chrome / Edge / Firefox。");
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    fail(gl.getShaderInfoLog(s) || "shader compile failed");
+  }
+  return s;
+}
+
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    fail(gl.getProgramInfoLog(p) || "program link failed");
+  }
+  return p;
+}
+
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      o[c * 4 + r] =
+        a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+        a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    }
+  }
+  return o;
+}
+
+function identity() {
+  return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+}
+
+function translate(m, x, y, z) {
+  const t = identity();
+  t[12] = x; t[13] = y; t[14] = z;
+  return mul(m, t);
+}
+
+function scaleMat(sx, sy, sz) {
+  const m = identity();
+  m[0] = sx; m[5] = sy; m[10] = sz;
+  return m;
+}
+
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2);
+  const nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+
+function ortho(l, r, b, t, n, f) {
+  return new Float32Array([
+    2 / (r - l), 0, 0, 0,
+    0, 2 / (t - b), 0, 0,
+    0, 0, -2 / (f - n), 0,
+    -(r + l) / (r - l), -(t + b) / (t - b), -(f + n) / (f - n), 1,
+  ]);
+}
+
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let len = Math.hypot(zx, zy, zz); zx /= len; zy /= len; zz /= len;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  len = Math.hypot(xx, xy, xz); xx /= len; xy /= len; xz /= len;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+    1,
+  ]);
+}
+
+function lookAtSafe(eye, center) {
+  const dy = Math.abs(eye[1] - center[1]);
+  const dist = Math.hypot(eye[0] - center[0], dy, eye[2] - center[2]);
+  const up = dy / dist > 0.92 ? [0, 0, 1] : [0, 1, 0];
+  return lookAt(eye, center, up);
+}
+
+const DEPTH_VS = `#version 300 es
+layout(location = 0) in vec3 a_pos;
+uniform mat4 u_mvp;
+void main() {
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+
+const DEPTH_FS = `#version 300 es
+precision mediump float;
+out vec4 unused;
+void main() { unused = vec4(0.0); }`;
+
+const VS = `#version 300 es
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec3 a_normal;
+uniform mat4 u_mvp;
+uniform mat4 u_model;
+out vec3 v_world;
+out vec3 v_normal;
+void main() {
+  vec4 world = u_model * vec4(a_pos, 1.0);
+  v_world = world.xyz;
+  v_normal = mat3(u_model) * a_normal;
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec3 v_world;
+in vec3 v_normal;
+uniform vec3 u_lightDir;
+uniform vec3 u_albedo;
+uniform float u_checker;
+uniform mat4 u_lightVP;
+uniform sampler2D u_shadow;
+uniform float u_bias;
+uniform float u_pcf;
+uniform float u_shadowSize;
+out vec4 outColor;
+
+float hardShadow(vec3 sc, vec2 uv) {
+  float closest = texture(u_shadow, uv).r;
+  return sc.z - u_bias > closest ? 0.0 : 1.0;
+}
+
+float pcfShadow(vec3 sc) {
+  float vis = 0.0;
+  float texel = 1.0 / u_shadowSize;
+  for (int x = -1; x <= 1; x++) {
+    for (int y = -1; y <= 1; y++) {
+      vis += hardShadow(sc, sc.xy + vec2(float(x), float(y)) * texel);
+    }
+  }
+  return vis / 9.0;
+}
+
+void main() {
+  vec3 N = normalize(v_normal);
+  vec3 L = normalize(-u_lightDir);
+  float ndl = max(dot(N, L), 0.0);
+
+  vec4 lp = u_lightVP * vec4(v_world, 1.0);
+  vec3 ndc = lp.xyz / lp.w;
+  vec3 sc = ndc * 0.5 + 0.5;
+  float shadow = 1.0;
+  if (sc.z <= 1.0 && sc.x >= 0.0 && sc.x <= 1.0 && sc.y >= 0.0 && sc.y <= 1.0) {
+    shadow = u_pcf > 0.5 ? pcfShadow(sc) : hardShadow(sc, sc.xy);
+  }
+
+  vec3 albedo = u_albedo;
+  if (u_checker > 0.5) {
+    float k = mod(floor(v_world.x) + floor(v_world.z), 2.0);
+    albedo = mix(vec3(0.38, 0.40, 0.44), vec3(0.52, 0.54, 0.58), k);
+  }
+  vec3 color = albedo * (0.18 + 0.82 * ndl * shadow);
+  outColor = vec4(color, 1.0);
+}`;
+
+const BLIT_VS = `#version 300 es
+const vec2 pos[3] = vec2[3](vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
+const vec2 uv[3]  = vec2[3](vec2(0.0,0.0), vec2(2.0,0.0), vec2(0.0,2.0));
+out vec2 v_uv;
+void main() {
+  v_uv = uv[gl_VertexID];
+  gl_Position = vec4(pos[gl_VertexID], 0.0, 1.0);
+}`;
+
+const BLIT_FS = `#version 300 es
+precision mediump float;
+in vec2 v_uv;
+uniform sampler2D u_tex;
+out vec4 outColor;
+void main() {
+  float d = texture(u_tex, v_uv).r;
+  outColor = vec4(vec3(d), 1.0);
+}`;
+
+const depthProg = link(DEPTH_VS, DEPTH_FS);
+const prog = link(VS, FS);
+const blitProg = link(BLIT_VS, BLIT_FS);
+const blitVao = gl.createVertexArray();
+const uDepthMvp = gl.getUniformLocation(depthProg, "u_mvp");
+const u = {
+  mvp: gl.getUniformLocation(prog, "u_mvp"),
+  model: gl.getUniformLocation(prog, "u_model"),
+  lightDir: gl.getUniformLocation(prog, "u_lightDir"),
+  albedo: gl.getUniformLocation(prog, "u_albedo"),
+  checker: gl.getUniformLocation(prog, "u_checker"),
+  lightVP: gl.getUniformLocation(prog, "u_lightVP"),
+  shadow: gl.getUniformLocation(prog, "u_shadow"),
+  bias: gl.getUniformLocation(prog, "u_bias"),
+  pcf: gl.getUniformLocation(prog, "u_pcf"),
+  shadowSize: gl.getUniformLocation(prog, "u_shadowSize"),
+};
+const uBlitTex = gl.getUniformLocation(blitProg, "u_tex");
+
+function createSphere(radius, stacks, slices) {
+  const pos = [];
+  const nrm = [];
+  const idx = [];
+  for (let i = 0; i <= stacks; i++) {
+    const theta = (i / stacks) * Math.PI;
+    const sinT = Math.sin(theta), cosT = Math.cos(theta);
+    for (let j = 0; j <= slices; j++) {
+      const phi = (j / slices) * Math.PI * 2;
+      const x = sinT * Math.cos(phi), y = cosT, z = sinT * Math.sin(phi);
+      pos.push(radius * x, radius * y, radius * z);
+      nrm.push(x, y, z);
+    }
+  }
+  const stride = slices + 1;
+  for (let i = 0; i < stacks; i++) {
+    for (let j = 0; j < slices; j++) {
+      const a = i * stride + j, b = a + stride;
+      idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+  }
+  return { positions: new Float32Array(pos), normals: new Float32Array(nrm), indices: new Uint16Array(idx) };
+}
+
+function createCube() {
+  const faces = [
+    { n: [ 0, 0, 1], v: [[-1,-1, 1],[ 1,-1, 1],[ 1, 1, 1],[-1, 1, 1]] },
+    { n: [ 0, 0,-1], v: [[ 1,-1,-1],[-1,-1,-1],[-1, 1,-1],[ 1, 1,-1]] },
+    { n: [ 1, 0, 0], v: [[ 1,-1, 1],[ 1,-1,-1],[ 1, 1,-1],[ 1, 1, 1]] },
+    { n: [-1, 0, 0], v: [[-1,-1,-1],[-1,-1, 1],[-1, 1, 1],[-1, 1,-1]] },
+    { n: [ 0, 1, 0], v: [[-1, 1, 1],[ 1, 1, 1],[ 1, 1,-1],[-1, 1,-1]] },
+    { n: [ 0,-1, 0], v: [[-1,-1,-1],[ 1,-1,-1],[ 1,-1, 1],[-1,-1, 1]] },
+  ];
+  const pos = [], nrm = [], idx = [];
+  let base = 0;
+  for (const f of faces) {
+    for (const p of f.v) { pos.push(p[0], p[1], p[2]); nrm.push(f.n[0], f.n[1], f.n[2]); }
+    idx.push(base, base+1, base+2, base, base+2, base+3);
+    base += 4;
+  }
+  return { positions: new Float32Array(pos), normals: new Float32Array(nrm), indices: new Uint16Array(idx) };
+}
+
+function makeMesh(mesh) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const posBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, mesh.positions, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  const nrmBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, nrmBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, mesh.normals, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+  const ibo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return { vao, count: mesh.indices.length };
+}
+
+const sphereDraw = makeMesh(createSphere(1, 24, 32));
+const cubeDraw = makeMesh(createCube());
+const floorDraw = makeMesh({
+  positions: new Float32Array([-4,0,-4, 4,0,-4, 4,0,4, -4,0,4]),
+  normals: new Float32Array([0,1,0, 0,1,0, 0,1,0, 0,1,0]),
+  indices: new Uint16Array([0, 1, 2, 0, 2, 3]),
+});
+
+const casters = [
+  { draw: cubeDraw,   model: mul(translate(identity(), -0.85, 0.85,  0.15), scaleMat(0.28, 0.85, 0.28)), color: [0.78, 0.32, 0.28] },
+  { draw: sphereDraw, model: mul(translate(identity(),  0.75, 0.48, -0.35), scaleMat(0.48, 0.48, 0.48)), color: [0.32, 0.55, 0.88] },
+  { draw: cubeDraw,   model: mul(translate(identity(),  0.10, 0.28,  1.05), scaleMat(0.42, 0.28, 0.42)), color: [0.86, 0.62, 0.22] },
+  { draw: cubeDraw,   model: mul(translate(identity(), -0.20, 0.18, -1.15), scaleMat(0.55, 0.18, 0.22)), color: [0.30, 0.68, 0.48] },
+];
+
+const SHADOW_SIZE = 1024;
+const ORTHO_W = 8;
+const LIGHT_NEAR = 0.5;
+const LIGHT_FAR = 16;
+
+function createShadowFbo(size) {
+  const depth = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, depth);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, size, size, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const color = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, color);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depth, 0);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) fail("shadow FBO 不完整");
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { fbo, depth, size };
+}
+
+const shadow = createShadowFbo(SHADOW_SIZE);
+
+function drawDepth(draw, mvp) {
+  gl.uniformMatrix4fv(uDepthMvp, false, mvp);
+  gl.bindVertexArray(draw.vao);
+  gl.drawElements(gl.TRIANGLES, draw.count, gl.UNSIGNED_SHORT, 0);
+}
+
+function drawLit(draw, model, viewProj, lightVP, color, checker, lightDir, bias, pcfOn) {
+  gl.uniformMatrix4fv(u.mvp, false, mul(viewProj, model));
+  gl.uniformMatrix4fv(u.model, false, model);
+  gl.uniformMatrix4fv(u.lightVP, false, lightVP);
+  gl.uniform3fv(u.albedo, color);
+  gl.uniform3fv(u.lightDir, lightDir);
+  gl.uniform1f(u.checker, checker);
+  gl.uniform1f(u.bias, bias);
+  gl.uniform1f(u.pcf, pcfOn ? 1 : 0);
+  gl.uniform1f(u.shadowSize, SHADOW_SIZE);
+  gl.uniform1i(u.shadow, 0);
+  gl.bindVertexArray(draw.vao);
+  gl.drawElements(gl.TRIANGLES, draw.count, gl.UNSIGNED_SHORT, 0);
+}
+
+let yaw = 0.7;
+let pitch = 0.42;
+let dragging = false;
+let lastX = 0;
+let lastY = 0;
+
+canvas.addEventListener("pointerdown", (e) => {
+  dragging = true;
+  lastX = e.clientX;
+  lastY = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  yaw -= (e.clientX - lastX) * 0.005;
+  pitch = Math.max(0.08, Math.min(1.2, pitch + (e.clientY - lastY) * 0.005));
+  lastX = e.clientX;
+  lastY = e.clientY;
+});
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+}
+
+function frame(t) {
+  requestAnimationFrame(frame);
+  resize();
+  const bias = Number(biasEl.value) / 2000;
+  biasVal.textContent = bias.toFixed(3);
+  mapLabel.classList.toggle("on", showMapEl.checked);
+
+  const lightAng = orbitLightEl.checked ? t * 0.00035 : 0.9;
+  const lightPos = [Math.sin(lightAng) * 4.2, 5.2, Math.cos(lightAng) * 3.4];
+  const lightTarget = [0, 0, 0];
+  const lightDir = [
+    lightTarget[0] - lightPos[0],
+    lightTarget[1] - lightPos[1],
+    lightTarget[2] - lightPos[2],
+  ];
+  const lightView = lookAtSafe(lightPos, lightTarget);
+  const lightProj = ortho(-ORTHO_W/2, ORTHO_W/2, -ORTHO_W/2, ORTHO_W/2, LIGHT_NEAR, LIGHT_FAR);
+  const lightVP = mul(lightProj, lightView);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, shadow.fbo);
+  gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE);
+  gl.clearDepth(1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.cullFace(cullFrontEl.checked ? gl.FRONT : gl.BACK);
+  gl.useProgram(depthProg);
+  drawDepth(floorDraw, mul(lightVP, identity()));
+  for (const o of casters) drawDepth(o.draw, mul(lightVP, o.model));
+  gl.cullFace(gl.BACK);
+
+  const dist = 7.2;
+  const eye = [
+    Math.sin(yaw) * Math.cos(pitch) * dist,
+    0.6 + Math.sin(pitch) * dist,
+    Math.cos(yaw) * Math.cos(pitch) * dist,
+  ];
+  const viewProj = mul(
+    perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 50),
+    lookAt(eye, [0, 0.4, 0], [0, 1, 0])
+  );
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.045, 0.055, 0.08, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(prog);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, shadow.depth);
+  drawLit(floorDraw, identity(), viewProj, lightVP, [0.45, 0.45, 0.48], 1, lightDir, bias, pcfEl.checked);
+  for (const o of casters) {
+    drawLit(o.draw, o.model, viewProj, lightVP, o.color, 0, lightDir, bias, pcfEl.checked);
+  }
+
+  const lamp = mul(translate(identity(), lightPos[0], lightPos[1], lightPos[2]), scaleMat(0.12, 0.12, 0.12));
+  gl.uniform1f(u.checker, 0);
+  gl.uniform1f(u.pcf, 0);
+  gl.uniform3fv(u.albedo, [1.0, 0.92, 0.45]);
+  gl.uniformMatrix4fv(u.mvp, false, mul(viewProj, lamp));
+  gl.uniformMatrix4fv(u.model, false, lamp);
+  gl.bindVertexArray(sphereDraw.vao);
+  gl.drawElements(gl.TRIANGLES, sphereDraw.count, gl.UNSIGNED_SHORT, 0);
+
+  if (showMapEl.checked) {
+    const side = Math.floor(Math.min(canvas.width, canvas.height) * 0.28);
+    gl.viewport(canvas.width - side - 12, 12, side, side);
+    gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(blitProg);
+    gl.bindVertexArray(blitVao);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, shadow.depth);
+    gl.uniform1i(uBlitTex, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.enable(gl.DEPTH_TEST);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+
+  if (bias < 0.0015) {
+    hintEl.textContent = "bias 很小：地面容易 acne（自己挡住自己）。";
+  } else if (bias > 0.025) {
+    hintEl.textContent = "bias 很大：影子会离开物体（peter panning）。";
+  } else if (pcfEl.checked) {
+    hintEl.textContent = "3×3 PCF：邻域平均，近处远处一样糊。";
+  } else {
+    hintEl.textContent = "硬阴影。边缘锯齿来自阴影图纹素。下一课 PCSS 按半影改核半径。";
+  }
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

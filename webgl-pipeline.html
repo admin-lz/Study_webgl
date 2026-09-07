@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 流程 · 从三角形写起</title>
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --panel: #12151f;
+      --line: #243044;
+      --text: #e8eef8;
+      --muted: #8b97a8;
+      --accent: #9fd4ff;
+      --gold: #f3d27a;
+      --ok: #7dcea0;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header {
+      padding: 20px 24px 8px;
+      border-bottom: 1px solid var(--line);
+    }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 920px; }
+    header b { color: var(--accent); }
+    .layout {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 20px;
+      padding: 20px 24px 40px;
+      align-items: start;
+    }
+    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
+    canvas {
+      width: 100%;
+      height: auto;
+      display: block;
+      background: #08090e;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    .pipe {
+      display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px;
+    }
+    .pipe span {
+      background: #1a2230; border: 1px solid #2c3b52; border-radius: 999px;
+      padding: 4px 10px; font-size: 12px; color: #c9d6e8;
+    }
+    .pipe span.gpu { color: var(--gold); border-color: #5a4a22; background: #221c10; }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps code, pre code, .note code { color: var(--gold); font-size: 12px; }
+    pre {
+      margin: 10px 0 0;
+      background: #0a0c12;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 12px 14px;
+      overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #d5deea;
+      white-space: pre;
+    }
+    .note { color: var(--muted); font-size: 13px; margin-top: 10px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { color: var(--accent); font-weight: 600; }
+    td:first-child { color: var(--ok); white-space: nowrap; }
+    #err {
+      display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212;
+      border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>WebGL2 流程：从画一个三角形写起</h1>
+    <p>
+      每次画一帧，JS 只做两件事：<b>把数据交给 GPU</b>，然后 <b>下令 draw</b>。
+      真正画像素的是 GPU 固定管线。下面右侧就是最小可运行程序：3 个顶点 → 1 个三角形。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <section class="stage">
+        <h2>1. 每帧在 GPU 里怎么走</h2>
+        <div class="pipe">
+          <span>顶点缓冲 VBO</span>
+          <span>→ 顶点着色器</span>
+          <span>→ 图元组装</span>
+          <span>→ 光栅化</span>
+          <span>→ 片元着色器</span>
+          <span>→ 深度 / 混合</span>
+          <span>→ 画布像素</span>
+        </div>
+        <ol class="steps">
+          <li><b style="color:#e8eef8">顶点着色器</b>：每个顶点跑一次。输入 <code>a_pos</code>，输出必须写 <code>gl_Position</code>（裁剪空间 -1~1）。</li>
+          <li><b style="color:#e8eef8">图元组装</b>：3 个顶点收成一个 <code>TRIANGLES</code>。</li>
+          <li><b style="color:#e8eef8">光栅化</b>：三角形覆盖了哪些像素，就生成哪些片元。</li>
+          <li><b style="color:#e8eef8">片元着色器</b>：每个片元跑一次，写出 <code>outColor</code>。</li>
+        </ol>
+        <p class="note">三角形阶段还没有相机、没有纹理。顶点直接写在裁剪空间里，所以看不见矩阵。</p>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>2. JS 必须按这个顺序写</h2>
+        <ol class="steps">
+          <li>拿 <code>canvas.getContext("webgl2")</code>。</li>
+          <li>写两段 GLSL：顶点着色器 + 片元着色器。</li>
+          <li><code>createShader</code> → <code>compileShader</code> → <code>createProgram</code> → <code>attach</code> → <code>link</code>。</li>
+          <li>CPU 上准备 <code>Float32Array</code> 顶点。</li>
+          <li><code>createBuffer</code> + <code>bufferData</code> 把数组上传到 GPU（VBO）。</li>
+          <li>WebGL2 用 <code>VAO</code> 记住「哪个 attribute 怎么从 buffer 取数」。</li>
+          <li><code>clear</code> + <code>drawArrays(TRIANGLES, 0, 3)</code>。</li>
+        </ol>
+        <p class="note">后面加颜色、旋转、贴图、相机，都是在第 4～7 步上插东西，顺序不变。</p>
+      </section>
+    </div>
+
+    <div>
+      <canvas id="c" width="720" height="520"></canvas>
+      <div id="err"></div>
+      <p class="note">裁剪空间：中心 (0,0)，右 +X，上 +Y。三个点已经写死在数组里。</p>
+    </div>
+  </div>
+
+  <div class="layout" style="padding-top:0">
+    <section class="stage">
+      <h2>3. 三角形：整份最小代码（本页正在跑的就是它）</h2>
+<pre><code>// ① 上下文
+const gl = canvas.getContext("webgl2");
+
+// ② 着色器源码（GPU 程序，不是 JS）
+const VS = `#version 300 es
+in vec2 a_pos;
+void main() {
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+const FS = `#version 300 es
+precision mediump float;
+out vec4 outColor;
+void main() {
+  outColor = vec4(0.2, 0.7, 1.0, 1.0);
+}`;
+
+// ③ 编译 + 链接成 program
+const prog = link(gl, VS, FS);
+gl.useProgram(prog);
+
+// ④ CPU 顶点：上、左下、右下
+const data = new Float32Array([
+   0.0,  0.6,
+  -0.6, -0.5,
+   0.6, -0.5,
+]);
+
+// ⑤ VBO：把数组拷到 GPU
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+
+// ⑥ VAO：声明 a_pos = 每顶点 2 个 float
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+const loc = gl.getAttribLocation(prog, "a_pos");
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+// ⑦ 画一帧
+gl.viewport(0, 0, canvas.width, canvas.height);
+gl.clearColor(0.08, 0.08, 0.12, 1);
+gl.clear(gl.COLOR_BUFFER_BIT);
+gl.drawArrays(gl.TRIANGLES, 0, 3);</code></pre>
+    </section>
+
+    <section class="stage">
+      <h2>4. 往后每加一项，对应写哪段代码</h2>
+      <table>
+        <thead>
+          <tr><th>能力</th><th>你要写的东西</th><th>本目录示例</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>顶点色</td>
+            <td>数组改成 <code>x,y,r,g,b</code>；VS <code>in / out</code> 传颜色；<code>vertexAttribPointer</code> 设 stride</td>
+            <td><code>VertexColor.html</code></td>
+          </tr>
+          <tr>
+            <td>每帧变化</td>
+            <td>VS 加 <code>uniform</code>；JS <code>getUniformLocation</code> + <code>uniform1f</code>；<code>requestAnimationFrame</code></td>
+            <td><code>uniform.html</code></td>
+          </tr>
+          <tr>
+            <td>贴图</td>
+            <td><code>createTexture</code> + <code>texImage2D</code>；FS <code>sampler2D</code> + <code>texture()</code></td>
+            <td><code>texture.html</code></td>
+          </tr>
+          <tr>
+            <td>3D / 相机</td>
+            <td>顶点改 vec3；JS 算 perspective × lookAt；<code>uniformMatrix4fv(u_mvp)</code></td>
+            <td><code>mvp-depth.html</code></td>
+          </tr>
+          <tr>
+            <td>索引网格</td>
+            <td>再做一个 ELEMENT_ARRAY_BUFFER；改成 <code>drawElements</code></td>
+            <td><code>sphere.html</code> / <code>wind-field.html</code></td>
+          </tr>
+          <tr>
+            <td>深度 / 透明</td>
+            <td><code>enable(DEPTH_TEST)</code>；透明再 <code>enable(BLEND)</code></td>
+            <td><code>mvp-depth.html</code> / <code>wind-field.html</code></td>
+          </tr>
+          <tr>
+            <td>多套物体</td>
+            <td>多套 program + VAO；每帧 <code>useProgram</code> → 绑 VAO → 设 uniform → draw</td>
+            <td><code>wind-field.html</code>（地形 / 箭头 / 流线）</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="note">
+        <code>wind-field.html</code> 只是把上面叠在一起：同一个 MVP，三套 shader，
+        网格用 <code>drawElements</code>，流线每帧 <code>bufferSubData</code> 更新 VBO。
+      </p>
+    </section>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+
+function fail(msg) {
+  errBox.style.display = "block";
+  errBox.textContent = msg;
+  throw new Error(msg);
+}
+
+const gl = canvas.getContext("webgl2", { antialias: true });
+if (!gl) fail("需要 WebGL2。请用较新的 Chrome / Edge / Firefox。");
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    fail(gl.getShaderInfoLog(s) || "shader compile failed");
+  }
+  return s;
+}
+
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    fail(gl.getProgramInfoLog(p) || "program link failed");
+  }
+  return p;
+}
+
+const VS = `#version 300 es
+in vec2 a_pos;
+void main() {
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision mediump float;
+out vec4 outColor;
+void main() {
+  outColor = vec4(0.25, 0.72, 1.0, 1.0);
+}`;
+
+const prog = link(VS, FS);
+gl.useProgram(prog);
+
+const data = new Float32Array([
+   0.0,  0.62,
+  -0.62, -0.52,
+   0.62, -0.52,
+]);
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+const loc = gl.getAttribLocation(prog, "a_pos");
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+gl.viewport(0, 0, canvas.width, canvas.height);
+gl.clearColor(0.031, 0.035, 0.055, 1);
+gl.clear(gl.COLOR_BUFFER_BIT);
+gl.drawArrays(gl.TRIANGLES, 0, 3);
+</script>
+</body>
+</html>

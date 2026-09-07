@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<canvas width="400" height="400"></canvas>
+<script>
+  const gl = document.querySelector("canvas").getContext("webgl2");
+  //  c -s  
+  //  s  c
+  const vs = 
+            `#version 300 es
+              in vec2 a_pos;
+              in vec3 a_col;
+             out vec3 v_col;
+              uniform float u_angle;
+              void main() {
+                float c = cos(u_angle), s = sin(u_angle);
+                vec2 p = mat2(c * 2.0, s, -s, c * 2.0) * a_pos;
+                gl_Position = vec4(p, 0.0, 1.0);
+                v_col = a_col;
+              }
+            `;
+  const fs = `#version 300 es
+            precision mediump float;
+             in vec3 v_col;
+            out vec4 fragColor;
+            void main() { 
+              fragColor = vec4(v_col, 1.0); 
+            }
+    `;
+  function makeProg(vsSrc, fsSrc) {
+    const compile = (t, s) => {
+      const sh = gl.createShader(t);
+      gl.shaderSource(sh, s);
+      gl.compileShader(sh);
+      return sh;
+    };
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+    gl.linkProgram(p);
+    return p;
+  }
+  const prog = makeProg(vs, fs);
+  gl.useProgram(prog);
+  const data = new Float32Array([
+    0,     0.5,   1.0, 0.5, 0.5,
+    -0.5, -0.4,   0.5, 0.2, 1.0,
+    0.5,  -0.4,   0.8, 0.8, 0.8,
+  ]);
+  // const data = new Float32Array([
+  //   0.0, 0.6, 1, 0, 0, -0.6, -0.5, 0, 1, 0, 0.6, -0.5, 0, 0, 1,
+  // ]);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, "a_pos");
+  gl.enableVertexAttribArray(loc);
+  const col = gl.getAttribLocation(prog, 'a_col');
+  const stride = 5 * 4; // 5 个 float
+  gl.enableVertexAttribArray(col);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, stride, 0);
+  gl.vertexAttribPointer(col, 3, gl.FLOAT, false, stride, 8);
+  const uAngle = gl.getUniformLocation(prog, "u_angle");
+  function frame(t) {
+    gl.clearColor(0.08, 0.08, 0.12, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.uniform1f(uAngle, t * 0.001);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+</script>

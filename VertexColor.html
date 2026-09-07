@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<canvas width="1800" height="880"></canvas>
+<script>
+  const gl = document.querySelector("canvas").getContext("webgl2");
+  const vs = `#version 300 es
+        in vec2 a_pos;
+        in vec3 a_color;
+        out vec3 v_color;
+        void main() {
+            gl_Position = vec4(a_pos, 0.0, 1.0);
+            v_color = a_color;
+        }`;
+  const fs = `#version 300 es
+            precision mediump float;
+            in vec3 v_color;
+            out vec4 fragColor;
+void main() { fragColor = vec4(v_color, 1.0); }`;
+  function makeProg(vsSrc, fsSrc) {
+    const compile = (t, s) => {
+      const sh = gl.createShader(t);
+      gl.shaderSource(sh, s);
+      gl.compileShader(sh);
+      return sh;
+    };
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+    gl.linkProgram(p);
+    return p;
+  }
+  const prog = makeProg(vs, fs);
+  gl.useProgram(prog);
+  // x,y, r,g,b
+  const data = new Float32Array([
+    0.0, 0.6, 1, 0, 0, -0.6, -0.5, 0, 1, 0, 0.6, -0.5, 0, 0, 1,
+  ]);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  const stride = 5 * 4; // 5 个 float
+  const pos = gl.getAttribLocation(prog, "a_pos");
+  const col = gl.getAttribLocation(prog, "a_color");
+  gl.enableVertexAttribArray(pos);
+  gl.vertexAttribPointer(pos, 2, gl.FLOAT, false, stride, 0);
+  gl.enableVertexAttribArray(col);
+  gl.vertexAttribPointer(col, 3, gl.FLOAT, false, stride, 8); // 2 * 4
+  gl.clearColor(0.08, 0.08, 0.12, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+</script>

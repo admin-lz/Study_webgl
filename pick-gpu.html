@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · GPU pick</title>
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --panel: #12151f;
+      --line: #243044;
+      --text: #e8eef8;
+      --muted: #8b97a8;
+      --accent: #9fd4ff;
+      --gold: #f3d27a;
+      --ok: #7dcea0;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 960px; }
+    header b { color: var(--accent); }
+    header a { color: var(--gold); }
+    .layout {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 20px;
+      padding: 20px 24px 40px;
+      align-items: start;
+    }
+    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
+    canvas {
+      width: 100%;
+      height: auto;
+      display: block;
+      background: #08090e;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      cursor: crosshair;
+    }
+    canvas:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    .pipe { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+    .pipe span {
+      background: #1a2230; border: 1px solid #2c3b52; border-radius: 999px;
+      padding: 4px 10px; font-size: 12px; color: #c9d6e8;
+    }
+    .pipe span.gpu { color: var(--ok); border-color: #2a4a38; background: #102018; }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code, .note code, pre code { color: var(--gold); font-size: 12px; }
+    pre {
+      margin: 10px 0 0;
+      background: #0a0c12;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 12px 14px;
+      overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #d5deea;
+      white-space: pre;
+    }
+    .note { color: var(--muted); font-size: 13px; margin-top: 10px; }
+    .stage-wrap { position: relative; }
+    .id-label {
+      display: none;
+      position: absolute;
+      right: 22px;
+      bottom: 16px;
+      color: #c9d6e8;
+      font-size: 11px;
+      text-shadow: 0 1px 4px #000;
+      pointer-events: none;
+    }
+    .id-label.on { display: block; }
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 10px 16px;
+      margin-top: 12px; align-items: center;
+      color: var(--muted); font-size: 13px;
+    }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .hint {
+      margin: 10px 0 0;
+      padding: 10px 12px;
+      border-radius: 6px;
+      background: #1a2230;
+      border: 1px solid #2c3b52;
+      color: var(--text);
+      font-size: 13px;
+      min-height: 3.2em;
+    }
+    .hint.hit { background: #102018; border-color: #2a4a38; color: var(--ok); }
+    .legend { color: var(--muted); font-size: 12px; margin-top: 8px; }
+    #err {
+      display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212;
+      border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>GPU pick：离屏平涂 ID 色，readPixels 读 1 个像素</h1>
+    <p>
+      不在 JS 里求交。用同一套 MVP 把每个物体涂成独一无二的 ID 色，深度测试决定谁留在像素上，再 <b>readPixels</b> 还原 id。
+      对照：<a href="pick-cpu.html">CPU pick</a>。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <section class="stage">
+        <h2>1. ID 缓冲怎么来</h2>
+        <div class="pipe">
+          <span>同一套 MVP</span>
+          <span>→ 离屏 FBO</span>
+          <span class="gpu">每物体一种 ID 色</span>
+          <span class="gpu">深度测试</span>
+          <span>readPixels 1px</span>
+        </div>
+        <ol class="steps">
+          <li>FBO 里关掉光照、关掉抗锯齿。片元只输出 <code>id → RGB</code>。</li>
+          <li>深度照常开：谁离相机近，谁的 ID 留在那个像素上。</li>
+          <li><code>readPixels</code> 读鼠标那 1 个像素，把 RGB 还原成整数 id。</li>
+          <li>清成黑色 = id 0 = 背景。本页：<code>id = R + G·256 + B·65536</code>。</li>
+        </ol>
+        <p class="note">
+          结果和屏幕像素一致，复杂网格也一样快。代价是多一次 draw，以及 <code>readPixels</code> 会让 GPU 和 CPU 同步。没有 3D 交点。
+        </p>
+      </section>
+    </div>
+
+    <div>
+      <div class="stage-wrap">
+        <canvas id="c" width="720" height="520"></canvas>
+        <div class="id-label" id="idLabel">右下角 = ID 缓冲</div>
+      </div>
+      <div id="err"></div>
+      <p class="legend">移动鼠标拾取 · 拖动旋转相机 · 地面没有 ID</p>
+      <div class="controls">
+        <label><input id="showId" type="checkbox" checked /> 显示 ID 缓冲</label>
+        <label><input id="pickDepth" type="checkbox" checked /> pick 开深度</label>
+      </div>
+      <p class="hint" id="hint">把鼠标移进画布。</p>
+    </div>
+  </div>
+
+  <div class="layout" style="padding-top:0">
+    <section class="stage">
+      <h2>2. 本页真正在跑的核心</h2>
+<pre><code>bindFramebuffer(pickFbo);
+clear; // 黑 = id 0
+drawEachObject(idColor);   // 无光照，有深度
+
+// GPU Y 在左下，鼠标 Y 在左上，必须翻转
+const px = floor(cssX * canvas.width  / cssW);
+const py = canvas.height - 1 - floor(cssY * canvas.height / cssH);
+readPixels(px, py, 1, 1, RGBA, UNSIGNED_BYTE, pixel);
+const id = pixel[0] + pixel[1] * 256 + pixel[2] * 65536;</code></pre>
+      <p class="note">
+        ID 缓冲不要开 MSAA：抗锯齿会把相邻 ID 混成非法颜色。
+        上一课射线求交见 <a href="pick-cpu.html" style="color:#f3d27a">pick-cpu.html</a>。
+      </p>
+    </section>
+
+    <section class="stage">
+      <h2>3. 对照着拧开关看</h2>
+      <ol class="steps">
+        <li>勾上「显示 ID 缓冲」：右下角每种色对应一个可点物体，地面是黑的。</li>
+        <li>关掉「pick 开深度」：后画的物体会盖住前面的 ID，和没深度的绘制一样。</li>
+        <li>提示里的 rgb 就是刚读到的那一个像素。id 1 的红球是 <code>(1,0,0)</code>。</li>
+        <li>没有黄点：GPU pick 只拿到颜色，不算出 3D 交点。</li>
+      </ol>
+    </section>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+const hintEl = document.getElementById("hint");
+const showIdEl = document.getElementById("showId");
+const pickDepthEl = document.getElementById("pickDepth");
+const idLabel = document.getElementById("idLabel");
+
+function fail(msg) {
+  errBox.style.display = "block";
+  errBox.textContent = msg;
+  throw new Error(msg);
+}
+
+const gl = canvas.getContext("webgl2", { antialias: true });
+if (!gl) fail("需要 WebGL2。请用较新的 Chrome / Edge / Firefox。");
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    fail(gl.getShaderInfoLog(s) || "shader compile failed");
+  }
+  return s;
+}
+
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    fail(gl.getProgramInfoLog(p) || "program link failed");
+  }
+  return p;
+}
+
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      o[c * 4 + r] =
+        a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+        a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    }
+  }
+  return o;
+}
+
+function identity() {
+  return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+}
+
+function translate(m, x, y, z) {
+  const t = identity();
+  t[12] = x; t[13] = y; t[14] = z;
+  return mul(m, t);
+}
+
+function scaleMat(sx, sy, sz) {
+  const m = identity();
+  m[0] = sx; m[5] = sy; m[10] = sz;
+  return m;
+}
+
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2);
+  const nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let len = Math.hypot(zx, zy, zz); zx /= len; zy /= len; zz /= len;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  len = Math.hypot(xx, xy, xz); xx /= len; xy /= len; xz /= len;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+    1,
+  ]);
+}
+
+const VS = `#version 300 es
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec3 a_normal;
+uniform mat4 u_mvp;
+uniform mat4 u_model;
+out vec3 v_normal;
+void main() {
+  v_normal = mat3(u_model) * a_normal;
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision mediump float;
+in vec3 v_normal;
+uniform vec3 u_color;
+uniform vec3 u_lightDir;
+uniform float u_lit;
+uniform float u_emissive;
+out vec4 outColor;
+void main() {
+  if (u_lit < 0.5) {
+    outColor = vec4(u_color, 1.0);
+    return;
+  }
+  vec3 N = normalize(v_normal);
+  float ndl = max(dot(N, normalize(u_lightDir)), 0.0);
+  outColor = vec4(u_color * (0.28 + 0.72 * ndl) + vec3(u_emissive), 1.0);
+}`;
+
+const BLIT_VS = `#version 300 es
+const vec2 pos[3] = vec2[3](vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
+const vec2 uv[3]  = vec2[3](vec2(0.0,0.0), vec2(2.0,0.0), vec2(0.0,2.0));
+out vec2 v_uv;
+void main() {
+  v_uv = uv[gl_VertexID];
+  gl_Position = vec4(pos[gl_VertexID], 0.0, 1.0);
+}`;
+
+const BLIT_FS = `#version 300 es
+precision mediump float;
+in vec2 v_uv;
+uniform sampler2D u_tex;
+out vec4 outColor;
+void main() {
+  outColor = texture(u_tex, v_uv);
+}`;
+
+const prog = link(VS, FS);
+const blitProg = link(BLIT_VS, BLIT_FS);
+const blitVao = gl.createVertexArray();
+const uMvp = gl.getUniformLocation(prog, "u_mvp");
+const uModel = gl.getUniformLocation(prog, "u_model");
+const uColor = gl.getUniformLocation(prog, "u_color");
+const uLightDir = gl.getUniformLocation(prog, "u_lightDir");
+const uLit = gl.getUniformLocation(prog, "u_lit");
+const uEmissive = gl.getUniformLocation(prog, "u_emissive");
+const uBlitTex = gl.getUniformLocation(blitProg, "u_tex");
+
+function createSphere(radius, stacks, slices) {
+  const pos = [];
+  const nrm = [];
+  const idx = [];
+  for (let i = 0; i <= stacks; i++) {
+    const theta = (i / stacks) * Math.PI;
+    const sinT = Math.sin(theta), cosT = Math.cos(theta);
+    for (let j = 0; j <= slices; j++) {
+      const phi = (j / slices) * Math.PI * 2;
+      const x = sinT * Math.cos(phi), y = cosT, z = sinT * Math.sin(phi);
+      pos.push(radius * x, radius * y, radius * z);
+      nrm.push(x, y, z);
+    }
+  }
+  const stride = slices + 1;
+  for (let i = 0; i < stacks; i++) {
+    for (let j = 0; j < slices; j++) {
+      const a = i * stride + j;
+      const b = a + stride;
+      idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+  }
+  return {
+    positions: new Float32Array(pos),
+    normals: new Float32Array(nrm),
+    indices: new Uint16Array(idx),
+  };
+}
+
+function createCube() {
+  const faces = [
+    { n: [ 0, 0, 1], v: [[-1,-1, 1],[ 1,-1, 1],[ 1, 1, 1],[-1, 1, 1]] },
+    { n: [ 0, 0,-1], v: [[ 1,-1,-1],[-1,-1,-1],[-1, 1,-1],[ 1, 1,-1]] },
+    { n: [ 1, 0, 0], v: [[ 1,-1, 1],[ 1,-1,-1],[ 1, 1,-1],[ 1, 1, 1]] },
+    { n: [-1, 0, 0], v: [[-1,-1,-1],[-1,-1, 1],[-1, 1, 1],[-1, 1,-1]] },
+    { n: [ 0, 1, 0], v: [[-1, 1, 1],[ 1, 1, 1],[ 1, 1,-1],[-1, 1,-1]] },
+    { n: [ 0,-1, 0], v: [[-1,-1,-1],[ 1,-1,-1],[ 1,-1, 1],[-1,-1, 1]] },
+  ];
+  const pos = [];
+  const nrm = [];
+  const idx = [];
+  let base = 0;
+  for (const f of faces) {
+    for (const p of f.v) {
+      pos.push(p[0], p[1], p[2]);
+      nrm.push(f.n[0], f.n[1], f.n[2]);
+    }
+    idx.push(base, base+1, base+2, base, base+2, base+3);
+    base += 4;
+  }
+  return {
+    positions: new Float32Array(pos),
+    normals: new Float32Array(nrm),
+    indices: new Uint16Array(idx),
+  };
+}
+
+function makeMesh(mesh) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const posBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, mesh.positions, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  const nrmBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, nrmBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, mesh.normals, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+  const ibo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return { vao, count: mesh.indices.length };
+}
+
+const sphereDraw = makeMesh(createSphere(1, 24, 32));
+const cubeDraw = makeMesh(createCube());
+const floorDraw = makeMesh({
+  positions: new Float32Array([-4,0,-4, 4,0,-4, 4,0,4, -4,0,4]),
+  normals: new Float32Array([0,1,0, 0,1,0, 0,1,0, 0,1,0]),
+  indices: new Uint16Array([0, 1, 2, 0, 2, 3]),
+});
+
+function idColor(id) {
+  return [
+    (id & 255) / 255,
+    ((id >> 8) & 255) / 255,
+    ((id >> 16) & 255) / 255,
+  ];
+}
+
+const objects = [
+  { id: 1, name: "红球",   kind: "sphere", center: [-0.95, 0.38,  0.15], radius: 0.38, color: [0.86, 0.28, 0.24] },
+  { id: 2, name: "橙立方", kind: "box",    center: [ 0.10, 0.32,  0.70], half: [0.32, 0.32, 0.32], color: [0.90, 0.52, 0.18] },
+  { id: 3, name: "黄球",   kind: "sphere", center: [ 0.95, 0.34, -0.10], radius: 0.34, color: [0.92, 0.78, 0.22] },
+  { id: 4, name: "绿立方", kind: "box",    center: [-0.20, 0.22, -0.90], half: [0.28, 0.22, 0.40], color: [0.28, 0.70, 0.42] },
+  { id: 5, name: "蓝球",   kind: "sphere", center: [ 0.55, 0.72, -0.55], radius: 0.28, color: [0.28, 0.52, 0.92] },
+  { id: 6, name: "紫立方", kind: "box",    center: [-0.78, 0.20, -0.55], half: [0.22, 0.20, 0.22], color: [0.62, 0.36, 0.86] },
+];
+
+function modelOf(obj) {
+  if (obj.kind === "sphere") {
+    const r = obj.radius;
+    return mul(translate(identity(), obj.center[0], obj.center[1], obj.center[2]), scaleMat(r, r, r));
+  }
+  const h = obj.half;
+  return mul(translate(identity(), obj.center[0], obj.center[1], obj.center[2]), scaleMat(h[0], h[1], h[2]));
+}
+
+let pickFbo = null;
+let pickTex = null;
+let pickDepthRb = null;
+let fboW = 0;
+let fboH = 0;
+
+function ensurePickFbo(w, h) {
+  if (pickFbo && fboW === w && fboH === h) return;
+  if (pickTex) gl.deleteTexture(pickTex);
+  if (pickDepthRb) gl.deleteRenderbuffer(pickDepthRb);
+  if (pickFbo) gl.deleteFramebuffer(pickFbo);
+  pickTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, pickTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  pickDepthRb = gl.createRenderbuffer();
+  gl.bindRenderbuffer(gl.RENDERBUFFER, pickDepthRb);
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+  pickFbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, pickFbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, pickTex, 0);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, pickDepthRb);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+    fail("pick FBO 不完整");
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  fboW = w;
+  fboH = h;
+}
+
+function drawMesh(draw, model, mvp, color, lit, emissive) {
+  gl.uniformMatrix4fv(uMvp, false, mvp);
+  gl.uniformMatrix4fv(uModel, false, model);
+  gl.uniform3fv(uColor, color);
+  gl.uniform1f(uLit, lit);
+  gl.uniform1f(uEmissive, emissive);
+  gl.bindVertexArray(draw.vao);
+  gl.drawElements(gl.TRIANGLES, draw.count, gl.UNSIGNED_SHORT, 0);
+}
+
+function drawObjects(viewProj, asId, highlightId) {
+  for (const obj of objects) {
+    const model = modelOf(obj);
+    const mvp = mul(viewProj, model);
+    const draw = obj.kind === "sphere" ? sphereDraw : cubeDraw;
+    if (asId) {
+      drawMesh(draw, model, mvp, idColor(obj.id), 0, 0);
+    } else {
+      const glow = obj.id === highlightId ? 0.22 : 0;
+      const col = obj.id === highlightId
+        ? [Math.min(1, obj.color[0]*1.25), Math.min(1, obj.color[1]*1.25), Math.min(1, obj.color[2]*1.25)]
+        : obj.color;
+      drawMesh(draw, model, mvp, col, 1, glow);
+    }
+  }
+}
+
+function renderPick(viewProj) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, pickFbo);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.disable(gl.BLEND);
+  if (pickDepthEl.checked) gl.enable(gl.DEPTH_TEST);
+  else gl.disable(gl.DEPTH_TEST);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(prog);
+  drawObjects(viewProj, true, -1);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.enable(gl.DEPTH_TEST);
+}
+
+const pixel = new Uint8Array(4);
+let yaw = 0.62;
+let pitch = 0.32;
+let dragging = false;
+let lastX = 0;
+let lastY = 0;
+let mouseInside = false;
+let cssX = 0;
+let cssY = 0;
+
+canvas.addEventListener("pointerdown", (e) => {
+  dragging = true;
+  lastX = e.clientX;
+  lastY = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointerleave", () => { mouseInside = false; });
+canvas.addEventListener("pointermove", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  cssX = e.clientX - rect.left;
+  cssY = e.clientY - rect.top;
+  mouseInside = cssX >= 0 && cssY >= 0 && cssX < rect.width && cssY < rect.height;
+  if (!dragging) return;
+  yaw -= (e.clientX - lastX) * 0.005;
+  pitch = Math.max(-0.12, Math.min(1.15, pitch + (e.clientY - lastY) * 0.005));
+  lastX = e.clientX;
+  lastY = e.clientY;
+});
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  resize();
+  ensurePickFbo(canvas.width, canvas.height);
+
+  const dist = 4.4;
+  const eye = [
+    Math.sin(yaw) * Math.cos(pitch) * dist,
+    0.55 + Math.sin(pitch) * dist,
+    Math.cos(yaw) * Math.cos(pitch) * dist,
+  ];
+  const proj = perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 50);
+  const view = lookAt(eye, [0, 0.35, 0], [0, 1, 0]);
+  const viewProj = mul(proj, view);
+  const rect = canvas.getBoundingClientRect();
+  const showId = showIdEl.checked;
+  idLabel.classList.toggle("on", showId);
+
+  renderPick(viewProj);
+
+  let hit = null;
+  let elapsed = 0;
+  let rgb = [0, 0, 0];
+  if (mouseInside) {
+    const t0 = performance.now();
+    const px = Math.max(0, Math.min(canvas.width  - 1, Math.floor(cssX * canvas.width  / rect.width)));
+    const py = Math.max(0, Math.min(canvas.height - 1, canvas.height - 1 - Math.floor(cssY * canvas.height / rect.height)));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, pickFbo);
+    gl.readPixels(px, py, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const id = pixel[0] + pixel[1] * 256 + pixel[2] * 65536;
+    rgb = [pixel[0], pixel[1], pixel[2]];
+    const obj = objects.find((o) => o.id === id);
+    hit = obj || null;
+    elapsed = performance.now() - t0;
+  }
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.enable(gl.DEPTH_TEST);
+  gl.clearColor(0.045, 0.055, 0.08, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(prog);
+  gl.uniform3f(uLightDir, 0.45, 0.8, 0.35);
+
+  const floorModel = identity();
+  drawMesh(floorDraw, floorModel, mul(viewProj, floorModel), [0.14, 0.16, 0.20], 1, 0);
+  drawObjects(viewProj, false, hit ? hit.id : -1);
+
+  if (showId) {
+    const side = Math.floor(Math.min(canvas.width, canvas.height) * 0.28);
+    gl.viewport(canvas.width - side - 12, 12, side, side);
+    gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(blitProg);
+    gl.bindVertexArray(blitVao);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, pickTex);
+    gl.uniform1i(uBlitTex, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.enable(gl.DEPTH_TEST);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+
+  if (!mouseInside) {
+    hintEl.className = "hint";
+    hintEl.textContent = "把鼠标移进画布。";
+  } else if (!hit) {
+    hintEl.className = "hint";
+    hintEl.textContent = `未击中  rgb(${rgb.join(",")})  ${elapsed.toFixed(2)} ms`;
+  } else {
+    hintEl.className = "hint hit";
+    hintEl.textContent = `${hit.name}  id=${hit.id}  rgb(${rgb.join(",")})  ${elapsed.toFixed(2)} ms`;
+  }
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

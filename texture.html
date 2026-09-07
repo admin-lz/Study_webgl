@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<canvas width="1000" height="1000"></canvas>
+<script>
+const WORLD = 1000, TILE_W = 100, TILE_H = 20;
+const canvas = document.querySelector('canvas');
+const gl = canvas.getContext('webgl2');
+const vs = `#version 300 es
+in vec3 a_pos;
+out vec3 v_world;
+uniform mat4 u_mvp;
+void main() {
+  v_world = a_pos;
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+const fs = `#version 300 es
+precision mediump float;
+in vec3 v_world;
+uniform sampler2D u_tex;
+uniform vec2 u_tileSize;
+out vec4 outColor;
+void main() {
+  // 地面用 XZ：X 方向砖宽 100，Z 方向行高 20，每行沿 X 偏 1/3
+  float row = floor(v_world.z / u_tileSize.y);
+  float shift = row * (u_tileSize.x / 3.0);
+  vec2 tileUV = vec2(
+    (v_world.x - shift) / u_tileSize.x,
+    v_world.z / u_tileSize.y
+  );
+  outColor = texture(u_tex, tileUV);
+}`;
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(sh));
+  return sh;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+// XZ 地面：y=0，范围 0~1000
+const data = new Float32Array([
+  0,0,0,   WORLD,0,0,   WORLD,0,WORLD,
+  0,0,0,   WORLD,0,WORLD,  0,0,WORLD,
+]);
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog, 'a_pos');
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+gl.uniform2f(gl.getUniformLocation(prog, 'u_tileSize'), TILE_W, TILE_H);
+const uMvp = gl.getUniformLocation(prog, 'u_mvp');
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      o[c * 4 + r] =
+        a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+        a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    }
+  }
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let len = Math.hypot(zx, zy, zz); zx /= len; zy /= len; zz /= len;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  len = Math.hypot(xx, xy, xz); xx /= len; xy /= len; xz /= len;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+    1,
+  ]);
+}
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+gl.enable(gl.DEPTH_TEST);
+gl.clearColor(0.08, 0.08, 0.12, 1);
+let ready = false;
+function frame(t) {
+  requestAnimationFrame(frame);
+  if (!ready) return;
+  const ang = t * 0.0004;
+  const r = 900;
+  const eye = [500 + Math.cos(ang) * r, 520, 500 + Math.sin(ang) * r];
+  const proj = perspective(Math.PI / 4, canvas.width / canvas.height, 1, 5000);
+  const view = lookAt(eye, [500, 0, 500], [0, 1, 0]);
+  gl.uniformMatrix4fv(uMvp, false, mul(proj, view));
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+const img = new Image();
+img.crossOrigin = 'anonymous';
+img.src = 'https://webgl2fundamentals.org/webgl/resources/f-texture.png';
+img.onload = () => {
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+  ready = true;
+};
+requestAnimationFrame(frame);
+</script>

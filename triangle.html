@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>WebGL2 · 三角形</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b0d14; }
+    canvas { display: block; width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/**
+ * WebGL2 最小闭环（先把这 7 步跑通，再往上加东西）
+ *
+ *  1. canvas.getContext("webgl2")
+ *  2. 写 VS / FS（GLSL）
+ *  3. compile + link → program
+ *  4. CPU 顶点 Float32Array
+ *  5. VBO：createBuffer + bufferData
+ *  6. VAO：enableVertexAttribArray + vertexAttribPointer
+ *  7. clear + drawArrays
+ */
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2", { antialias: true });
+if (!gl) throw new Error("需要 WebGL2");
+
+canvas.width = canvas.clientWidth;
+canvas.height = canvas.clientHeight;
+gl.viewport(0, 0, canvas.width, canvas.height);
+
+// ---------- 2. 着色器：GPU 上真正跑的程序 ----------
+// 顶点着色器：每个顶点一次。必须写出裁剪空间坐标 gl_Position。
+const VS = `#version 300 es
+in vec2 a_pos;
+void main() {
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+// 片元着色器：每个像素一次。写出颜色。
+const FS = `#version 300 es
+precision mediump float;
+out vec4 outColor;
+void main() {
+  outColor = vec4(0.25, 0.72, 1.0, 1.0);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+
+// ---------- 3. program = VS + FS 链接在一起 ----------
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+  throw new Error(gl.getProgramInfoLog(prog));
+}
+gl.useProgram(prog);
+
+// ---------- 4. CPU 顶点（裁剪空间：中心 0,0，右 +X，上 +Y）----------
+const data = new Float32Array([
+   0.0,  0.6,   // 上
+  -0.6, -0.5,   // 左下
+   0.6, -0.5,   // 右下
+]);
+
+// ---------- 5. VBO：数组从 CPU 拷到 GPU ----------
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+
+// ---------- 6. VAO：记住「a_pos 怎么从 VBO 取值」----------
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+const loc = gl.getAttribLocation(prog, "a_pos");
+gl.enableVertexAttribArray(loc);
+// size=2 → 每个顶点 2 个 float；stride=0 → 紧密排列
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+// ---------- 7. 画一帧 ----------
+gl.clearColor(0.08, 0.08, 0.12, 1);
+gl.clear(gl.COLOR_BUFFER_BIT);
+gl.drawArrays(gl.TRIANGLES, 0, 3);
+</script>
+</body>
+</html>

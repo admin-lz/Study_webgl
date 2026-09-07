@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL Blinn-Phong 球</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b0d14; overflow: hidden; font-family: ui-sans-serif, system-ui, sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #hud {
+      position: fixed; left: 16px; top: 16px; color: #e8eef8; font-size: 13px; line-height: 1.5;
+      text-shadow: 0 1px 4px #000; user-select: none; width: 320px;
+    }
+    #hud b { color: #9fd4ff; }
+    #hud code { color: #f3d27a; font-size: 12px; }
+    #hud label { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+    #hud input[type="range"] { flex: 1; }
+    #err {
+      display: none; position: fixed; inset: 0; place-items: center;
+      color: #fff; background: #1a1a1a; padding: 24px; font-size: 16px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="hud">
+    <b>WebGL · Blinn-Phong 球</b><br>
+    <code>I = ka·Ia + kd·Id·(N·L) + ks·Is·(N·H)^n</code><br>
+    H = normalize(L + V)<br>
+    拖动旋转视角 · 灯光自动绕行
+    <label>高光指数 n <input id="shininess" type="range" min="4" max="256" value="64" /> <span id="nVal">64</span></label>
+    <label>镜面强度 ks <input id="ks" type="range" min="0" max="100" value="70" /> <span id="ksVal">0.70</span></label>
+    <label>漫反射 kd <input id="kd" type="range" min="0" max="100" value="80" /> <span id="kdVal">0.80</span></label>
+  </div>
+  <div id="err"></div>
+
+<script>
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+const gl = canvas.getContext("webgl2", { antialias: true });
+if (!gl) {
+  errBox.style.display = "grid";
+  errBox.textContent = "需要 WebGL2。请使用较新的 Chrome / Edge / Firefox。";
+  throw new Error("no webgl2");
+}
+
+const VS = `#version 300 es
+in vec3 a_pos;
+in vec3 a_normal;
+uniform mat4 u_mvp;
+uniform mat4 u_model;
+uniform mat3 u_normalMat;
+out vec3 v_world;
+out vec3 v_normal;
+void main() {
+  vec4 world = u_model * vec4(a_pos, 1.0);
+  v_world = world.xyz;
+  v_normal = u_normalMat * a_normal;
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec3 v_world;
+in vec3 v_normal;
+uniform vec3 u_cameraPos;
+uniform vec3 u_lightPos;
+uniform vec3 u_lightColor;
+uniform vec3 u_ambientLight;
+uniform vec3 u_albedo;
+uniform float u_ka;
+uniform float u_kd;
+uniform float u_ks;
+uniform float u_shininess;
+out vec4 outColor;
+void main() {
+  vec3 N = normalize(v_normal);
+  vec3 L = normalize(u_lightPos - v_world);
+  vec3 V = normalize(u_cameraPos - v_world);
+  vec3 H = normalize(L + V);          // Blinn 半程向量
+
+  float NdotL = max(dot(N, L), 0.0);
+  float NdotH = max(dot(N, H), 0.0);
+
+  vec3 ambient  = u_ka * u_ambientLight * u_albedo;
+  vec3 diffuse  = u_kd * u_lightColor * u_albedo * NdotL;
+  vec3 specular = u_ks * u_lightColor * pow(NdotH, u_shininess);
+
+  // 背面没有漫反射/高光
+  if (NdotL <= 0.0) specular = vec3(0.0);
+
+  vec3 color = ambient + diffuse + specular;
+  color = pow(color, vec3(1.0 / 2.2)); // gamma
+  outColor = vec4(color, 1.0);
+}`;
+
+const LIGHT_VS = `#version 300 es
+in vec3 a_pos;
+uniform mat4 u_mvp;
+void main() {
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+
+const LIGHT_FS = `#version 300 es
+precision mediump float;
+uniform vec3 u_color;
+out vec4 outColor;
+void main() { outColor = vec4(u_color, 1.0); }`;
+
+function fail(msg) {
+  errBox.style.display = "grid";
+  errBox.textContent = msg;
+  throw new Error(msg);
+}
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    fail(gl.getShaderInfoLog(sh));
+  }
+  return sh;
+}
+
+function makeProg(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    fail(gl.getProgramInfoLog(p));
+  }
+  return p;
+}
+
+function createSphere(radius, stacks, slices) {
+  const pos = [];
+  const nrm = [];
+  const idx = [];
+  for (let i = 0; i <= stacks; i++) {
+    const theta = (i / stacks) * Math.PI;
+    const sinT = Math.sin(theta);
+    const cosT = Math.cos(theta);
+    for (let j = 0; j <= slices; j++) {
+      const phi = (j / slices) * Math.PI * 2;
+      const x = sinT * Math.cos(phi);
+      const y = cosT;
+      const z = sinT * Math.sin(phi);
+      pos.push(radius * x, radius * y, radius * z);
+      nrm.push(x, y, z);
+    }
+  }
+  const stride = slices + 1;
+  for (let i = 0; i < stacks; i++) {
+    for (let j = 0; j < slices; j++) {
+      const a = i * stride + j;
+      const b = a + stride;
+      idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+  }
+  return {
+    positions: new Float32Array(pos),
+    normals: new Float32Array(nrm),
+    indices: new Uint16Array(idx),
+  };
+}
+
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      o[c * 4 + r] =
+        a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+        a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    }
+  }
+  return o;
+}
+
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2);
+  const nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let len = Math.hypot(zx, zy, zz); zx /= len; zy /= len; zz /= len;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  len = Math.hypot(xx, xy, xz); xx /= len; xy /= len; xz /= len;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+    1,
+  ]);
+}
+
+function identity() {
+  return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+}
+
+function translate(m, x, y, z) {
+  const t = identity();
+  t[12] = x; t[13] = y; t[14] = z;
+  return mul(m, t);
+}
+
+function scaleMat(sx, sy, sz) {
+  const m = identity();
+  m[0] = sx; m[5] = sy; m[10] = sz;
+  return m;
+}
+
+function normalMat3(m) {
+  // 单位缩放旋转时，模型矩阵左上 3x3 即可；这里仍求逆转置以通用
+  const a00 = m[0], a01 = m[1], a02 = m[2];
+  const a10 = m[4], a11 = m[5], a12 = m[6];
+  const a20 = m[8], a21 = m[9], a22 = m[10];
+  const b00 = a11 * a22 - a12 * a21;
+  const b01 = a02 * a21 - a01 * a22;
+  const b02 = a01 * a12 - a02 * a11;
+  const det = a00 * b00 + a10 * b01 + a20 * b02;
+  const inv = 1 / (det || 1);
+  return new Float32Array([
+    b00 * inv, (a12 * a20 - a10 * a22) * inv, (a10 * a21 - a11 * a20) * inv,
+    b01 * inv, (a00 * a22 - a02 * a20) * inv, (a01 * a20 - a00 * a21) * inv,
+    b02 * inv, (a02 * a10 - a00 * a12) * inv, (a00 * a11 - a01 * a10) * inv,
+  ]);
+}
+
+const sphere = createSphere(1, 48, 64);
+const lightMesh = createSphere(1, 12, 16);
+
+const prog = makeProg(VS, FS);
+const lightProg = makeProg(LIGHT_VS, LIGHT_FS);
+
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+
+const posBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+gl.bufferData(gl.ARRAY_BUFFER, sphere.positions, gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog, "a_pos");
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+
+const nrmBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, nrmBuf);
+gl.bufferData(gl.ARRAY_BUFFER, sphere.normals, gl.STATIC_DRAW);
+const aNrm = gl.getAttribLocation(prog, "a_normal");
+gl.enableVertexAttribArray(aNrm);
+gl.vertexAttribPointer(aNrm, 3, gl.FLOAT, false, 0, 0);
+
+const ibo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, sphere.indices, gl.STATIC_DRAW);
+
+const lightVao = gl.createVertexArray();
+gl.bindVertexArray(lightVao);
+const lightPosBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, lightPosBuf);
+gl.bufferData(gl.ARRAY_BUFFER, lightMesh.positions, gl.STATIC_DRAW);
+const aLightPos = gl.getAttribLocation(lightProg, "a_pos");
+gl.enableVertexAttribArray(aLightPos);
+gl.vertexAttribPointer(aLightPos, 3, gl.FLOAT, false, 0, 0);
+const lightIbo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, lightIbo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, lightMesh.indices, gl.STATIC_DRAW);
+gl.bindVertexArray(null);
+
+const u = {
+  mvp: gl.getUniformLocation(prog, "u_mvp"),
+  model: gl.getUniformLocation(prog, "u_model"),
+  normalMat: gl.getUniformLocation(prog, "u_normalMat"),
+  cameraPos: gl.getUniformLocation(prog, "u_cameraPos"),
+  lightPos: gl.getUniformLocation(prog, "u_lightPos"),
+  lightColor: gl.getUniformLocation(prog, "u_lightColor"),
+  ambientLight: gl.getUniformLocation(prog, "u_ambientLight"),
+  albedo: gl.getUniformLocation(prog, "u_albedo"),
+  ka: gl.getUniformLocation(prog, "u_ka"),
+  kd: gl.getUniformLocation(prog, "u_kd"),
+  ks: gl.getUniformLocation(prog, "u_ks"),
+  shininess: gl.getUniformLocation(prog, "u_shininess"),
+};
+const uLightMvp = gl.getUniformLocation(lightProg, "u_mvp");
+const uLightColor = gl.getUniformLocation(lightProg, "u_color");
+
+let yaw = 0.55;
+let pitch = 0.28;
+let dragging = false;
+let lastX = 0;
+let lastY = 0;
+
+canvas.addEventListener("pointerdown", (e) => {
+  dragging = true;
+  lastX = e.clientX;
+  lastY = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  yaw -= (e.clientX - lastX) * 0.005;
+  pitch = Math.max(-1.2, Math.min(1.2, pitch + (e.clientY - lastY) * 0.005));
+  lastX = e.clientX;
+  lastY = e.clientY;
+});
+
+const shininessEl = document.getElementById("shininess");
+const ksEl = document.getElementById("ks");
+const kdEl = document.getElementById("kd");
+const nVal = document.getElementById("nVal");
+const ksVal = document.getElementById("ksVal");
+const kdVal = document.getElementById("kdVal");
+
+function readSliders() {
+  const n = Number(shininessEl.value);
+  const ks = Number(ksEl.value) / 100;
+  const kd = Number(kdEl.value) / 100;
+  nVal.textContent = String(n);
+  ksVal.textContent = ks.toFixed(2);
+  kdVal.textContent = kd.toFixed(2);
+  return { n, ks, kd };
+}
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+
+function frame(t) {
+  requestAnimationFrame(frame);
+  resize();
+  const { n, ks, kd } = readSliders();
+
+  const dist = 3.4;
+  const eye = [
+    Math.sin(yaw) * Math.cos(pitch) * dist,
+    Math.sin(pitch) * dist,
+    Math.cos(yaw) * Math.cos(pitch) * dist,
+  ];
+  const proj = perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 50);
+  const view = lookAt(eye, [0, 0, 0], [0, 1, 0]);
+  const model = identity();
+  const mvp = mul(mul(proj, view), model);
+
+  const ang = t * 0.0008 + 1.05; // 初始相位让灯光落在镜头前方
+  const lightPos = [Math.cos(ang) * 2.2, 1.25, Math.sin(ang) * 2.2];
+
+  gl.clearColor(0.05, 0.06, 0.09, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  gl.useProgram(prog);
+  gl.bindVertexArray(vao);
+  gl.uniformMatrix4fv(u.mvp, false, mvp);
+  gl.uniformMatrix4fv(u.model, false, model);
+  gl.uniformMatrix3fv(u.normalMat, false, normalMat3(model));
+  gl.uniform3fv(u.cameraPos, eye);
+  gl.uniform3fv(u.lightPos, lightPos);
+  gl.uniform3f(u.lightColor, 1.35, 1.25, 1.10);
+  gl.uniform3f(u.ambientLight, 0.22, 0.24, 0.30);
+  gl.uniform3f(u.albedo, 0.82, 0.28, 0.18); // 铜色，白高光更明显
+  gl.uniform1f(u.ka, 0.42);
+  gl.uniform1f(u.kd, kd);
+  gl.uniform1f(u.ks, ks);
+  gl.uniform1f(u.shininess, n);
+  gl.drawElements(gl.TRIANGLES, sphere.indices.length, gl.UNSIGNED_SHORT, 0);
+
+  const lightModel = mul(translate(identity(), lightPos[0], lightPos[1], lightPos[2]), scaleMat(0.08, 0.08, 0.08));
+  gl.useProgram(lightProg);
+  gl.bindVertexArray(lightVao);
+  gl.uniformMatrix4fv(uLightMvp, false, mul(mul(proj, view), lightModel));
+  gl.uniform3f(uLightColor, 1.0, 0.95, 0.75);
+  gl.drawElements(gl.TRIANGLES, lightMesh.indices.length, gl.UNSIGNED_SHORT, 0);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

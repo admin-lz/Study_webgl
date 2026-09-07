@@ -1,0 +1,1014 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · 风场流动线 (高度贴合)</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b0d14; overflow: hidden; font-family: ui-sans-serif, system-ui, sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+    canvas:active { cursor: grabbing; }
+    #hud {
+      position: fixed; left: 16px; top: 16px; color: #e8eef8; font-size: 13px; line-height: 1.5;
+      text-shadow: 0 1px 4px #000; user-select: none; width: 360px; pointer-events: none;
+    }
+    #hud b { color: #9fd4ff; }
+    #hud code { color: #f3d27a; font-size: 12px; }
+    #hud .row { pointer-events: auto; display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+    #hud input[type="range"] { flex: 1; }
+    #bar {
+      position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+      color: #e8eef8; font-size: 14px; text-align: center; text-shadow: 0 1px 4px #000;
+    }
+    #bar .track { width: 240px; height: 6px; background: #243044; border-radius: 4px; margin: 10px auto 0; overflow: hidden; }
+    #bar .fill { height: 100%; width: 0%; background: #4aa3ff; }
+    #err {
+      display: none; position: fixed; inset: 0; place-items: center;
+      color: #fff; background: #1a1a1a; padding: 24px; font-size: 16px; white-space: pre-wrap;
+    }
+    #legend {
+      position: fixed; right: 16px; bottom: 16px; width: 160px; color: #e8eef8; font-size: 11px;
+      text-shadow: 0 1px 3px #000; user-select: none;
+    }
+    #legend .grad {
+      height: 10px; border-radius: 2px;
+      background: linear-gradient(90deg, #1a237e, #00bcd4, #c6ff00, #ff6d00, #b71c1c);
+      margin: 4px 0;
+    }
+    #legend .ends { display: flex; justify-content: space-between; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="bar">
+    <div id="barText">加载风场 JSON…</div>
+    <div class="track"><div class="fill" id="fill"></div></div>
+  </div>
+  <div id="hud" style="display:none">
+    <b>WebGL2 · 风场流动线</b><br>
+    连续顺风平流 · 风速越快流得越快 · 全场同时铺满<br>
+    拖动旋转 · 滚轮缩放 · 右键平移
+    <div class="row">高度夸张 <input id="exag" type="range" min="1" max="40" value="3" /> <span id="exagVal">3×</span></div>
+    <div class="row">箭头密度 <input id="step" type="range" min="4" max="40" value="16" /> <span id="stepVal">每 16 格</span></div>
+    <div class="row">线束数量 <input id="flowN" type="range" min="12" max="90" step="3" value="90" /> <span id="flowNVal">90</span></div>
+    <div class="row">拖尾长度 <input id="trailLen" type="range" min="24" max="90" step="2" value="90" /> <span id="trailLenVal">90</span></div>
+    <div class="row">流动速度 <input id="flowSpd" type="range" min="1" max="40" value="1" /> <span id="flowSpdVal">1×</span></div>
+    <div class="row">线束间距 <input id="bundleGap" type="range" min="1" max="20" value="4" /> <span id="gapVal">4</span></div>
+    <div class="row">离地高度 <input id="flowH" type="range" min="50" max="400" step="10" value="80" /> <span id="flowHVal">80 m</span></div>
+    <div class="row">起点间隔 <input id="spawnGap" type="range" min="0.05" max="1" step="0.05" value="0.1" /> <span id="spawnGapVal">0.1 s</span></div>
+    <div class="row"><label><input id="showMesh" type="checkbox" checked /> 高度场</label>
+      <label><input id="showArrows" type="checkbox" /> 风向箭头</label>
+      <label><input id="showFlow" type="checkbox" checked /> 流动线</label></div>
+    <div id="stats" style="margin-top:8px;opacity:.85"></div>
+  </div>
+  <div id="legend" style="display:none">
+    风速 speed_2D (m/s)
+    <div class="grad"></div>
+    <div class="ends"><span id="sMin">0</span><span id="sMax">10</span></div>
+  </div>
+  <div id="err"></div>
+
+<script>
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+const bar = document.getElementById("bar");
+const fill = document.getElementById("fill");
+const hud = document.getElementById("hud");
+const legend = document.getElementById("legend");
+const statsEl = document.getElementById("stats");
+
+const gl = canvas.getContext("webgl2", { antialias: true });
+if (!gl) {
+  errBox.style.display = "grid";
+  errBox.textContent = "需要 WebGL2。";
+  throw new Error("no webgl2");
+}
+
+function fail(msg) {
+  bar.style.display = "none";
+  errBox.style.display = "grid";
+  errBox.textContent = msg;
+  throw new Error(msg);
+}
+
+function setProgress(p, text) {
+  fill.style.width = `${Math.round(p * 100)}%`;
+  if (text) document.getElementById("barText").textContent = text;
+}
+
+// ---------- math ----------
+const R_EARTH = 6371000;
+const DEG = Math.PI / 180;
+
+function lonLatHToENU(lon, lat, h, lon0, lat0, h0) {
+  const cos0 = Math.cos(lat0 * DEG);
+  const E = (lon - lon0) * DEG * cos0 * R_EARTH;
+  const N = (lat - lat0) * DEG * R_EARTH;
+  const U = h - h0;
+  return [E, U, -N]; // Y-up
+}
+
+function mul4(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      o[c * 4 + r] =
+        a[0 * 4 + r] * b[c * 4 + 0] +
+        a[1 * 4 + r] * b[c * 4 + 1] +
+        a[2 * 4 + r] * b[c * 4 + 2] +
+        a[3 * 4 + r] * b[c * 4 + 3];
+    }
+  }
+  return o;
+}
+function perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2);
+  const m = new Float32Array(16);
+  m[0] = f / aspect; m[5] = f;
+  m[10] = (far + near) / (near - far);
+  m[11] = -1;
+  m[14] = (2 * far * near) / (near - far);
+  return m;
+}
+function lookAt(eye, target, up) {
+  let zx = eye[0] - target[0], zy = eye[1] - target[1], zz = eye[2] - target[2];
+  let len = Math.hypot(zx, zy, zz) || 1;
+  zx /= len; zy /= len; zz /= len;
+  let xx = up[1] * zz - up[2] * zy;
+  let xy = up[2] * zx - up[0] * zz;
+  let xz = up[0] * zy - up[1] * zx;
+  len = Math.hypot(xx, xy, xz) || 1;
+  xx /= len; xy /= len; xz /= len;
+  const yx = zy * xz - zz * xy;
+  const yy = zz * xx - zx * xz;
+  const yz = zx * xy - zy * xx;
+  const m = new Float32Array(16);
+  m[0] = xx; m[1] = yx; m[2] = zx; m[3] = 0;
+  m[4] = xy; m[5] = yy; m[6] = zy; m[7] = 0;
+  m[8] = xz; m[9] = yz; m[10] = zz; m[11] = 0;
+  m[12] = -(xx * eye[0] + xy * eye[1] + xz * eye[2]);
+  m[13] = -(yx * eye[0] + yy * eye[1] + yz * eye[2]);
+  m[14] = -(zx * eye[0] + zy * eye[1] + zz * eye[2]);
+  m[15] = 1;
+  return m;
+}
+
+function speedColor(t) {
+  // 0..1 → blue-cyan-lime-orange-red
+  const stops = [
+    [0.10, 0.14, 0.49],
+    [0.00, 0.74, 0.83],
+    [0.78, 1.00, 0.00],
+    [1.00, 0.43, 0.00],
+    [0.72, 0.11, 0.11],
+  ];
+  t = Math.min(1, Math.max(0, t));
+  const x = t * (stops.length - 1);
+  const i = Math.min(stops.length - 2, Math.floor(x));
+  const f = x - i;
+  const a = stops[i], b = stops[i + 1];
+  return [
+    a[0] + (b[0] - a[0]) * f,
+    a[1] + (b[1] - a[1]) * f,
+    a[2] + (b[2] - a[2]) * f,
+  ];
+}
+
+// ---------- shaders ----------
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    fail(gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) fail(gl.getProgramInfoLog(p));
+  return p;
+}
+
+const MESH_VS = `#version 300 es
+layout(location=0) in vec3 a_pos;
+layout(location=1) in vec3 a_color;
+uniform mat4 u_mvp;
+uniform float u_exag;
+out vec3 v_color;
+void main() {
+  vec3 p = vec3(a_pos.x, a_pos.y * u_exag, a_pos.z);
+  v_color = a_color;
+  gl_Position = u_mvp * vec4(p, 1.0);
+}`;
+const MESH_FS = `#version 300 es
+precision mediump float;
+in vec3 v_color;
+uniform float u_alpha;
+out vec4 outColor;
+void main() {
+  outColor = vec4(v_color, u_alpha);
+}`;
+
+const LINE_VS = `#version 300 es
+layout(location=0) in vec3 a_pos;
+layout(location=1) in vec3 a_color;
+uniform mat4 u_mvp;
+uniform float u_exag;
+out vec3 v_color;
+void main() {
+  vec3 p = vec3(a_pos.x, a_pos.y * u_exag, a_pos.z);
+  v_color = a_color;
+  gl_Position = u_mvp * vec4(p, 1.0);
+}`;
+const LINE_FS = `#version 300 es
+precision mediump float;
+in vec3 v_color;
+uniform float u_alpha;
+out vec4 outColor;
+void main() {
+  outColor = vec4(v_color, u_alpha);
+}`;
+
+const FLOW_VS = `#version 300 es
+layout(location=0) in vec3 a_pos;
+layout(location=1) in vec4 a_color; // rgb + alpha
+uniform mat4 u_mvp;
+uniform float u_exag;
+uniform float u_lift; // 离地高度（米），与高度夸张一起作用
+out vec4 v_color;
+void main() {
+  vec3 p = vec3(a_pos.x, (a_pos.y + u_lift) * u_exag, a_pos.z);
+  v_color = a_color;
+  gl_Position = u_mvp * vec4(p, 1.0);
+}`;
+const FLOW_FS = `#version 300 es
+precision mediump float;
+in vec4 v_color;
+out vec4 outColor;
+void main() {
+  outColor = v_color;
+}`;
+
+const meshProg = program(MESH_VS, MESH_FS);
+const lineProg = program(LINE_VS, LINE_FS);
+const flowProg = program(FLOW_VS, FLOW_FS);
+
+// ---------- load JSON (supports progress) ----------
+async function loadJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`加载失败 ${url}: ${res.status}`);
+  const total = Number(res.headers.get("content-length")) || 0;
+  if (!res.body || !total) {
+    setProgress(0.3, "解析 JSON…");
+    return res.json();
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let received = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    setProgress(Math.min(0.85, received / total), `下载 ${(received / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB`);
+  }
+  setProgress(0.9, "解析 JSON…");
+  const buf = new Uint8Array(received);
+  let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.length; }
+  return JSON.parse(new TextDecoder().decode(buf));
+}
+
+function buildArrows(positions, nx, ny, uu, vv, spd, sMin, sMax, arrowStep) {
+  const arrowPos = [];
+  const arrowCol = [];
+  const scale = 80; // meters per (m/s)
+  const sRange = Math.max(1e-6, sMax - sMin);
+  for (let j = 0; j < ny; j += arrowStep) {
+    for (let i = 0; i < nx; i += arrowStep) {
+      const idx = j * nx + i;
+      const x0 = positions[idx * 3];
+      const y0 = positions[idx * 3 + 1];
+      const z0 = positions[idx * 3 + 2];
+      const u = uu[i][j];
+      const v = vv[i][j];
+      // u=east → +E, v=north → -Z in Y-up ENU
+      const x1 = x0 + u * scale;
+      const y1 = y0 + 2;
+      const z1 = z0 - v * scale;
+      const t = (spd[i][j] - sMin) / sRange;
+      const c = speedColor(t);
+      arrowPos.push(x0, y0 + 1, z0, x1, y1, z1);
+      arrowCol.push(c[0], c[1], c[2], c[0], c[1], c[2]);
+      const dx = x1 - x0, dz = z1 - z0;
+      const len = Math.hypot(dx, dz) || 1;
+      const px = (-dz / len) * 25, pz = (dx / len) * 25;
+      arrowPos.push(x1, y1, z1, x1 - dx * 0.25 + px, y1, z1 - dz * 0.25 + pz);
+      arrowPos.push(x1, y1, z1, x1 - dx * 0.25 - px, y1, z1 - dz * 0.25 - pz);
+      arrowCol.push(c[0], c[1], c[2], c[0], c[1], c[2]);
+      arrowCol.push(c[0], c[1], c[2], c[0], c[1], c[2]);
+    }
+  }
+  return {
+    arrowPositions: new Float32Array(arrowPos),
+    arrowColors: new Float32Array(arrowCol),
+  };
+}
+
+function buildGeometry(data, arrowStep) {
+  const xs = data.x_range; // lon, length nx
+  const ys = data.y_range; // lat, length ny
+  const zs = data.z_range; // [nx][ny]
+  const spd = data.speed_2D;
+  const uu = data.speed_u;
+  const vv = data.speed_v;
+  const nx = xs.length;
+  const ny = ys.length;
+  if (zs.length !== nx || zs[0].length !== ny) {
+    throw new Error(`维度不一致: x=${nx} y=${ny} z=${zs.length}x${zs[0]?.length}`);
+  }
+
+  const lon0 = xs[Math.floor(nx / 2)];
+  const lat0 = ys[Math.floor(ny / 2)];
+  let zMin = Infinity, zMax = -Infinity, sMin = Infinity, sMax = -Infinity;
+  for (let i = 0; i < nx; i++) {
+    for (let j = 0; j < ny; j++) {
+      const z = zs[i][j], s = spd[i][j];
+      if (z < zMin) zMin = z;
+      if (z > zMax) zMax = z;
+      if (s < sMin) sMin = s;
+      if (s > sMax) sMax = s;
+    }
+  }
+  const h0 = zMin;
+
+  const nVert = nx * ny;
+  const positions = new Float32Array(nVert * 3);
+  const colors = new Float32Array(nVert * 3);
+  const sRange = Math.max(1e-6, sMax - sMin);
+
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const idx = j * nx + i;
+      const [E, U, Zn] = lonLatHToENU(xs[i], ys[j], zs[i][j], lon0, lat0, h0);
+      positions[idx * 3] = E;
+      positions[idx * 3 + 1] = U;
+      positions[idx * 3 + 2] = Zn;
+      const t = (spd[i][j] - sMin) / sRange;
+      const c = speedColor(t);
+      colors[idx * 3] = c[0];
+      colors[idx * 3 + 1] = c[1];
+      colors[idx * 3 + 2] = c[2];
+    }
+  }
+
+  const nQuad = (nx - 1) * (ny - 1);
+  const indices = new Uint32Array(nQuad * 6);
+  let w = 0;
+  for (let j = 0; j < ny - 1; j++) {
+    for (let i = 0; i < nx - 1; i++) {
+      const a = j * nx + i;
+      const b = a + 1;
+      const c0 = a + nx;
+      const d = c0 + 1;
+      indices[w++] = a; indices[w++] = c0; indices[w++] = b;
+      indices[w++] = b; indices[w++] = c0; indices[w++] = d;
+    }
+  }
+
+  const arrow = buildArrows(positions, nx, ny, uu, vv, spd, sMin, sMax, arrowStep);
+
+  let maxR = 0;
+  for (let i = 0; i < nVert; i++) {
+    const x = positions[i * 3], y = positions[i * 3 + 1], z = positions[i * 3 + 2];
+    maxR = Math.max(maxR, Math.hypot(x, y * 3, z));
+  }
+
+  return {
+    nx, ny, lon0, lat0, h0, zMin, zMax, sMin, sMax,
+    positions, colors, indices,
+    xs, ys, zs, uu, vv, spd,
+    ...arrow,
+    radius: maxR,
+    meta: {
+      lonMin: xs[0], lonMax: xs[nx - 1],
+      latMin: ys[0], latMax: ys[ny - 1],
+      heightConst: data.height,
+    },
+  };
+}
+
+function createMeshBuffers(geo) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+
+  const pb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, pb);
+  gl.bufferData(gl.ARRAY_BUFFER, geo.positions, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+
+  const cb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, cb);
+  gl.bufferData(gl.ARRAY_BUFFER, geo.colors, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+
+  const ib = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geo.indices, gl.STATIC_DRAW);
+
+  gl.bindVertexArray(null);
+  return { vao, count: geo.indices.length };
+}
+
+function createLineBuffers(pos, col) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const pb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, pb);
+  gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  const cb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, cb);
+  gl.bufferData(gl.ARRAY_BUFFER, col, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return { vao, count: pos.length / 3, pb, cb };
+}
+
+// ---------- continuous wind ribbons on height ----------
+let TRAIL_LEN = 42;
+const STRANDS = 3; // 每束 3 股平行线
+
+function sampleField(geo, gi, gj) {
+  const i0 = Math.floor(gi), j0 = Math.floor(gj);
+  const i1 = Math.min(geo.nx - 1, i0 + 1);
+  const j1 = Math.min(geo.ny - 1, j0 + 1);
+  const fx = gi - i0, fy = gj - j0;
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const bilerp = (q00, q10, q01, q11) =>
+    lerp(lerp(q00, q10, fx), lerp(q01, q11, fx), fy);
+
+  const u = bilerp(geo.uu[i0][j0], geo.uu[i1][j0], geo.uu[i0][j1], geo.uu[i1][j1]);
+  const v = bilerp(geo.vv[i0][j0], geo.vv[i1][j0], geo.vv[i0][j1], geo.vv[i1][j1]);
+  const h = bilerp(geo.zs[i0][j0], geo.zs[i1][j0], geo.zs[i0][j1], geo.zs[i1][j1]);
+  const s = bilerp(geo.spd[i0][j0], geo.spd[i1][j0], geo.spd[i0][j1], geo.spd[i1][j1]);
+  return { u, v, h, s };
+}
+
+function gridToWorld(geo, gi, gj, h) {
+  const i0 = Math.min(geo.nx - 2, Math.max(0, Math.floor(gi)));
+  const j0 = Math.min(geo.ny - 2, Math.max(0, Math.floor(gj)));
+  const fx = gi - i0, fy = gj - j0;
+  const lon = geo.xs[i0] + (geo.xs[i0 + 1] - geo.xs[i0]) * fx;
+  const lat = geo.ys[j0] + (geo.ys[j0 + 1] - geo.ys[j0]) * fy;
+  return lonLatHToENU(lon, lat, h, geo.lon0, geo.lat0, geo.h0);
+}
+
+function createFlowSystem(geo, count, trailLen) {
+  TRAIL_LEN = trailLen;
+  const alongPerLane = 3;
+  const nLanes = Math.max(4, Math.round(count / alongPerLane));
+  const activeTarget = nLanes * alongPerLane;
+  // 双倍池：旧线收尾的同时，新线立刻从入流出现，两波重叠
+  const pool = activeTarget * 2;
+  const particles = new Array(pool);
+  const nSeg = pool * STRANDS * (TRAIL_LEN - 1);
+  const positions = new Float32Array(nSeg * 2 * 3);
+  const colors = new Float32Array(nSeg * 2 * 4);
+  const lift = 0;
+
+  const cellE = Math.abs((geo.xs[1] - geo.xs[0]) * DEG * Math.cos(geo.lat0 * DEG) * R_EARTH);
+  const cellN = Math.abs((geo.ys[1] - geo.ys[0]) * DEG * R_EARTH);
+
+  let meanU = 0, meanV = 0, meanSpd = 0, nSamp = 0;
+  for (let i = 0; i < geo.nx; i += 12) {
+    for (let j = 0; j < geo.ny; j += 12) {
+      meanU += geo.uu[i][j];
+      meanV += geo.vv[i][j];
+      meanSpd += geo.spd[i][j];
+      nSamp++;
+    }
+  }
+  meanU /= nSamp;
+  meanV /= nSamp;
+  meanSpd = Math.max(0.5, meanSpd / nSamp);
+  const mLen = Math.hypot(meanU, meanV) || 1;
+  const fE = meanU / mLen;
+  const fN = meanV / mLen;
+
+  function advectStep(gi, gj, dt, speedMul) {
+    const samp = sampleField(
+      geo,
+      Math.min(geo.nx - 1.001, Math.max(0, gi)),
+      Math.min(geo.ny - 1.001, Math.max(0, gj)),
+    );
+    const local = Math.hypot(samp.u, samp.v);
+    const boost = 0.55 + 0.9 * (local / meanSpd);
+    const FLOW_SCALE = 120;
+    gi += (samp.u / cellE) * dt * speedMul * FLOW_SCALE * boost;
+    gj += (samp.v / cellN) * dt * speedMul * FLOW_SCALE * boost;
+    return { gi, gj, samp, local };
+  }
+
+  const sRange = Math.max(1e-6, geo.sMax - geo.sMin);
+
+  function writeHead(p, gi, gj, samp) {
+    const [x, y, z] = gridToWorld(geo, gi, gj, samp.h);
+    const spd = Math.hypot(samp.u, samp.v) || 1;
+    p.head = (p.head + 1) % TRAIL_LEN;
+    p.trail[p.head * 3] = x;
+    p.trail[p.head * 3 + 1] = y + lift;
+    p.trail[p.head * 3 + 2] = z;
+    p.dir[p.head * 2] = samp.u / spd;
+    p.dir[p.head * 2 + 1] = samp.v / spd;
+    p.trailSpd[p.head] = samp.s;
+    p.filled = Math.min(TRAIL_LEN, p.filled + 1);
+  }
+
+  function inflowOrigin(crossT) {
+    // 从入流边内侧出发，两侧留一点，避免一出生就贴死边界
+    const inset = 8;
+    const t = 0.03 + Math.min(1, Math.max(0, crossT)) * 0.94;
+    let gi, gj;
+    if (Math.abs(fE) >= Math.abs(fN)) {
+      gi = fE < 0 ? geo.nx - 1 - inset : inset;
+      gj = t * (geo.ny - 1);
+    } else {
+      gj = fN < 0 ? geo.ny - 1 - inset : inset;
+      gi = t * (geo.nx - 1);
+    }
+    return { gi, gj };
+  }
+
+  function seedOnLane(crossT, depthFrames, speedMul) {
+    let { gi, gj } = inflowOrigin(crossT);
+    const dt = 1 / 60;
+    for (let k = 0; k < depthFrames; k++) {
+      const next = advectStep(gi, gj, dt, speedMul);
+      gi = next.gi;
+      gj = next.gj;
+      gi = Math.min(geo.nx - 1.2, Math.max(0.2, gi));
+      gj = Math.min(geo.ny - 1.2, Math.max(0.2, gj));
+    }
+    return { gi, gj, crossT };
+  }
+
+  // 只有下风出口算出场；入流边 / 侧边不算死
+  function leftThroughExit(gi, gj) {
+    if (Math.abs(fE) >= Math.abs(fN)) {
+      return fE < 0 ? gi < 0.4 : gi > geo.nx - 1.4;
+    }
+    return fN < 0 ? gj < 0.4 : gj > geo.ny - 1.4;
+  }
+
+  function clampDomain(gi, gj) {
+    return {
+      gi: Math.min(geo.nx - 1.05, Math.max(0.05, gi)),
+      gj: Math.min(geo.ny - 1.05, Math.max(0.05, gj)),
+    };
+  }
+
+  function resetTrail(p) {
+    p.head = 0;
+    p.filled = 0;
+  }
+
+  function activate(p, crossT, depthFrames, growTrail, canEmit) {
+    const speedMul = 18;
+    const origin = seedOnLane(crossT, 0, speedMul);
+    const pos = depthFrames > 0 ? seedOnLane(crossT, depthFrames, speedMul) : origin;
+    p.originGi = origin.gi;
+    p.originGj = origin.gj;
+    p.gi = pos.gi;
+    p.gj = pos.gj;
+    p.crossT = crossT;
+    p.alive = true;
+    p.draining = false;
+    p.spawnedNext = !canEmit;
+    p.spawnWait = -1;
+    p.age = 0;
+    resetTrail(p);
+
+    if (growTrail) {
+      const hist = [];
+      let gi = pos.gi, gj = pos.gj;
+      const backN = Math.min(TRAIL_LEN - 1, 28);
+      for (let k = 0; k < backN; k++) {
+        const samp = sampleField(
+          geo,
+          Math.min(geo.nx - 1.001, Math.max(0, gi)),
+          Math.min(geo.ny - 1.001, Math.max(0, gj)),
+        );
+        hist.push({ gi, gj, samp });
+        const local = Math.hypot(samp.u, samp.v) || 1;
+        const boost = 0.55 + 0.9 * (local / meanSpd);
+        gi -= (samp.u / cellE) * (1 / 60) * speedMul * 120 * boost;
+        gj -= (samp.v / cellN) * (1 / 60) * speedMul * 120 * boost;
+        const c = clampDomain(gi, gj);
+        gi = c.gi;
+        gj = c.gj;
+      }
+      for (let k = hist.length - 1; k >= 0; k--) {
+        writeHead(p, hist[k].gi, hist[k].gj, hist[k].samp);
+      }
+      p.gi = pos.gi;
+      p.gj = pos.gj;
+    } else {
+      const samp = sampleField(
+        geo,
+        Math.min(geo.nx - 1.001, Math.max(0, p.gi)),
+        Math.min(geo.ny - 1.001, Math.max(0, p.gj)),
+      );
+      writeHead(p, p.gi, p.gj, samp);
+    }
+  }
+
+  function makeParticle() {
+    return {
+      gi: 0, gj: 0, originGi: 0, originGj: 0, crossT: 0,
+      head: 0, filled: 0, age: 0,
+      alive: false, draining: false, spawnedNext: false, spawnWait: -1,
+      trail: new Float32Array(TRAIL_LEN * 3),
+      dir: new Float32Array(TRAIL_LEN * 2),
+      trailSpd: new Float32Array(TRAIL_LEN),
+    };
+  }
+
+  function findIdle() {
+    for (let i = 0; i < pool; i++) {
+      if (!particles[i].alive) return particles[i];
+    }
+    return null;
+  }
+
+  function spawnSuccessor(p) {
+    if (p.spawnedNext) return;
+    const idle = findIdle();
+    if (!idle) return;
+    p.spawnedNext = true;
+    activate(idle, p.crossT, 0, false, true);
+  }
+
+  for (let i = 0; i < pool; i++) particles[i] = makeParticle();
+
+  const travelFrames = Math.max(220, Math.floor(Math.hypot(geo.nx, geo.ny) * 0.55));
+  let idx = 0;
+  for (let lane = 0; lane < nLanes; lane++) {
+    const crossT = nLanes <= 1 ? 0.5 : lane / (nLanes - 1);
+    for (let a = 0; a < alongPerLane; a++) {
+      const p = particles[idx++];
+      const depthFrames = a === 0 ? 0 : Math.floor((a / alongPerLane) * travelFrames);
+      activate(p, crossT, depthFrames, a > 0, a === 0);
+    }
+  }
+
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const pb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, pb);
+  gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  const cb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, cb);
+  gl.bufferData(gl.ARRAY_BUFFER, colors, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+
+  function step(dt, speedMul, gapCells, spawnGapSec) {
+    const dtClamped = Math.min(0.05, Math.max(0.001, dt));
+    const gap = gapCells * 26;
+    const spawnGap = Math.max(0, spawnGapSec);
+    let w = 0;
+
+    for (let i = 0; i < pool; i++) {
+      const p = particles[i];
+      if (!p.alive) continue;
+      p.age++;
+
+      const next = p.draining ? null : advectStep(p.gi, p.gj, dtClamped, speedMul);
+      if (next) {
+        p.gi = next.gi;
+        p.gj = next.gj;
+      }
+
+      const out = p.age > 12 && leftThroughExit(p.gi, p.gj);
+      if (!out) {
+        const clamped = clampDomain(p.gi, p.gj);
+        p.gi = clamped.gi;
+        p.gj = clamped.gj;
+      }
+
+      // 整条拖尾都离开起点（环缓冲写满）→ 起点空了，短间隔后再从起点生成
+      if (!p.spawnedNext && p.filled >= TRAIL_LEN && p.spawnWait < 0) {
+        p.spawnWait = spawnGap;
+      }
+      if (p.spawnWait >= 0 && !p.spawnedNext) {
+        p.spawnWait -= dtClamped;
+        if (p.spawnWait <= 0) spawnSuccessor(p);
+      }
+
+      if (!p.draining && out) p.draining = true;
+
+      if (p.draining) {
+        p.filled = Math.max(0, p.filled - 1);
+        if (p.filled <= 1) {
+          if (!p.spawnedNext) spawnSuccessor(p); // 起点线若被掐掉，立刻补一束
+          p.alive = false;
+          p.draining = false;
+          p.spawnedNext = false;
+          p.spawnWait = -1;
+        }
+      } else if (next) {
+        writeHead(p, p.gi, p.gj, next.samp);
+      }
+
+      const segs = Math.min(TRAIL_LEN - 1, Math.max(0, p.filled - 1));
+      if (segs < 2) continue;
+
+      for (let s = 0; s < STRANDS; s++) {
+        const side = s - (STRANDS - 1) / 2;
+        for (let t = 0; t < segs; t++) {
+          const i0 = (p.head - segs + t + TRAIL_LEN * 2) % TRAIL_LEN;
+          const i1 = (i0 + 1) % TRAIL_LEN;
+          const u0 = t / segs;
+          const u1 = (t + 1) / segs;
+
+          const e0 = p.dir[i0 * 2], n0 = p.dir[i0 * 2 + 1];
+          const e1 = p.dir[i1 * 2], n1 = p.dir[i1 * 2 + 1];
+          const dx0 = -n0 * side * gap;
+          const dz0 = -e0 * side * gap;
+          const dx1 = -n1 * side * gap;
+          const dz1 = -e1 * side * gap;
+
+          const c0 = speedColor((p.trailSpd[i0] - geo.sMin) / sRange);
+          const c1 = speedColor((p.trailSpd[i1] - geo.sMin) / sRange);
+          const a0 = Math.pow(u0, 1.35) * 0.95;
+          const a1 = Math.pow(u1, 1.35);
+
+          const o = w * 6;
+          positions[o] = p.trail[i0 * 3] + dx0;
+          positions[o + 1] = p.trail[i0 * 3 + 1];
+          positions[o + 2] = p.trail[i0 * 3 + 2] + dz0;
+          positions[o + 3] = p.trail[i1 * 3] + dx1;
+          positions[o + 4] = p.trail[i1 * 3 + 1];
+          positions[o + 5] = p.trail[i1 * 3 + 2] + dz1;
+          const co = w * 8;
+          colors[co] = c0[0]; colors[co + 1] = c0[1]; colors[co + 2] = c0[2]; colors[co + 3] = a0;
+          colors[co + 4] = c1[0]; colors[co + 5] = c1[1]; colors[co + 6] = c1[2]; colors[co + 7] = a1;
+          w++;
+        }
+      }
+    }
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, pb);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, positions.subarray(0, w * 6));
+    gl.bindBuffer(gl.ARRAY_BUFFER, cb);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, colors.subarray(0, w * 8));
+    return w * 2;
+  }
+
+  return {
+    vao,
+    liveCount: 0,
+    step(dt, speedMul, gapCells, spawnGapSec) {
+      this.liveCount = step(dt, speedMul, gapCells, spawnGapSec);
+    },
+  };
+}
+
+// ---------- camera ----------
+const cam = {
+  yaw: 0.6,
+  pitch: 0.55,
+  dist: 18000,
+  target: [0, 800, 0],
+};
+
+let dragging = false;
+let panning = false;
+let lastX = 0, lastY = 0;
+
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+canvas.addEventListener("pointerdown", (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  dragging = e.button === 0;
+  panning = e.button === 2;
+  lastX = e.clientX; lastY = e.clientY;
+});
+canvas.addEventListener("pointerup", () => { dragging = panning = false; });
+canvas.addEventListener("pointermove", (e) => {
+  const dx = e.clientX - lastX, dy = e.clientY - lastY;
+  lastX = e.clientX; lastY = e.clientY;
+  if (dragging) {
+    cam.yaw -= dx * 0.005;
+    cam.pitch += dy * 0.005;
+    cam.pitch = Math.min(1.45, Math.max(0.08, cam.pitch));
+  } else if (panning) {
+    const pan = cam.dist * 0.001;
+    const cos = Math.cos(cam.yaw), sin = Math.sin(cam.yaw);
+    cam.target[0] += (-dx * cos - dy * 0 * sin) * pan;
+    cam.target[2] += (dx * sin - dy * 0) * pan;
+    cam.target[1] += dy * pan * 0.5;
+  }
+});
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  cam.dist *= e.deltaY > 0 ? 1.08 : 0.92;
+  cam.dist = Math.min(80000, Math.max(500, cam.dist));
+}, { passive: false });
+
+function eyePos() {
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+  return [
+    cam.target[0] + cam.dist * cp * sy,
+    cam.target[1] + cam.dist * sp,
+    cam.target[2] + cam.dist * cp * cy,
+  ];
+}
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio, 2);
+  const w = canvas.clientWidth | 0;
+  const h = canvas.clientHeight | 0;
+  canvas.width = Math.max(1, (w * dpr) | 0);
+  canvas.height = Math.max(1, (h * dpr) | 0);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+addEventListener("resize", resize);
+resize();
+
+// ---------- main ----------
+const DATA_URLS = ["a.json", "../a.json"];
+
+(async () => {
+  let data = null;
+  let lastErr = null;
+  for (const url of DATA_URLS) {
+    try {
+      setProgress(0.05, `请求 ${url}…`);
+      data = await loadJSON(url);
+      break;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!data) {
+    fail("无法加载 a.json。\n请用本地服务打开本目录，并保证 a.json 在同目录或上一级。\n\n" + lastErr);
+  }
+
+  setProgress(0.95, "构建网格…");
+  await new Promise((r) => setTimeout(r, 20));
+
+  let arrowStep = Number(document.getElementById("step").value);
+  let geo = buildGeometry(data, arrowStep);
+  let mesh = createMeshBuffers(geo);
+  let arrows = createLineBuffers(geo.arrowPositions, geo.arrowColors);
+  let flowCount = Number(document.getElementById("flowN").value);
+  let trailLen = Number(document.getElementById("trailLen").value);
+  let flow = createFlowSystem(geo, flowCount, trailLen);
+
+  cam.dist = geo.radius * 1.35;
+  cam.target = [0, (geo.zMax - geo.zMin) * 0.15, 0];
+
+  document.getElementById("sMin").textContent = geo.sMin.toFixed(2);
+  document.getElementById("sMax").textContent = geo.sMax.toFixed(2);
+  statsEl.innerHTML =
+    `网格 <code>${geo.nx} × ${geo.ny}</code> = ${(geo.nx * geo.ny).toLocaleString()} 点<br>` +
+    `经度 ${geo.meta.lonMin.toFixed(4)} ~ ${geo.meta.lonMax.toFixed(4)}<br>` +
+    `纬度 ${geo.meta.latMin.toFixed(4)} ~ ${geo.meta.latMax.toFixed(4)}<br>` +
+    `高度 z ${geo.zMin.toFixed(1)} ~ ${geo.zMax.toFixed(1)} m（字段 height=${geo.meta.heightConst}）`;
+
+  bar.style.display = "none";
+  hud.style.display = "block";
+  legend.style.display = "block";
+
+  const uExag = () => Number(document.getElementById("exag").value);
+  document.getElementById("exag").addEventListener("input", (e) => {
+    document.getElementById("exagVal").textContent = e.target.value + "×";
+  });
+  document.getElementById("flowSpd").addEventListener("input", (e) => {
+    document.getElementById("flowSpdVal").textContent = e.target.value + "×";
+  });
+  document.getElementById("bundleGap").addEventListener("input", (e) => {
+    document.getElementById("gapVal").textContent = e.target.value;
+  });
+  document.getElementById("flowH").addEventListener("input", (e) => {
+    document.getElementById("flowHVal").textContent = e.target.value + " m";
+  });
+  document.getElementById("spawnGap").addEventListener("input", (e) => {
+    document.getElementById("spawnGapVal").textContent = Number(e.target.value).toFixed(1) + " s";
+  });
+  function rebuildFlow() {
+    flowCount = Number(document.getElementById("flowN").value);
+    trailLen = Number(document.getElementById("trailLen").value);
+    document.getElementById("flowNVal").textContent = String(flowCount);
+    document.getElementById("trailLenVal").textContent = String(trailLen);
+    flow = createFlowSystem(geo, flowCount, trailLen);
+  }
+  document.getElementById("flowN").addEventListener("input", (e) => {
+    document.getElementById("flowNVal").textContent = e.target.value;
+  });
+  document.getElementById("flowN").addEventListener("change", rebuildFlow);
+  document.getElementById("trailLen").addEventListener("input", (e) => {
+    document.getElementById("trailLenVal").textContent = e.target.value;
+  });
+  document.getElementById("trailLen").addEventListener("change", rebuildFlow);
+
+  function rebuildArrows() {
+    arrowStep = Number(document.getElementById("step").value);
+    document.getElementById("stepVal").textContent = `每 ${arrowStep} 格`;
+    const g = buildArrows(
+      geo.positions, geo.nx, geo.ny, geo.uu, geo.vv, geo.spd, geo.sMin, geo.sMax, arrowStep,
+    );
+    geo.arrowPositions = g.arrowPositions;
+    geo.arrowColors = g.arrowColors;
+    arrows = createLineBuffers(geo.arrowPositions, geo.arrowColors);
+  }
+  document.getElementById("step").addEventListener("change", rebuildArrows);
+  document.getElementById("step").addEventListener("input", (e) => {
+    document.getElementById("stepVal").textContent = `每 ${e.target.value} 格`;
+  });
+
+  const showMesh = document.getElementById("showMesh");
+  const showArrows = document.getElementById("showArrows");
+  const showFlow = document.getElementById("showFlow");
+
+  gl.enable(gl.DEPTH_TEST);
+  gl.clearColor(0.043, 0.051, 0.078, 1);
+
+  let lastT = performance.now();
+
+  function frame(now) {
+    resize();
+    const dt = (now - lastT) / 1000;
+    lastT = now;
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    const eye = eyePos();
+    const proj = perspective(50 * DEG, canvas.width / canvas.height, 10, 200000);
+    const view = lookAt(eye, cam.target, [0, 1, 0]);
+    const mvp = mul4(proj, view);
+    const exag = uExag();
+
+    if (showMesh.checked) {
+      gl.disable(gl.BLEND);
+      gl.depthMask(true);
+      gl.useProgram(meshProg);
+      gl.uniformMatrix4fv(gl.getUniformLocation(meshProg, "u_mvp"), false, mvp);
+      gl.uniform1f(gl.getUniformLocation(meshProg, "u_exag"), exag);
+      gl.uniform1f(gl.getUniformLocation(meshProg, "u_alpha"), showFlow.checked ? 0.35 : 1.0);
+      if (showFlow.checked) {
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      }
+      gl.bindVertexArray(mesh.vao);
+      gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_INT, 0);
+    }
+
+    if (showArrows.checked) {
+      gl.disable(gl.BLEND);
+      gl.depthMask(true);
+      gl.useProgram(lineProg);
+      gl.uniformMatrix4fv(gl.getUniformLocation(lineProg, "u_mvp"), false, mvp);
+      gl.uniform1f(gl.getUniformLocation(lineProg, "u_exag"), exag);
+      gl.uniform1f(gl.getUniformLocation(lineProg, "u_alpha"), 1.0);
+      gl.bindVertexArray(arrows.vao);
+      gl.drawArrays(gl.LINES, 0, arrows.count);
+    }
+
+    if (showFlow.checked) {
+      const speedMul = Number(document.getElementById("flowSpd").value);
+      const gapCells = Number(document.getElementById("bundleGap").value);
+      const spawnGapSec = Number(document.getElementById("spawnGap").value);
+      flow.step(dt, speedMul, gapCells, spawnGapSec);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+      gl.depthMask(false);
+      gl.useProgram(flowProg);
+      gl.uniformMatrix4fv(gl.getUniformLocation(flowProg, "u_mvp"), false, mvp);
+      gl.uniform1f(gl.getUniformLocation(flowProg, "u_exag"), exag);
+      gl.uniform1f(gl.getUniformLocation(flowProg, "u_lift"), Number(document.getElementById("flowH").value));
+      gl.bindVertexArray(flow.vao);
+      gl.drawArrays(gl.LINES, 0, flow.liveCount);
+      gl.depthMask(true);
+      gl.disable(gl.BLEND);
+    }
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})().catch((e) => fail(String(e && e.stack || e)));
+</script>
+</body>
+</html>

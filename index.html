@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGPU Path Tracing Starter</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #111; overflow: hidden; font-family: ui-sans-serif, system-ui, sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #hud {
+      position: fixed; left: 16px; top: 16px; color: #eee; font-size: 13px; line-height: 1.55;
+      text-shadow: 0 1px 4px #000; pointer-events: none; user-select: none;
+    }
+    #hud b { color: #8fd3ff; }
+    #err {
+      display: none; position: fixed; inset: 0; place-items: center;
+      color: #fff; background: #1a1a1a; padding: 24px; font-size: 16px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="hud"></div>
+  <div id="err"></div>
+
+<script type="module">
+/*
+  Minimal WebGPU path tracer you can edit.
+
+  JS      -> device / buffers / dispatch compute, then blit with a fullscreen triangle
+  compute -> per pixel: make ray -> bounce loop -> accumulate
+  vs/fs   -> display + tonemap only (usually leave it)
+
+  Edit PATHTRACE_WGSL in this order:
+    1. Cornell box sizes / colors / extra AABBs
+    2. bounce count and light strength
+    3. scatter() -> add mirrors with reflect(rd, n)
+    4. replace AABB with triangles, then add a BVH
+*/
+
+const canvas = document.getElementById("c");
+const hud = document.getElementById("hud");
+const errBox = document.getElementById("err");
+
+function fail(msg) {
+  errBox.style.display = "grid";
+  errBox.textContent = msg;
+  throw new Error(msg);
+}
+
+if (!navigator.gpu) {
+  fail("No WebGPU. Use latest Chrome/Edge with hardware acceleration on.");
+}
+
+const adapter = await navigator.gpu.requestAdapter();
+if (!adapter) fail("No GPU adapter.");
+const device = await adapter.requestDevice();
+const context = canvas.getContext("webgpu");
+const format = navigator.gpu.getPreferredCanvasFormat();
+
+const PATHTRACE_WGSL = /* wgsl */ `
+struct Uniforms {
+  origin: vec3f,
+  frame: f32,
+  lowerLeft: vec3f,
+  maxBounces: f32,
+  horizontal: vec3f,
+  _pad0: f32,
+  vertical: vec3f,
+  _pad1: f32,
+  resolution: vec2f,
+  seed: vec2f,
+};
+
+@group(0) @binding(0) var<uniform> uni: Uniforms;
+@group(0) @binding(1) var<storage, read_write> accum: array<vec4f>;
+@group(0) @binding(2) var outImage: texture_storage_2d<rgba16float, write>;
+
+struct Ray { orig: vec3f, dir: vec3f }
+struct Hit {
+  t: f32,
+  p: vec3f,
+  n: vec3f,
+  albedo: vec3f,
+  emit: vec3f,
+}
+
+const PI = 3.141592653589793;
+const EPS = 1e-3;
+const INF = 1e30;
+
+fn pcg(n: u32) -> u32 {
+  var h = n * 747796405u + 2891336453u;
+  let w = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+fn rand(state: ptr<function, u32>) -> f32 {
+  *state = pcg(*state);
+  return f32(*state) * (1.0 / 4294967295.0);
+}
+
+fn applyOnb(n: vec3f, local: vec3f) -> vec3f {
+  let sgn = select(-1.0, 1.0, n.z >= 0.0);
+  let a = -1.0 / (sgn + n.z);
+  let b = n.x * n.y * a;
+  let t = vec3f(1.0 + sgn * n.x * n.x * a, sgn * b, -sgn * n.x);
+  let bt = vec3f(b, sgn + n.y * n.y * a, -n.y);
+  return local.x * t + local.y * bt + local.z * n;
+}
+
+fn cosineHemisphere(n: vec3f, state: ptr<function, u32>) -> vec3f {
+  let r1 = rand(state);
+  let r2 = rand(state);
+  let phi = 2.0 * PI * r1;
+  let r = sqrt(r2);
+  let local = vec3f(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - r2)));
+  return applyOnb(n, local);
+}
+
+// Slab-method AABB. Same idea as the GLSL you already read.
+fn hitAABB(
+  ro: vec3f, rd: vec3f,
+  c: vec3f, hsz: vec3f,
+  albedo: vec3f, emit: vec3f,
+  hit: ptr<function, Hit>
+) -> bool {
+  let inv = 1.0 / rd;
+  let t0 = (c - hsz - ro) * inv;
+  let t1 = (c + hsz - ro) * inv;
+  let tn = min(t0, t1);
+  let tx = max(t0, t1);
+  let tN = max(max(tn.x, tn.y), tn.z);
+  let tF = min(min(tx.x, tx.y), tx.z);
+  if (tN > tF || tF < EPS) { return false; }
+  let t = select(tF, tN, tN > EPS);
+  if (t <= EPS || t >= (*hit).t) { return false; }
+
+  let p = ro + rd * t;
+  let q = (p - c) / hsz;
+  var n = vec3f(0.0, 0.0, 1.0);
+  let ax = abs(q.x);
+  let ay = abs(q.y);
+  let az = abs(q.z);
+  if (ax > ay && ax > az) { n = vec3f(sign(q.x), 0.0, 0.0); }
+  else if (ay > az) { n = vec3f(0.0, sign(q.y), 0.0); }
+  else { n = vec3f(0.0, 0.0, sign(q.z)); }
+
+  if (dot(n, -rd) < 0.0) { n = -n; }
+
+  (*hit).t = t;
+  (*hit).p = p;
+  (*hit).n = n;
+  (*hit).albedo = albedo;
+  (*hit).emit = emit;
+  return true;
+}
+
+fn hitSphere(
+  ro: vec3f, rd: vec3f,
+  c: vec3f, radius: f32,
+  albedo: vec3f, emit: vec3f,
+  hit: ptr<function, Hit>
+) -> bool {
+  let oc = ro - c;
+  let a = dot(rd, rd);
+  let b = dot(oc, rd);
+  let d = b * b - a * (dot(oc, oc) - radius * radius);
+  if (d < 0.0) { return false; }
+  let s = sqrt(d);
+  var t = (-b - s) / a;
+  if (t < EPS) { t = (-b + s) / a; }
+  if (t < EPS || t >= (*hit).t) { return false; }
+  let p = ro + rd * t;
+  var n = normalize(p - c);
+  if (dot(n, -rd) < 0.0) { n = -n; }
+  (*hit).t = t;
+  (*hit).p = p;
+  (*hit).n = n;
+  (*hit).albedo = albedo;
+  (*hit).emit = emit;
+  return true;
+}
+
+// Scene: Cornell box + 2 AABBs + 1 sphere. Edit this to change the world.
+fn intersectScene(ro: vec3f, rd: vec3f) -> Hit {
+  var hit: Hit;
+  hit.t = INF;
+  hit.emit = vec3f(0.0);
+
+  let white = vec3f(0.73, 0.73, 0.73);
+  let red   = vec3f(0.65, 0.05, 0.05);
+  let green = vec3f(0.12, 0.45, 0.15);
+  let none  = vec3f(0.0);
+
+  hitAABB(ro, rd, vec3f( 0.0, 0.0,  0.0), vec3f(1.0, 0.02, 1.0), white, none, &hit); // floor
+  hitAABB(ro, rd, vec3f( 0.0, 2.0,  0.0), vec3f(1.0, 0.02, 1.0), white, none, &hit); // ceiling
+  hitAABB(ro, rd, vec3f( 0.0, 1.0, -1.0), vec3f(1.0, 1.0, 0.02), white, none, &hit); // back
+  hitAABB(ro, rd, vec3f(-1.0, 1.0,  0.0), vec3f(0.02, 1.0, 1.0), red,   none, &hit); // left
+  hitAABB(ro, rd, vec3f( 1.0, 1.0,  0.0), vec3f(0.02, 1.0, 1.0), green, none, &hit); // right
+
+  // area light on the ceiling
+  hitAABB(ro, rd, vec3f(0.0, 1.96, 0.0), vec3f(0.28, 0.02, 0.28), vec3f(0.0), vec3f(18.0, 16.0, 12.0), &hit);
+
+  hitAABB(ro, rd, vec3f( 0.38, 0.30,  0.32), vec3f(0.30, 0.30, 0.30), white, none, &hit);
+  hitAABB(ro, rd, vec3f(-0.38, 0.60, -0.28), vec3f(0.28, 0.60, 0.28), white, none, &hit);
+
+  // currently Lambert like the walls; make it a mirror in scatter()
+  hitSphere(ro, rd, vec3f(0.0, 0.22, 0.05), 0.22, vec3f(0.8, 0.8, 0.85), none, &hit);
+
+  return hit;
+}
+
+// Material bounce. Lambert for now.
+// Mirror:  return reflect(rd, n);
+// Glass:   fresnel pick of reflect / refract
+fn scatter(rd: vec3f, n: vec3f, albedo: vec3f, state: ptr<function, u32>) -> vec3f {
+  return cosineHemisphere(n, state) + rd * 0.0 + albedo * 0.0;
+}
+
+fn trace(ray0: Ray, state: ptr<function, u32>) -> vec3f {
+  var ray = ray0;
+  var color = vec3f(0.0);
+  var thpt = vec3f(1.0); // throughput = product of albedos
+  let bounces = u32(uni.maxBounces);
+
+  for (var i = 0u; i < bounces; i++) {
+    let hit = intersectScene(ray.orig, ray.dir);
+
+    if (hit.t >= INF) {
+      return color; // miss -> black. swap in a sky color / env map here
+    }
+
+    if (dot(hit.emit, hit.emit) > 0.0) {
+      color += thpt * hit.emit;
+      return color;
+    }
+
+    thpt *= hit.albedo;
+    ray.orig = hit.p + hit.n * EPS;
+    ray.dir = scatter(ray.dir, hit.n, hit.albedo, state);
+  }
+  return color;
+}
+
+fn aces(x: vec3f) -> vec3f {
+  let a = x * (x * 2.51 + 0.03);
+  let b = x * (x * 2.43 + 0.59) + 0.14;
+  return clamp(a / b, vec3f(0.0), vec3f(1.0));
+}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let res = vec2u(uni.resolution);
+  if (id.x >= res.x || id.y >= res.y) { return; }
+
+  let idx = id.y * res.x + id.x;
+  var rng = pcg(id.x + id.y * 1973u + u32(uni.frame) * 9277u);
+  rng = pcg(rng ^ u32(uni.seed.x * 1e6));
+
+  let jitter = vec2f(rand(&rng), rand(&rng));
+  var uv = (vec2f(id.xy) + jitter) / uni.resolution;
+  uv.y = 1.0 - uv.y; // GPU y=0 is top; camera uv.y=0 is bottom
+
+  var ray: Ray;
+  ray.orig = uni.origin;
+  ray.dir = normalize(uni.lowerLeft + uv.x * uni.horizontal + uv.y * uni.vertical - uni.origin);
+
+  let sample = trace(ray, &rng);
+  let prev = accum[idx].xyz;
+  let n = uni.frame;
+  let mixed = select(sample, (prev * n + sample) / (n + 1.0), n > 0.0);
+  accum[idx] = vec4f(mixed, 1.0);
+
+  let mapped = pow(aces(mixed), vec3f(1.0 / 2.2));
+  textureStore(outImage, vec2i(id.xy), vec4f(mapped, 1.0));
+}
+`;
+
+const BLIT_WGSL = /* wgsl */ `
+@group(0) @binding(0) var src: texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let pos = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(pos[i], 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+  let c = textureLoad(src, vec2i(p.xy), 0);
+  return vec4f(c.rgb, 1.0);
+}
+`;
+
+device.addEventListener("uncapturederror", (e) => {
+  fail("WebGPU: " + e.error.message);
+});
+
+const computeModule = device.createShaderModule({ code: PATHTRACE_WGSL });
+const blitModule = device.createShaderModule({ code: BLIT_WGSL });
+
+function formatShaderLog(label, info) {
+  return info.messages
+    .map((m) => `${label} [${m.type}] L${m.lineNum}:${m.linePos} ${m.message}`)
+    .join("\n");
+}
+
+const computeLog = formatShaderLog("compute", await computeModule.getCompilationInfo());
+const blitLog = formatShaderLog("blit", await blitModule.getCompilationInfo());
+const shaderErrors = [computeLog, blitLog].filter((s) => s.includes("[error]"));
+if (shaderErrors.length) fail(shaderErrors.join("\n"));
+
+let computePipeline;
+let blitPipeline;
+try {
+  computePipeline = await device.createComputePipelineAsync({
+    layout: "auto",
+    compute: { module: computeModule, entryPoint: "main" },
+  });
+  blitPipeline = await device.createRenderPipelineAsync({
+    layout: "auto",
+    vertex: { module: blitModule, entryPoint: "vs" },
+    fragment: {
+      module: blitModule,
+      entryPoint: "fs",
+      targets: [{ format }],
+    },
+    primitive: { topology: "triangle-list" },
+  });
+} catch (e) {
+  fail((e && e.message) + "\n" + computeLog + "\n" + blitLog);
+}
+
+if (computeLog || blitLog) console.warn(computeLog, blitLog);
+
+const uniformBuffer = device.createBuffer({
+  size: 80,
+  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+});
+
+let width = 0;
+let height = 0;
+let accumBuffer;
+let colorTex;
+let computeBindGroup;
+let blitBindGroup;
+let frame = 0;
+let maxBounces = 5;
+let yaw = 0.0;
+let pitch = 0.12;
+let dragging = false;
+let lastX = 0;
+let lastY = 0;
+
+function resetAccum() { frame = 0; }
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio, 1.5);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (w === width && h === height) return;
+  width = w;
+  height = h;
+  canvas.width = w;
+  canvas.height = h;
+  context.configure({ device, format, alphaMode: "opaque" });
+
+  accumBuffer?.destroy();
+  colorTex?.destroy();
+
+  accumBuffer = device.createBuffer({
+    size: width * height * 16,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  colorTex = device.createTexture({
+    size: [width, height],
+    format: "rgba16float",
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+  });
+  computeBindGroup = device.createBindGroup({
+    layout: computePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuffer } },
+      { binding: 1, resource: { buffer: accumBuffer } },
+      { binding: 2, resource: colorTex.createView() },
+    ],
+  });
+  blitBindGroup = device.createBindGroup({
+    layout: blitPipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: colorTex.createView() }],
+  });
+  resetAccum();
+}
+
+function sub(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+function scale(a, s) { return [a[0]*s, a[1]*s, a[2]*s]; }
+function cross(a, b) {
+  return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+}
+function normalize(a) {
+  const l = Math.hypot(a[0], a[1], a[2]) || 1;
+  return scale(a, 1 / l);
+}
+
+function writeCamera() {
+  const dist = 3.35;
+  const target = [0, 1.0, 0];
+  const origin = [
+    Math.sin(yaw) * Math.cos(pitch) * dist,
+    1.0 + Math.sin(pitch) * dist,
+    Math.cos(yaw) * Math.cos(pitch) * dist,
+  ];
+  const w = normalize(sub(origin, target));
+  const u = normalize(cross([0, 1, 0], w));
+  const v = cross(w, u);
+  const aspect = width / height;
+  const tan = Math.tan((38 * Math.PI) / 180 / 2);
+  const vh = 2 * tan;
+  const vw = vh * aspect;
+  const lowerLeft = sub(sub(sub(origin, scale(u, vw / 2)), scale(v, vh / 2)), w);
+  const horizontal = scale(u, vw);
+  const vertical = scale(v, vh);
+
+  const f32 = new Float32Array(20);
+  f32.set(origin, 0); f32[3] = frame;
+  f32.set(lowerLeft, 4); f32[7] = maxBounces;
+  f32.set(horizontal, 8);
+  f32.set(vertical, 12);
+  f32[16] = width; f32[17] = height;
+  f32[18] = Math.random(); f32[19] = Math.random();
+  device.queue.writeBuffer(uniformBuffer, 0, f32);
+}
+
+canvas.addEventListener("pointerdown", (e) => {
+  dragging = true;
+  lastX = e.clientX;
+  lastY = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  yaw -= (e.clientX - lastX) * 0.005;
+  pitch = Math.max(-0.4, Math.min(0.6, pitch + (e.clientY - lastY) * 0.005));
+  lastX = e.clientX;
+  lastY = e.clientY;
+  resetAccum();
+});
+
+window.addEventListener("keydown", (e) => {
+  if (e.key === "[" ) { maxBounces = Math.max(1, maxBounces - 1); resetAccum(); }
+  if (e.key === "]" ) { maxBounces = Math.min(16, maxBounces + 1); resetAccum(); }
+  if (e.key === "r" || e.key === "R") resetAccum();
+});
+window.addEventListener("resize", resize);
+
+function frameLoop() {
+  resize();
+  writeCamera();
+
+  const encoder = device.createCommandEncoder();
+  const cpass = encoder.beginComputePass();
+  cpass.setPipeline(computePipeline);
+  cpass.setBindGroup(0, computeBindGroup);
+  cpass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
+  cpass.end();
+
+  const rpass = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: context.getCurrentTexture().createView(),
+      loadOp: "clear",
+      storeOp: "store",
+      clearValue: { r: 0, g: 0, b: 0, a: 1 },
+    }],
+  });
+  rpass.setPipeline(blitPipeline);
+  rpass.setBindGroup(0, blitBindGroup);
+  rpass.draw(3);
+  rpass.end();
+  device.queue.submit([encoder.finish()]);
+
+  hud.innerHTML =
+    `<b>WebGPU path tracer</b><br>` +
+    `spp ${frame + 1} &nbsp; bounces ${maxBounces}<br>` +
+    `drag to orbit &nbsp; [ / ] bounces &nbsp; R reset<br>` +
+    `edit PATHTRACE_WGSL in this file`;
+
+  frame++;
+  requestAnimationFrame(frameLoop);
+}
+
+resize();
+frameLoop();
+</script>
+</body>
+</html>

@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js · WebGPU + TSL 光照示例</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b0d14; overflow: hidden; font-family: ui-sans-serif, system-ui, sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #hud {
+      position: fixed; left: 16px; top: 16px; color: #e8eef8; font-size: 13px; line-height: 1.5;
+      text-shadow: 0 1px 4px #000; user-select: none; width: 340px;
+    }
+    #hud b { color: #9fd4ff; }
+    #hud code { color: #f3d27a; font-size: 12px; }
+    #hud label { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+    #hud input[type="range"] { flex: 1; }
+    #err {
+      display: none; position: fixed; inset: 0; place-items: center;
+      color: #fff; background: #1a1a1a; padding: 24px; font-size: 16px; white-space: pre-wrap;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.181.0/build/three.webgpu.js",
+      "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.181.0/build/three.webgpu.js",
+      "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.181.0/build/three.tsl.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.181.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="hud">
+    <b>Three.js · WebGPURenderer + TSL</b><br>
+    <code>MeshPhysicalNodeMaterial</code> · 内置 PBR 灯 + IBL<br>
+    自定义：TSL <code>colorNode</code> Fresnel 边缘光<br>
+    拖动旋转 · 点光自动绕行
+    <label>粗糙度 <input id="roughness" type="range" min="0" max="100" value="25" /> <span id="roughVal">0.25</span></label>
+    <label>金属度 <input id="metalness" type="range" min="0" max="100" value="60" /> <span id="metalVal">0.60</span></label>
+    <label>清漆 clearcoat <input id="clearcoat" type="range" min="0" max="100" value="40" /> <span id="coatVal">0.40</span></label>
+    <label>Fresnel 强度 <input id="fresnel" type="range" min="0" max="100" value="55" /> <span id="fresnelVal">0.55</span></label>
+  </div>
+  <div id="err"></div>
+
+<script type="module">
+import * as THREE from 'three/webgpu';
+import {
+  Fn, uniform, float, vec3, mix, pow,
+  normalize, sub, max, dot,
+  positionWorld, normalWorld, cameraPosition,
+} from 'three/tsl';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const errBox = document.getElementById('err');
+
+function fail(msg) {
+  errBox.style.display = 'grid';
+  errBox.textContent = msg;
+  throw new Error(msg);
+}
+
+// ---------- renderer（最新路径：WebGPU，自动回退 WebGL2） ----------
+const renderer = new THREE.WebGPURenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+document.body.appendChild(renderer.domElement);
+
+await renderer.init().catch((e) => fail('WebGPURenderer 初始化失败：\n' + e));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0d14);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(2.6, 1.4, 3.2);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0, 0.55, 0);
+
+// ---------- IBL（环境光 / 反射，现代写实光照的核心） ----------
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.85;
+
+// ---------- 直接光 ----------
+const key = new THREE.DirectionalLight(0xfff2e0, 2.2);
+key.position.set(4, 6, 3);
+key.castShadow = true;
+key.shadow.mapSize.set(1024, 1024);
+key.shadow.camera.near = 0.5;
+key.shadow.camera.far = 20;
+key.shadow.camera.left = -4;
+key.shadow.camera.right = 4;
+key.shadow.camera.top = 4;
+key.shadow.camera.bottom = -4;
+scene.add(key);
+
+const fill = new THREE.HemisphereLight(0x8ec8ff, 0x1a120c, 0.35);
+scene.add(fill);
+
+const point = new THREE.PointLight(0x66ccff, 8, 12, 2);
+point.position.set(2, 1.2, 0);
+point.castShadow = true;
+scene.add(point);
+
+const pointHelper = new THREE.Mesh(
+  new THREE.SphereGeometry(0.08, 16, 16),
+  new THREE.MeshBasicNodeMaterial({ color: 0x66ccff }),
+);
+scene.add(pointHelper);
+
+// ---------- 地面 ----------
+const ground = new THREE.Mesh(
+  new THREE.CircleGeometry(4, 64),
+  new THREE.MeshStandardNodeMaterial({
+    color: 0x1a1f2b,
+    roughness: 0.85,
+    metalness: 0.05,
+  }),
+);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ---------- 球：Physical NodeMaterial + TSL 自定义 Fresnel ----------
+const uRoughness = uniform(0.25);
+const uMetalness = uniform(0.6);
+const uClearcoat = uniform(0.4);
+const uFresnel = uniform(0.55);
+const uBaseColor = uniform(new THREE.Color(0x4a9eff));
+const uRimColor = uniform(new THREE.Color(0xffffff));
+
+const material = new THREE.MeshPhysicalNodeMaterial({
+  color: 0x4a9eff,
+  roughness: 0.25,
+  metalness: 0.6,
+  clearcoat: 0.4,
+  clearcoatRoughness: 0.15,
+});
+
+// 关键点：用 TSL 改 colorNode，灯光/阴影/IBL 仍由材质内置 PBR 处理
+material.colorNode = Fn(() => {
+  const N = normalize(normalWorld);
+  const V = normalize(sub(cameraPosition, positionWorld));
+  const fresnel = pow(sub(float(1), max(dot(N, V), float(0))), float(3));
+  const rim = uRimColor.mul(fresnel).mul(uFresnel);
+  return mix(uBaseColor, rim.add(uBaseColor), fresnel.mul(uFresnel));
+})();
+
+material.roughnessNode = uRoughness;
+material.metalnessNode = uMetalness;
+material.clearcoatNode = uClearcoat;
+
+const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.85, 64, 64), material);
+sphere.position.y = 0.85;
+sphere.castShadow = true;
+sphere.receiveShadow = true;
+scene.add(sphere);
+
+// ---------- UI ----------
+const bind = (id, spanId, uniformNode, digits = 2) => {
+  const el = document.getElementById(id);
+  const span = document.getElementById(spanId);
+  const sync = () => {
+    const v = Number(el.value) / 100;
+    uniformNode.value = v;
+    span.textContent = v.toFixed(digits);
+  };
+  el.addEventListener('input', sync);
+  sync();
+};
+bind('roughness', 'roughVal', uRoughness);
+bind('metalness', 'metalVal', uMetalness);
+bind('clearcoat', 'coatVal', uClearcoat);
+bind('fresnel', 'fresnelVal', uFresnel);
+
+// ---------- loop ----------
+const clock = new THREE.Clock();
+
+function frame() {
+  const t = clock.getElapsedTime();
+  point.position.set(Math.cos(t) * 2.2, 1.1 + Math.sin(t * 1.3) * 0.3, Math.sin(t) * 2.2);
+  pointHelper.position.copy(point.position);
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+renderer.setAnimationLoop(frame);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
