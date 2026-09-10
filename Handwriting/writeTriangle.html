@@ -5,83 +5,137 @@
   <title>WebGL2 · 三角形</title>
   <style>
     html, body { margin: 0; height: 100%; background: #0b0d14; }
-    canvas { display: block; width: 100%; height: 100%; }
+    canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+    canvas:active { cursor: grabbing; }
   </style>
 </head>
 <body>
     <canvas id="c"></canvas>
+    <script src="tools.js"></script>
     <script>
-        const canvas = document.getElementById('c');
-        const gl = canvas.getContext('webgl2', { antialias: true });
-        if(!gl) {
-            console.log('Failed to get WebGL2 context');
-        }
-
+        const canvas = document.getElementById("c");
+        const gl = canvas.getContext("webgl2");
+        if (!gl) throw new Error("需要webgl2");
         canvas.width = canvas.clientWidth;
         canvas.height = canvas.clientHeight;
-
         gl.viewport(0, 0, canvas.width, canvas.height);
 
-        const vertexShaderSource = `#version 300 es
-        in vec2 a_pos;
-        void main() {
-            gl_Position = vec4(a_pos, 0.0, 1.0);
-        }` 
-
-        const fragmentShaderSource = `#version 300 es
-        precision mediump float;
-        out vec4 outColor;
-         void main() {
-            outColor = vec4(1.0, 0.0, 0.0, 1.0);
-         }
-        `
         const program = gl.createProgram();
 
-        // function compile(type, source) {
-        //     const shader = gl.createShader(type);
-        //     gl.shaderSource(shader, source);
-        //     gl.compileShader(shader);
-        //     if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-        //         throw new Error(gl.getShaderInfoLog(shader));
-        //     }
-        //     return shader;
-        // }
-        // gl.attachShader(program, compile(gl.VERTEX_SHADER, vertexShaderSource));
-        // gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fragmentShaderSource));
+        const vs = `#version 300 es
+            in vec3 a_pos;
+            in vec3 a_color;
+            uniform mat4 u_mvp;
+            out vec3 v_color;
+            void main() {
+                gl_Position = u_mvp * vec4(a_pos, 1.0);
+                v_color = a_color;
+            }
+        `;
 
-        const vertexShader = gl.createShader(gl.VERTEX_SHADER);
-        const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
-        gl.shaderSource(vertexShader, vertexShaderSource);
-        gl.shaderSource(fragmentShader, fragmentShaderSource);
-        gl.compileShader(vertexShader);
-        gl.compileShader(fragmentShader);
-        gl.attachShader(program, vertexShader);
-        gl.attachShader(program, fragmentShader);
-        
+        const fs = `#version 300 es
+            precision mediump float;
+            out vec4 outColor;
+            in vec3 v_color;
+            void main() {
+                outColor = vec4(v_color, 1.0);
+            }
+        `;
+
+        const compile = (type, src) => {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, src);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                throw new Error(gl.getShaderInfoLog(shader));
+            }
+            return shader;
+        };
+
+        gl.attachShader(program, compile(gl.VERTEX_SHADER, vs));
+        gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fs));
         gl.linkProgram(program);
         if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
             throw new Error(gl.getProgramInfoLog(program));
         }
         gl.useProgram(program);
 
+        const uMvp = gl.getUniformLocation(program, "u_mvp");
+
+        // 四面体：4 个顶点必须不共面，z 不能全是 0
+        //   0 顶红    1 左前绿    2 右前蓝    3 后青
         const data = new Float32Array([
-            0.0, 1.0, 0.5, -1.0, -0.5, 0.0
-        ])
+             0.0,  0.70,  0.00,   1, 0, 0,
+            -0.65, -0.40,  0.45,   0, 1, 0,
+             0.65, -0.40,  0.45,   0, 0, 1,
+             0.00, -0.40, -0.60,   0, 1, 1,
+        ]);
+
+        // ABC ABD ACD BCD
+        const indices = new Uint16Array([
+            0, 1, 2,
+            0, 1, 3,
+            0, 2, 3,
+            1, 2, 3,
+        ]);
+
+        const stride = 6 * 4; // x,y,z, r,g,b
 
         const vbo = gl.createBuffer();
         gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
         gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
 
         const vao = gl.createVertexArray();
-        gl.bindVertexArray(vao)
-        const loc = gl.getAttribLocation(program, 'a_pos');
+        gl.bindVertexArray(vao);
+
+        const loc = gl.getAttribLocation(program, "a_pos");
+        const col = gl.getAttribLocation(program, "a_color");
         gl.enableVertexAttribArray(loc);
+        gl.enableVertexAttribArray(col);
+        gl.vertexAttribPointer(loc, 3, gl.FLOAT, false, stride, 0);
+        gl.vertexAttribPointer(col, 3, gl.FLOAT, false, stride, 12);
 
-        gl.vertexAttribPointer(0,2,gl.FLOAT, false, 0, 0);
+        const ibo = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
 
-        gl.clearColor(0.0,0.0,0.0,1.0);
-        gl.clear(gl.COLOR_BUFFER_BIT);
-        gl.drawArrays(gl.TRIANGLES,0,3);        
+        let yaw = 0.6, pitch = 0.35;
+        let dragging = false, lastX = 0, lastY = 0;
+        canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+        canvas.addEventListener("pointerup", () => { dragging = false; });
+        canvas.addEventListener("pointermove", (e) => {
+            if (!dragging) return;
+            yaw -= (e.clientX - lastX) * 0.008;
+            pitch = Math.max(-1.2, Math.min(1.2, pitch - (e.clientY - lastY) * 0.008));
+            lastX = e.clientX; lastY = e.clientY;
+        });
+
+        function frame(now) {
+            requestAnimationFrame(frame);
+
+            if (!dragging) yaw += 0.008; // 不拖的时候自己转，立体感才看得出来
+
+            const dist = 3.2;
+            const eye = [
+                Math.sin(yaw) * Math.cos(pitch) * dist,
+                Math.sin(pitch) * dist,
+                Math.cos(yaw) * Math.cos(pitch) * dist,
+            ];
+            const proj = perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 50);
+            const view = lookAt(eye, [0, 0, 0], [0, 1, 0]);
+            const mvp = mul(proj, view);
+
+            gl.viewport(0, 0, canvas.width, canvas.height);
+            gl.enable(gl.DEPTH_TEST);
+            gl.clearColor(0.045, 0.055, 0.08, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+            gl.useProgram(program);
+            gl.bindVertexArray(vao);
+            gl.uniformMatrix4fv(uMvp, false, mvp);
+            gl.drawElements(gl.TRIANGLES, indices.length, gl.UNSIGNED_SHORT, 0);
+        }
+
+        requestAnimationFrame(frame);
     </script>
 </body>
 </html>
