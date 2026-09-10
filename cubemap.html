@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · 立方体贴图与环境反射</title>
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --panel: #12151f;
+      --line: #243044;
+      --text: #e8eef8;
+      --muted: #8b97a8;
+      --accent: #9fd4ff;
+      --gold: #f3d27a;
+      --ok: #7dcea0;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 940px; }
+    header b { color: var(--accent); }
+    .layout {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 20px;
+      padding: 20px 24px 40px;
+      align-items: start;
+    }
+    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
+    canvas {
+      width: 100%; height: auto; display: block;
+      background: #08090e; border: 1px solid var(--line);
+      border-radius: 8px; cursor: grab;
+    }
+    canvas:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre {
+      margin: 10px 0 0; background: #0a0c12; border: 1px solid var(--line);
+      border-radius: 6px; padding: 12px 14px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #d5deea; white-space: pre;
+    }
+    .note { color: var(--muted); font-size: 13px; margin-top: 10px; }
+    .note b { color: var(--text); }
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 10px 16px;
+      margin-top: 12px; align-items: center;
+      color: var(--muted); font-size: 13px;
+    }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .stats {
+      margin-top: 12px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px 16px; font-size: 12.5px; color: var(--muted);
+    }
+    .stats b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .stats .hl { color: var(--gold); }
+    .hint {
+      margin: 10px 0 0; padding: 10px 12px; border-radius: 6px;
+      background: #1a2230; border: 1px solid #2c3b52; color: var(--text);
+      font-size: 13px; min-height: 4.2em;
+    }
+    .hint.bad { background: #2a1212; border-color: #5a2424; color: #ffb4b4; }
+    #err {
+      display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212;
+      border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>立方体贴图：用一个方向去查环境</h1>
+    <p>
+      天空盒、反射、折射、IBL 的底子都是同一件事：给 <b>samplerCube</b> 一个<b>方向向量</b>，
+      它自己算出落在哪个面、面的哪个位置。这一页把 6 个面摊开摆出来，让你看清方向是怎么落到面上的。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <section class="stage">
+        <h2>1. 为什么是"方向"而不是 UV</h2>
+        <ol class="steps">
+          <li>2D 贴图用 <code>(u, v)</code> 定位，所以你得先知道"在哪儿"—— 球面上要自己算经纬度。</li>
+          <li>立方体贴图用 <code>vec3</code> 定位：取绝对值最大的那个分量决定<b>面</b>，剩下两个分量除以它得到<b>面内坐标</b>。</li>
+          <li>因为按轴向切分，相邻面的边界是接得上的，<b>没有极点、也没有接缝</b>（WebGL2 的立方体贴图还默认开启 seamless 过滤）。</li>
+          <li>代价是分辨率被均分到 6 个面上，而且同一方向的精度在不同面上并不一致。</li>
+        </ol>
+        <pre>面      sc      tc
++X     -rz     -ry
+-X     +rz     -ry
++Y     +rx     +rz
+-Y     +rx     -rz
++Z     +rx     -ry
+-Z     -rx     -ry
+s = (sc/|ma| + 1)/2   t = (tc/|ma| + 1)/2</pre>
+        <p class="note">
+          记住这张表的实际意义：<b>+X 面的"上"是 +Y，"右"是 −Z</b>。
+          用错了不会报错，只会让天空盒里的太阳跑到反方向 —— 这类 bug 只能靠"看起来对不对"来抓。
+        </p>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>2. 上传：一个面一次 texImage2D</h2>
+        <pre>gl.bindTexture(gl.TEXTURE_CUBE_MAP, env);
+for (let i = 0; i < 6; i++) {
+  gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X + i, 0,
+                gl.RGBA, s, s, 0, gl.RGBA, gl.UNSIGNED_BYTE, faces[i]);
+}
+gl.generateMipmap(gl.TEXTURE_CUBE_MAP);   // 立方体贴图同样能生成 mip 链</pre>
+        <p class="note">
+          <b>采样器类型必须匹配：</b>shader 里声明 <code>samplerCube</code>，就必须绑到 <code>TEXTURE_CUBE_MAP</code>；
+          绑成 <code>TEXTURE_2D</code> 会让 draw 直接报 <code>INVALID_OPERATION</code>，
+          而且错误信息通常不会告诉你是哪张纹理。
+        </p>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>3. 从反射到 IBL</h2>
+        <ol class="steps">
+          <li><b>天空盒：</b>把立方体放在相机中心（只保留视图矩阵的旋转部分），采样方向就是顶点方向。为了永远不被别的物体挡住，<code>gl_Position</code> 写成 <code>p.xyww</code>，把 z 顶到远平面。</li>
+          <li><b>反射：</b><code>reflect(-V, N)</code> 得到镜像方向，拿它查环境 → 镜面反射。</li>
+          <li><b>粗糙度：</b>直接 <code>textureLod(env, dir, lod)</code>，用更糊的一层当"大概的环境"。真正的 PBR 会用预过滤的多级立方体贴图（PMREM）把这一步离线做掉。</li>
+          <li><b>漫反射环境光：</b>用最糊的那一层按法线方向采样，就近似了半球积分（irradiance）。</li>
+        </ol>
+        <p class="note">
+          注意 <b>mip 链在这里不只是抗锯齿</b>：它被当成"预先算好的模糊程度"来用，
+          这就是为什么 IBL 的预过滤要专门设计滤波核，而不是随手 generateMipmap。
+        </p>
+      </section>
+    </div>
+
+    <div>
+      <canvas id="c" width="900" height="560"></canvas>
+
+      <section class="stage" style="margin-top:16px">
+        <div class="controls">
+          <label>模式
+            <select id="mode">
+              <option value="0" selected>反射</option>
+              <option value="1">折射</option>
+              <option value="2">法线可视化</option>
+              <option value="3">漫反射环境光</option>
+            </select>
+          </label>
+          <label>粗糙度 <input type="range" id="rough" min="0" max="8" step="1" value="0" style="width:100px" /> <b id="roughVal">0</b></label>
+          <label>折射率 <input type="range" id="ior" min="100" max="250" step="1" value="152" style="width:100px" /> <b id="iorVal">1.52</b></label>
+          <label>基础色
+            <select id="tint">
+              <option value="0.95,0.86,0.62" selected>金</option>
+              <option value="0.90,0.55,0.40">铜</option>
+              <option value="0.85,0.90,0.95">银</option>
+              <option value="0.35,0.70,0.55">绿</option>
+            </select>
+          </label>
+          <label><input type="checkbox" id="fresnel" checked /> 菲涅尔</label>
+          <label><input type="checkbox" id="showBg" checked /> 环境背景</label>
+          <label><input type="checkbox" id="showCross" checked /> 展开图</label>
+          <label><input type="checkbox" id="spin" /> 自动旋转</label>
+        </div>
+        <div class="stats">
+          <div>立方体贴图：<b id="sFace">-</b></div>
+          <div>mip 级别：<b id="sLod">-</b></div>
+          <div>采样方向：<b id="sDir" class="hl">-</b></div>
+          <div>球面三角形：<b id="sTri">-</b></div>
+        </div>
+        <p class="hint" id="hint"></p>
+        <div id="err"></div>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => {
+  errBox.style.display = "block";
+  errBox.textContent += (e.message || e.error) + "\n";
+});
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+      a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  }
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let len = Math.hypot(zx, zy, zz); zx /= len; zy /= len; zz /= len;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  len = Math.hypot(xx, xy, xz); xx /= len; xy /= len; xz /= len;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+    1,
+  ]);
+}
+const flat = (a) => (Array.isArray(a[0]) ? a.flat() : a);
+
+// ---------- 程序化生成 6 个面 ----------
+const FACE = 128;
+// 面内坐标 (uu, tt) → 方向。tt = +1 对应图像第 0 行（面的"上"），和 GL 的 t 约定一致
+const FACE_DIR = [
+  (uu, tt) => [1, tt, -uu],   // +X
+  (uu, tt) => [-1, tt, uu],   // -X
+  (uu, tt) => [uu, 1, -tt],   // +Y
+  (uu, tt) => [uu, -1, tt],   // -Y
+  (uu, tt) => [uu, tt, 1],    // +Z
+  (uu, tt) => [-uu, tt, -1],  // -Z
+];
+const FACE_NAME = ["+X", "-X", "+Y", "-Y", "+Z", "-Z"];
+const FACE_HUE = [[0.85, 0.35, 0.30], [0.35, 0.55, 0.85], [0.45, 0.80, 0.45], [0.80, 0.70, 0.35], [0.60, 0.45, 0.85], [0.35, 0.75, 0.75]];
+const SUN = (() => { const v = [0.42, 0.52, 0.74], n = Math.hypot(...v); return v.map((x) => x / n); })();
+
+function skyColor(d, uu, tt, fi) {
+  const y = d[1];
+  let r, g, b;
+  if (y >= 0) {
+    const t = Math.pow(Math.min(y, 1), 0.62);
+    r = 0.76 + (0.10 - 0.76) * t;
+    g = 0.83 + (0.26 - 0.83) * t;
+    b = 0.90 + (0.64 - 0.90) * t;
+  } else {
+    // 地面：把方向投到 y = -1 的平面上做棋盘，再按距离往地平线色靠
+    const px = d[0] / -y, pz = d[2] / -y;
+    const check = ((Math.floor(px) + Math.floor(pz)) & 1) === 0;
+    const base = check ? [0.34, 0.36, 0.38] : [0.21, 0.22, 0.25];
+    const dist = Math.hypot(px, pz);
+    const haze = Math.min(1, Math.max(0, (dist - 5) / 26));
+    r = base[0] * (1 - haze) + 0.72 * haze;
+    g = base[1] * (1 - haze) + 0.78 * haze;
+    b = base[2] * (1 - haze) + 0.84 * haze;
+  }
+  // 太阳
+  const c = d[0] * SUN[0] + d[1] * SUN[1] + d[2] * SUN[2];
+  const disc = c > 0.9986 ? 1 : 0;
+  const glow = Math.pow(Math.max(c, 0), 220) * 1.2 + Math.pow(Math.max(c, 0), 12) * 0.16;
+  r = Math.min(1, r + (disc * 1.0 + glow) * 1.0);
+  g = Math.min(1, g + (disc * 0.96 + glow) * 0.92);
+  b = Math.min(1, b + (disc * 0.82 + glow) * 0.62);
+  // 面边框：让"哪个像素属于哪个面"一眼可见
+  if (Math.abs(uu) > 0.965 || Math.abs(tt) > 0.965) {
+    const h = FACE_HUE[fi];
+    r = r * 0.25 + h[0] * 0.9;
+    g = g * 0.25 + h[1] * 0.9;
+    b = b * 0.25 + h[2] * 0.9;
+  }
+  return [r, g, b];
+}
+
+const faces = [];
+const atlas = new Uint8Array(FACE * 4 * FACE * 3 * 4); // 4 列 × 3 行的展开图
+const CROSS = [[1, 0, 2], [0, 1, 1], [1, 1, 4], [2, 1, 0], [3, 1, 5], [1, 2, 3]]; // [列, 行, 面]
+for (let fi = 0; fi < 6; fi++) {
+  const data = new Uint8Array(FACE * FACE * 4);
+  for (let y = 0; y < FACE; y++) {
+    for (let x = 0; x < FACE; x++) {
+      const uu = 2 * (x + 0.5) / FACE - 1;
+      const tt = 1 - 2 * (y + 0.5) / FACE;
+      const d = FACE_DIR[fi](uu, tt);
+      const n = Math.hypot(d[0], d[1], d[2]);
+      const col = skyColor([d[0] / n, d[1] / n, d[2] / n], uu, tt, fi);
+      const i = (y * FACE + x) * 4;
+      data[i] = col[0] * 255; data[i + 1] = col[1] * 255; data[i + 2] = col[2] * 255; data[i + 3] = 255;
+    }
+  }
+  faces.push(data);
+  // 顺便写进展开图，方便在画面里对照
+  const cell = CROSS.find((c) => c[2] === fi);
+  if (cell) {
+    const [col, row] = cell;
+    for (let y = 0; y < FACE; y++) {
+      for (let x = 0; x < FACE; x++) {
+        const src = (y * FACE + x) * 4;
+        const ax = col * FACE + x, ay = row * FACE + y;
+        const dst = (ay * FACE * 4 + ax) * 4;
+        atlas[dst] = data[src]; atlas[dst + 1] = data[src + 1];
+        atlas[dst + 2] = data[src + 2]; atlas[dst + 3] = 255;
+      }
+    }
+  }
+}
+
+const envTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_CUBE_MAP, envTex);
+for (let i = 0; i < 6; i++) {
+  gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, gl.RGBA, FACE, FACE, 0, gl.RGBA, gl.UNSIGNED_BYTE, faces[i]);
+}
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.generateMipmap(gl.TEXTURE_CUBE_MAP);
+const ENV_MAX_LOD = Math.log2(FACE) | 0;
+
+const atlasTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, FACE * 4, FACE * 3, 0, gl.RGBA, gl.UNSIGNED_BYTE, atlas);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+// ---------- 天空盒 ----------
+const SKY_VS = `#version 300 es
+in vec3 a_pos;
+uniform mat4 u_viewRot;   // 只保留旋转的视图矩阵：天空盒永远以相机为中心
+uniform mat4 u_proj;
+out vec3 v_dir;
+void main() {
+  vec4 p = u_proj * u_viewRot * vec4(a_pos, 1.0);
+  v_dir = (u_viewRot * vec4(a_pos, 1.0)).xyz;  // 相机在中心，所以位置就是方向
+  gl_Position = p.xyww;                        // 强制贴到远平面，永远不会被挡住
+}`;
+const SKY_FS = `#version 300 es
+precision highp float;
+in vec3 v_dir;
+uniform samplerCube u_env;
+uniform int u_lod;
+out vec4 outColor;
+void main() { outColor = vec4(textureLod(u_env, normalize(v_dir), float(u_lod)).rgb, 1.0); }`;
+
+// ---------- 物体 ----------
+const OBJ_VS = `#version 300 es
+in vec3 a_pos;
+in vec3 a_nrm;
+uniform mat4 u_mvp;
+uniform mat4 u_model;
+out vec3 v_world;
+out vec3 v_nrm;
+void main() {
+  v_world = (u_model * vec4(a_pos, 1.0)).xyz;
+  v_nrm = mat3(u_model) * a_nrm;
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+const OBJ_FS = `#version 300 es
+precision highp float;
+in vec3 v_world;
+in vec3 v_nrm;
+uniform samplerCube u_env;
+uniform vec3 u_camPos;
+uniform int u_mode;      // 0 反射 1 折射 2 法线 3 漫反射环境光
+uniform float u_lod;
+uniform float u_maxLod;
+uniform float u_ior;
+uniform vec3 u_tint;
+uniform int u_fresnel;
+out vec4 outColor;
+void main() {
+  vec3 N = normalize(v_nrm);
+  vec3 V = normalize(u_camPos - v_world);
+  if (u_mode == 2) { outColor = vec4(N * 0.5 + 0.5, 1.0); return; }
+  if (u_mode == 3) {
+    // 最糊的一层 ≈ 半球积分（irradiance），这就是最朴素的 IBL 漫反射
+    outColor = vec4(textureLod(u_env, N, u_maxLod).rgb * u_tint * 1.6, 1.0);
+    return;
+  }
+  vec3 dir = u_mode == 1 ? refract(-V, N, 1.0 / u_ior) : reflect(-V, N);
+  vec3 env = textureLod(u_env, dir, u_lod).rgb;
+  float f = pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 5.0);
+  float mixf = u_fresnel == 1 ? clamp(0.06 + 0.94 * f, 0.0, 1.0) : 1.0;
+  outColor = vec4(mix(u_tint * env, env, mixf), 1.0);
+}`;
+
+// ---------- 展开图 ----------
+const OV_VS = `#version 300 es
+in vec2 a_pos;
+in vec2 a_uv;
+out vec2 v_uv;
+void main() { v_uv = a_uv; gl_Position = vec4(a_pos, 0.0, 1.0); }`;
+const OV_FS = `#version 300 es
+precision mediump float;
+in vec2 v_uv;
+uniform sampler2D u_atlas;
+out vec4 outColor;
+void main() { outColor = vec4(texture(u_atlas, v_uv).rgb, 1.0); }`;
+
+const skyProg = link(SKY_VS, SKY_FS);
+const objProg = link(OBJ_VS, OBJ_FS);
+const ovProg = link(OV_VS, OV_FS);
+
+// 天空盒立方体：必须大到能把相机整个包在里面。
+// 相机（在原点附近绕圈）距离世界中心 3.4，所以半径 1 的立方体是包不住的 ——
+// 那样屏幕四角会露在立方体外面，背景只剩中间一块。
+const CUBE_R = 60;
+const CUBE_V = [];
+{
+  const f = [
+    [[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]],
+    [[1, -1, -1], [-1, -1, -1], [-1, 1, -1], [1, 1, -1]],
+    [[1, -1, 1], [1, -1, -1], [1, 1, -1], [1, 1, 1]],
+    [[-1, -1, -1], [-1, -1, 1], [-1, 1, 1], [-1, 1, -1]],
+    [[-1, 1, 1], [1, 1, 1], [1, 1, -1], [-1, 1, -1]],
+    [[-1, -1, -1], [1, -1, -1], [1, -1, 1], [-1, -1, 1]],
+  ];
+  for (const q of f) {
+    for (const i of [0, 1, 2, 0, 2, 3]) {
+      CUBE_V.push(q[i][0] * CUBE_R, q[i][1] * CUBE_R, q[i][2] * CUBE_R);
+    }
+  }
+}
+
+// 球
+function makeSphere(seg, ring) {
+  const pos = [], nrm = [], idx = [];
+  for (let y = 0; y <= ring; y++) {
+    const phi = (y / ring) * Math.PI;
+    for (let x = 0; x <= seg; x++) {
+      const th = (x / seg) * Math.PI * 2;
+      const nx = Math.sin(phi) * Math.cos(th), ny = Math.cos(phi), nz = Math.sin(phi) * Math.sin(th);
+      pos.push(nx, ny, nz); nrm.push(nx, ny, nz);
+    }
+  }
+  for (let y = 0; y < ring; y++) for (let x = 0; x < seg; x++) {
+    const a = y * (seg + 1) + x, b = a + seg + 1;
+    idx.push(a, b, a + 1, a + 1, b, b + 1);
+  }
+  return { pos: new Float32Array(pos), nrm: new Float32Array(nrm), idx: new Uint16Array(idx) };
+}
+const sphere = makeSphere(48, 24);
+
+function buf(target, data, usage) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(target, b);
+  gl.bufferData(target, data, usage || gl.STATIC_DRAW);
+  return b;
+}
+// 天空盒 VAO
+const skyVao = gl.createVertexArray();
+gl.bindVertexArray(skyVao);
+{
+  const b = buf(gl.ARRAY_BUFFER, new Float32Array(CUBE_V));
+  const loc = gl.getAttribLocation(skyProg, "a_pos");
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 3, gl.FLOAT, false, 0, 0);
+}
+// 球 VAO
+const objVao = gl.createVertexArray();
+gl.bindVertexArray(objVao);
+{
+  const lp = gl.getAttribLocation(objProg, "a_pos");
+  buf(gl.ARRAY_BUFFER, sphere.pos);
+  gl.enableVertexAttribArray(lp);
+  gl.vertexAttribPointer(lp, 3, gl.FLOAT, false, 0, 0);
+  const ln = gl.getAttribLocation(objProg, "a_nrm");
+  buf(gl.ARRAY_BUFFER, sphere.nrm);
+  gl.enableVertexAttribArray(ln);
+  gl.vertexAttribPointer(ln, 3, gl.FLOAT, false, 0, 0);
+  buf(gl.ELEMENT_ARRAY_BUFFER, sphere.idx);
+}
+// 展开图 VAO
+const ovVao = gl.createVertexArray();
+let ovCount = 0;
+gl.bindVertexArray(ovVao);
+{
+  const lp = gl.getAttribLocation(ovProg, "a_pos");
+  const lu = gl.getAttribLocation(ovProg, "a_uv");
+  const lpBuf = gl.createBuffer();
+  const luBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, lpBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, 6 * 6 * 2 * 2 * 4, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(lp);
+  gl.vertexAttribPointer(lp, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, luBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, 6 * 6 * 2 * 2 * 4, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(lu);
+  gl.vertexAttribPointer(lu, 2, gl.FLOAT, false, 0, 0);
+  ovCount = 36;
+  ovVao.posBuf = lpBuf;
+  ovVao.uvBuf = luBuf;
+}
+
+const uSky = {
+  viewRot: gl.getUniformLocation(skyProg, "u_viewRot"),
+  proj: gl.getUniformLocation(skyProg, "u_proj"),
+  env: gl.getUniformLocation(skyProg, "u_env"),
+  lod: gl.getUniformLocation(skyProg, "u_lod"),
+};
+const uObj = {
+  mvp: gl.getUniformLocation(objProg, "u_mvp"),
+  model: gl.getUniformLocation(objProg, "u_model"),
+  env: gl.getUniformLocation(objProg, "u_env"),
+  camPos: gl.getUniformLocation(objProg, "u_camPos"),
+  mode: gl.getUniformLocation(objProg, "u_mode"),
+  lod: gl.getUniformLocation(objProg, "u_lod"),
+  maxLod: gl.getUniformLocation(objProg, "u_maxLod"),
+  ior: gl.getUniformLocation(objProg, "u_ior"),
+  tint: gl.getUniformLocation(objProg, "u_tint"),
+  fresnel: gl.getUniformLocation(objProg, "u_fresnel"),
+};
+const uOv = { atlas: gl.getUniformLocation(ovProg, "u_atlas") };
+
+const el = (id) => document.getElementById(id);
+const modeEl = el("mode"), roughEl = el("rough"), iorEl = el("ior"), tintEl = el("tint");
+const fresnelEl = el("fresnel"), showBgEl = el("showBg"), showCrossEl = el("showCross"), spinEl = el("spin");
+const roughVal = el("roughVal"), iorVal = el("iorVal"), hintEl = el("hint");
+
+el("sFace").textContent = FACE_NAME.join(" ") + "（各 " + FACE + "²）";
+el("sTri").textContent = (sphere.idx.length / 3) + " 个 / " + sphere.idx.length + " 索引";
+
+const view = { yaw: 0.7, pitch: 0.34, spinAngle: 0 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  view.yaw -= (e.clientX - lastX) * 0.006;
+  view.pitch = Math.max(-0.2, Math.min(1.2, view.pitch + (e.clientY - lastY) * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+let hintKey = "";
+function refreshHint() {
+  const mode = Number(modeEl.value);
+  const key = [mode, roughEl.value, iorEl.value].join(",");
+  if (key === hintKey) return;
+  hintKey = key;
+  roughVal.textContent = roughEl.value;
+  iorVal.textContent = (Number(iorEl.value) / 100).toFixed(2);
+  el("sLod").textContent = "0 – " + ENV_MAX_LOD;
+  el("sDir").textContent = ["reflect(-V, N)", "refract(-V, N, 1/η)", "N", "N（最糊层）"][mode];
+  hintEl.className = "hint";
+  hintEl.textContent = mode === 1
+    ? "折射方向由折射率 η 决定，" + iorVal.textContent + " 约等于玻璃。注意球体是单面的，内部没有第二次折射 —— 真正的玻璃要渲染背面或做两次求交。"
+    : mode === 2
+      ? "直接输出 N * 0.5 + 0.5：法线从 [-1,1] 搬到 [0,1] 当颜色。调试法线时这一步很常用。"
+      : mode === 3
+        ? "沿法线方向取 mip 链上最糊的一层，近似「Irradiance」：只剩低频的环境光，没有镜像细节。"
+        : "拖动粗糙度：值越大取越糊的 mip 层。真做 PBR 时这一步会被预过滤（PMREM）替代。";
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+
+  refreshHint();
+  if (spinEl.checked) view.spinAngle += 0.01;
+  const yaw = view.yaw + view.spinAngle;
+  const dist = 3.4;
+  const eye = [
+    Math.sin(yaw) * Math.cos(view.pitch) * dist,
+    Math.sin(view.pitch) * dist,
+    Math.cos(yaw) * Math.cos(view.pitch) * dist,
+  ];
+  const proj = perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 100);
+  const viewM = lookAt(eye, [0, 0, 0], [0, 1, 0]);
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.04, 0.045, 0.07, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const rough = Number(roughEl.value);
+  const lod = rough / 8 * ENV_MAX_LOD;
+  const tint = tintEl.value.split(",").map(Number);
+
+  // ① 天空盒：只留旋转的视图矩阵
+  if (showBgEl.checked) {
+    const viewRot = new Float32Array(viewM);
+    viewRot[12] = 0; viewRot[13] = 0; viewRot[14] = 0;
+    gl.disable(gl.DEPTH_TEST);
+    gl.depthMask(false);
+    gl.disable(gl.CULL_FACE);
+    gl.useProgram(skyProg);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_CUBE_MAP, envTex);
+    gl.uniform1i(uSky.env, 0);
+    gl.uniform1i(uSky.lod, 0);
+    gl.uniformMatrix4fv(uSky.viewRot, false, viewRot);
+    gl.uniformMatrix4fv(uSky.proj, false, proj);
+    gl.bindVertexArray(skyVao);
+    gl.drawArrays(gl.TRIANGLES, 0, 36);
+    gl.depthMask(true);
+  }
+
+  // ② 球
+  gl.enable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+  gl.useProgram(objProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_CUBE_MAP, envTex);
+  gl.uniform1i(uObj.env, 0);
+  gl.uniform1i(uObj.mode, Number(modeEl.value));
+  gl.uniform1f(uObj.lod, lod);
+  gl.uniform1f(uObj.maxLod, ENV_MAX_LOD);
+  gl.uniform1f(uObj.ior, Number(iorEl.value) / 100);
+  gl.uniform3fv(uObj.tint, new Float32Array(tint));
+  gl.uniform1i(uObj.fresnel, fresnelEl.checked ? 1 : 0);
+  gl.uniform3fv(uObj.camPos, new Float32Array(eye));
+  gl.uniformMatrix4fv(uObj.mvp, false, mul(proj, viewM));
+  const ident = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1]);
+  gl.uniformMatrix4fv(uObj.model, false, ident);
+  gl.bindVertexArray(objVao);
+  gl.drawElements(gl.TRIANGLES, sphere.idx.length, gl.UNSIGNED_SHORT, 0);
+
+  // ③ 展开图：6 个面按十字摆开，画在左下角
+  if (showCrossEl.checked) {
+    const aspect = canvas.width / canvas.height;
+    const fs = 0.28, fsx = fs / aspect;
+    const posArr = [], uvArr = [];
+    for (const [col, row, fi] of CROSS) {
+      const x0 = -0.97 + col * fsx, x1 = x0 + fsx;
+      const y1 = -0.03 - row * fs, y0 = y1 - fs;
+      // 面第 0 行在 v 较小的一侧（GL 里 t=0 就是数据第一行）
+      const vTop = row / 3, vBot = (row + 1) / 3;
+      const u0 = col / 4, u1 = (col + 1) / 4;
+      const v = [[x0, y0, u0, vBot], [x1, y0, u1, vBot], [x1, y1, u1, vTop],
+                 [x0, y0, u0, vBot], [x1, y1, u1, vTop], [x0, y1, u0, vTop]];
+      for (const q of v) posArr.push(q[0], q[1]), uvArr.push(q[2], q[3]);
+    }
+    gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(ovProg);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+    gl.uniform1i(uOv.atlas, 0);
+    gl.bindVertexArray(ovVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, ovVao.posBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, new Float32Array(posArr));
+    gl.bindBuffer(gl.ARRAY_BUFFER, ovVao.uvBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, new Float32Array(uvArr));
+    gl.drawArrays(gl.TRIANGLES, 0, ovCount);
+  }
+}
+
+refreshHint();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

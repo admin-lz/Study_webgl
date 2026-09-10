@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · 法线贴图与切线空间</title>
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --panel: #12151f;
+      --line: #243044;
+      --text: #e8eef8;
+      --muted: #8b97a8;
+      --accent: #9fd4ff;
+      --gold: #f3d27a;
+      --ok: #7dcea0;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 940px; }
+    header b { color: var(--accent); }
+    .layout {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 20px;
+      padding: 20px 24px 40px;
+      align-items: start;
+    }
+    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
+    canvas {
+      width: 100%; height: auto; display: block;
+      background: #08090e; border: 1px solid var(--line);
+      border-radius: 8px; cursor: grab;
+    }
+    canvas:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre {
+      margin: 10px 0 0; background: #0a0c12; border: 1px solid var(--line);
+      border-radius: 6px; padding: 12px 14px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #d5deea; white-space: pre;
+    }
+    .note { color: var(--muted); font-size: 13px; margin-top: 10px; }
+    .note b { color: var(--text); }
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 10px 16px;
+      margin-top: 12px; align-items: center;
+      color: var(--muted); font-size: 13px;
+    }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .stats {
+      margin-top: 12px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px 16px; font-size: 12.5px; color: var(--muted);
+    }
+    .stats b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .stats .hl { color: var(--gold); }
+    .hint {
+      margin: 10px 0 0; padding: 10px 12px; border-radius: 6px;
+      background: #1a2230; border: 1px solid #2c3b52; color: var(--text);
+      font-size: 13px; min-height: 4.2em;
+    }
+    .hint.ok { background: #102018; border-color: #2a4a38; color: var(--ok); }
+    #err {
+      display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212;
+      border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>法线贴图：不增加三角形，只改"这一点的朝向"</h1>
+    <p>
+      高模的细节能不能贴到低模上？能 —— 因为光照只关心<b>法线</b>。
+      法线贴图把每个像素的法线存进一张 RGB 图（<b>切线空间</b>），着色时用 TBN 矩阵转回世界空间。
+      这一页把高度场、法线贴图、TBN 三者的关系摊开看。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <section class="stage">
+        <h2>1. 为什么存的是"切线空间"的法线</h2>
+        <ol class="steps">
+          <li>同一张砖墙法线贴图要能贴到<b>任何朝向</b>的面上。如果直接存世界空间法线，转个角度就全错了。</li>
+          <li>所以贴图里存的是<b>相对于表面自己的坐标系</b>：x 沿 u 方向，y 沿 v 方向，z 沿表面法线。</li>
+          <li>平坦表面的法线是 <code>(0,0,1)</code>，编码成颜色就是 <code>(0.5, 0.5, 1.0)</code> —— 所以法线贴图整体偏<b>蓝紫色</b>。</li>
+          <li>着色时用 <code>TBN = [T, B, N]</code> 把它转回世界空间：<code>N_world = normalize(TBN * n_tangent)</code>。</li>
+        </ol>
+        <pre>vec3 n = texture(u_nrmMap, uv).xyz * 2.0 - 1.0;  // [0,1] → [-1,1]
+n.xy *= u_strength;                              // 强度，只缩放切向分量
+vec3 N = normalize(TBN * normalize(n));</pre>
+        <p class="note">
+          本页的 UV 是 <code>(x/SPAN, -z/SPAN)</code>，所以 <b>T = +X，B = −Z，N = T × B = +Y</b>。
+          这个对应关系必须和贴图生成时一致，否则凸起会变成凹陷（光照看着"反了"）。
+        </p>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>2. 切线从哪来：顶点属性 vs 屏幕导数</h2>
+        <ol class="steps">
+          <li><b>顶点切线：</b>建模时算好 T、B 存进顶点属性（本页每个顶点只存一份，因为 UV 是均匀的）。</li>
+          <li><b>屏幕导数：</b>不存切线，用 <code>dFdx/dFdy</code> 在片元里反解出来 —— 只要知道位置和 UV 在屏幕上怎么变，就能解出 T、B。</li>
+          <li>两者<b>在平面上完全等价</b>（可以切着看，画面一模一样）。</li>
+          <li>但一旦顶点被<b>位移（displacement）</b>顶起来，UV 算出来的固定切线就跟不上真实起伏了，导数法会自动跟上。</li>
+        </ol>
+        <pre>vec3 dp1 = dFdx(v_world), dp2 = dFdy(v_world);
+vec2 du1 = dFdx(v_uv),    du2 = dFdy(v_uv);
+float det = du1.x * du2.y - du2.x * du1.y;
+vec3 T = (dp1 * du2.y - dp2 * du1.y) / det;
+vec3 B = (dp2 * du1.x - dp1 * du2.x) / det;</pre>
+        <p class="note">
+          导数法的代价是<b>不能在顶点着色器里用</b>，而且三角形退化（UV 面积为零）时 <code>det</code> 会趋近 0，必须兜底。
+        </p>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>3. 法线贴图不是位移</h2>
+        <ol class="steps">
+          <li>法线贴图只改<b>着色</b>：轮廓还是低模的轮廓，边缘不会多出任何凹凸。</li>
+          <li>打开「位移」才是真的把高度加到顶点上 —— 轮廓会变，但需要足够密的网格，而且开销是真的。</li>
+          <li>想要"看起来很立体但不用高模"的中间态，还有视差贴图 / 视差遮蔽（POM），代价是在片元里反复采样。</li>
+        </ol>
+        <p class="note">
+          本页把高度值塞进了法线贴图的 <b>alpha 通道</b>（"显示高度场"那一档直接读 <code>.a</code>）。
+          真实项目也常这么打包：<b>RG = 法线 xy，B = 法线 z，A = AO 或高度</b>，一张图当两张用。
+        </p>
+      </section>
+    </div>
+
+    <div>
+      <canvas id="c" width="900" height="560"></canvas>
+
+      <section class="stage" style="margin-top:16px">
+        <div class="controls">
+          <label>显示
+            <select id="mode">
+              <option value="0" selected>光照结果</option>
+              <option value="1">法线贴图</option>
+              <option value="2">扰动后的世界法线</option>
+              <option value="3">高度场</option>
+            </select>
+          </label>
+          <label>TBN 来源
+            <select id="tbn">
+              <option value="0" selected>顶点切线</option>
+              <option value="1">屏幕导数</option>
+            </select>
+          </label>
+          <label><input type="checkbox" id="useMap" checked /> 使用法线贴图</label>
+          <label><input type="checkbox" id="disp" /> 位移（真的动顶点）</label>
+          <label>强度 <input type="range" id="strength" min="0" max="300" step="5" value="100" style="width:100px" /> <b id="strengthVal">1.00</b></label>
+          <label>光源角度 <input type="range" id="lightA" min="0" max="360" step="1" value="40" style="width:110px" /> <b id="lightAVal">40°</b></label>
+          <label>网格细分
+            <select id="grid">
+              <option value="16">16 × 16</option>
+              <option value="64" selected>64 × 64</option>
+              <option value="192">192 × 192</option>
+            </select>
+          </label>
+        </div>
+        <div class="stats">
+          <div>法线贴图：<b id="sTex">-</b></div>
+          <div>顶点数：<b id="sVerts" class="hl">-</b></div>
+          <div>三角形数：<b id="sTri">-</b></div>
+          <div>切空间：<b id="sTbn">T=+X B=−Z N=+Y</b></div>
+        </div>
+        <p class="hint" id="hint"></p>
+        <div id="err"></div>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => {
+  errBox.style.display = "block";
+  errBox.textContent += (e.message || e.error) + "\n";
+});
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+      a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  }
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let len = Math.hypot(zx, zy, zz); zx /= len; zy /= len; zz /= len;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  len = Math.hypot(xx, xy, xz); xx /= len; xy /= len; xz /= len;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+    1,
+  ]);
+}
+const clamp01 = (x) => Math.max(0, Math.min(1, x));
+function smoothstep(a, b, x) {
+  const t = clamp01((x - a) / (b - a));
+  return t * t * (3 - 2 * t);
+}
+
+// ---------- 高度场：砖墙 + 几个凸起 ----------
+// 单位为世界单位。SPAN 个世界单位对应整张贴图。
+const SPAN = 6;
+const BRICK_W = 2, BRICK_H = 1;
+function height(u, v) {
+  const row = Math.floor(v / BRICK_H);
+  const uu = u + (row & 1 ? BRICK_W * 0.5 : 0);
+  const fu = uu / BRICK_W - Math.floor(uu / BRICK_W);
+  const fv = v / BRICK_H - Math.floor(v / BRICK_H);
+  const eu = Math.min(fu, 1 - fu) * BRICK_W;   // 到砖边的世界距离
+  const ev = Math.min(fv, 1 - fv) * BRICK_H;
+  let h = Math.min(smoothstep(0, 0.16, eu), smoothstep(0, 0.10, ev)) * 0.75;
+  h += 0.025 * Math.sin(u * 5.1) * Math.sin(v * 4.3);      // 砖面轻微起伏
+  h += 0.40 * Math.exp(-(((u - 1.2) ** 2 + (v - 2.2) ** 2)) / 0.55);  // 圆凸起
+  h += 0.30 * Math.exp(-(((u + 2.6) ** 2 + (v - 1.0) ** 2)) / 0.30);
+  h += 0.22 * Math.exp(-(((u + 0.4) ** 2 + (v - 4.6) ** 2)) / 0.40);
+  return h;
+}
+const NRM_SIZE = 512;
+const NM_AMP = 0.30;   // 生成法线时的斜率放大，烘焙进贴图
+const nmData = new Uint8Array(NRM_SIZE * NRM_SIZE * 4);
+{
+  const e = SPAN / NRM_SIZE * 0.5;
+  for (let j = 0; j < NRM_SIZE; j++) {
+    for (let i = 0; i < NRM_SIZE; i++) {
+      const u = (i + 0.5) / NRM_SIZE * SPAN;
+      const v = (j + 0.5) / NRM_SIZE * SPAN;
+      const dhdu = (height(u + e, v) - height(u - e, v)) / (2 * e);
+      const dhdv = (height(u, v + e) - height(u, v - e)) / (2 * e);
+      let nx = -dhdu * NM_AMP, ny = -dhdv * NM_AMP, nz = 1;
+      const nl = Math.hypot(nx, ny, nz); nx /= nl; ny /= nl; nz /= nl;
+      const k = (j * NRM_SIZE + i) * 4;
+      nmData[k] = (nx * 0.5 + 0.5) * 255;
+      nmData[k + 1] = (ny * 0.5 + 0.5) * 255;
+      nmData[k + 2] = (nz * 0.5 + 0.5) * 255;
+      nmData[k + 3] = clamp01(height(u, v) / 0.9) * 255;   // alpha 塞高度
+    }
+  }
+}
+const nmTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, nmTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, NRM_SIZE, NRM_SIZE, 0, gl.RGBA, gl.UNSIGNED_BYTE, nmData);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+const VS = `#version 300 es
+in vec3 a_pos;      // xz 平面，y = 0
+in vec3 a_nrm;      // 高度场梯度法线（未位移时不用它）
+in vec3 a_tan;      // +X
+in vec3 a_bit;      // -Z
+in float a_h;       // 高度值
+in vec2 a_uv;
+uniform mat4 u_mvp;
+uniform float u_disp;   // 0 = 不平移，1 = 按高度顶起来
+out vec3 v_world;
+out vec3 v_nrm;
+out vec3 v_tan;
+out vec3 v_bit;
+out vec2 v_uv;
+void main() {
+  vec3 p = a_pos;
+  p.y += a_h * u_disp;
+  v_world = p;
+  // 顶点法线：没位移就是 (0,1,0)，位移了就用梯度法线
+  v_nrm = mix(vec3(0.0, 1.0, 0.0), a_nrm, u_disp);
+  v_tan = a_tan;
+  v_bit = a_bit;
+  v_uv = a_uv;
+  gl_Position = u_mvp * vec4(p, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec3 v_world;
+in vec3 v_nrm;
+in vec3 v_tan;
+in vec3 v_bit;
+in vec2 v_uv;
+uniform sampler2D u_nrmMap;
+uniform vec3 u_camPos;
+uniform vec3 u_lightDir;
+uniform int u_mode;       // 0 光照 1 贴图 2 世界法线 3 高度
+uniform int u_tbn;        // 0 顶点切线 1 屏幕导数
+uniform int u_useMap;
+uniform float u_strength;
+out vec4 outColor;
+
+void main() {
+  if (u_mode == 1) { outColor = vec4(texture(u_nrmMap, v_uv).rgb, 1.0); return; }
+  if (u_mode == 3) { outColor = vec4(vec3(texture(u_nrmMap, v_uv).a), 1.0); return; }
+
+  vec3 N = normalize(v_nrm);
+  if (!gl_FrontFacing) N = -N;
+
+  vec3 T, B;
+  if (u_tbn == 0) {
+    T = normalize(v_tan - N * dot(N, v_tan));
+    B = normalize(v_bit - N * dot(N, v_bit));
+  } else {
+    vec3 dp1 = dFdx(v_world), dp2 = dFdy(v_world);
+    vec2 du1 = dFdx(v_uv),    du2 = dFdy(v_uv);
+    float det = du1.x * du2.y - du2.x * du1.y;
+    det = abs(det) < 1e-9 ? 1e-9 : det;     // UV 退化时兜底
+    vec3 dT = (dp1 * du2.y - dp2 * du1.y) / det;
+    vec3 dB = (dp2 * du1.x - dp1 * du2.x) / det;
+    T = normalize(dT - N * dot(N, dT));
+    B = normalize(dB - N * dot(N, dB));
+  }
+  mat3 TBN = mat3(T, B, N);
+
+  vec3 n = vec3(0.0, 0.0, 1.0);
+  if (u_useMap == 1) {
+    n = texture(u_nrmMap, v_uv).xyz * 2.0 - 1.0;
+    n.xy *= u_strength;
+    n = normalize(n);
+  }
+  vec3 nWorld = normalize(TBN * n);
+
+  if (u_mode == 2) { outColor = vec4(nWorld * 0.5 + 0.5, 1.0); return; }
+
+  vec3 L = normalize(u_lightDir);
+  vec3 V = normalize(u_camPos - v_world);
+  vec3 H = normalize(L + V);
+  float diff = max(dot(nWorld, L), 0.0);
+  float spec = pow(max(dot(nWorld, H), 0.0), 72.0);
+  vec3 base = vec3(0.62, 0.58, 0.54);
+  vec3 col = base * (0.16 + 0.90 * diff) + vec3(1.0, 0.97, 0.92) * spec * 0.7;
+  outColor = vec4(col, 1.0);
+}`;
+
+const prog = link(VS, FS);
+gl.useProgram(prog);
+const U = {};
+for (const n of ["u_mvp", "u_disp", "u_nrmMap", "u_camPos", "u_lightDir", "u_mode", "u_tbn", "u_useMap", "u_strength"]) {
+  U[n] = gl.getUniformLocation(prog, n);
+}
+const A = {};
+for (const n of ["a_pos", "a_nrm", "a_tan", "a_bit", "a_h", "a_uv"]) A[n] = gl.getAttribLocation(prog, n);
+
+function buildGrid(n) {
+  const pos = [], nrm = [], tan = [], bit = [], hgt = [], uv = [], idx = [];
+  const step = SPAN / n;
+  for (let j = 0; j <= n; j++) {
+    for (let i = 0; i <= n; i++) {
+      const x = -SPAN / 2 + i * step;
+      const z = -SPAN / 2 + j * step;
+      const u = (x + SPAN / 2) / SPAN * SPAN;        // 世界单位
+      const v = (z + SPAN / 2) / SPAN * SPAN;
+      const e = step * 0.35;
+      const dhdx = (height(u + e, v) - height(u - e, v)) / (2 * e);
+      const dhdz = (height(u, v + e) - height(u, v - e)) / (2 * e);
+      const nl = Math.hypot(-dhdx * NM_AMP, 1, -dhdz * NM_AMP);
+      pos.push(x, 0, z);
+      nrm.push(-dhdx * NM_AMP / nl, 1 / nl, -dhdz * NM_AMP / nl);
+      tan.push(1, 0, 0);
+      bit.push(0, 0, -1);
+      hgt.push(height(u, v));
+      uv.push(u / SPAN, v / SPAN);
+    }
+  }
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      const a = j * (n + 1) + i, b = a + n + 1;
+      idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+  }
+  return {
+    pos: new Float32Array(pos), nrm: new Float32Array(nrm), tan: new Float32Array(tan),
+    bit: new Float32Array(bit), hgt: new Float32Array(hgt), uv: new Float32Array(uv),
+    idx: new Uint16Array(idx), count: n * n * 6, verts: (n + 1) * (n + 1),
+  };
+}
+
+let mesh = null, vao = null;
+function rebuild(n) {
+  if (vao) gl.deleteVertexArray(vao);
+  mesh = buildGrid(n);
+  vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const put = (loc, data, size) => {
+    const b = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+  };
+  put(A.a_pos, mesh.pos, 3);
+  put(A.a_nrm, mesh.nrm, 3);
+  put(A.a_tan, mesh.tan, 3);
+  put(A.a_bit, mesh.bit, 3);
+  put(A.a_h, mesh.hgt, 1);
+  put(A.a_uv, mesh.uv, 2);
+  const ib = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.idx, gl.STATIC_DRAW);
+  document.getElementById("sVerts").textContent = mesh.verts.toLocaleString();
+  document.getElementById("sTri").textContent = (mesh.count / 3).toLocaleString();
+}
+rebuild(64);
+document.getElementById("sTex").textContent = NRM_SIZE + "² RGBA（A = 高度）";
+
+const el = (id) => document.getElementById(id);
+const modeEl = el("mode"), tbnEl = el("tbn"), useMapEl = el("useMap"), dispEl = el("disp");
+const strengthEl = el("strength"), lightAEl = el("lightA"), gridEl = el("grid");
+const strengthVal = el("strengthVal"), lightAVal = el("lightAVal"), hintEl = el("hint");
+
+const cam = { yaw: 0.0, pitch: 0.62, dist: 6.2 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.006;
+  cam.pitch = Math.max(0.12, Math.min(1.45, cam.pitch - (e.clientY - lastY) * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+let gridN = 64, hintKey = "";
+function refreshHint() {
+  const mode = Number(modeEl.value), tbn = Number(tbnEl.value);
+  const key = [mode, tbn, useMapEl.checked, dispEl.checked, strengthEl.value].join(",");
+  if (key === hintKey) return;
+  hintKey = key;
+  strengthVal.textContent = (Number(strengthEl.value) / 100).toFixed(2);
+  lightAVal.textContent = lightAEl.value + "°";
+  hintEl.className = "hint";
+  if (mode === 0 && tbn === 1 && !dispEl.checked) {
+    hintEl.className = "hint ok";
+    hintEl.textContent = "平面上两种 TBN 来源结果完全一致 —— 这正是导数法的价值：不存切线也能得到同样的结果。打开「位移」再看，两者就会分开了。";
+  } else if (mode === 3) {
+    hintEl.textContent = "高度场（存在法线贴图的 alpha 通道里）。法线贴图就是它的梯度：梯度大 → 法线偏得远 → 光照变化剧烈。";
+  } else if (mode === 1) {
+    hintEl.textContent = "法线贴图原图：整体偏蓝紫（z 分量接近 1），砖缝和凸起的边缘有明显的红绿变化。";
+  } else if (mode === 2) {
+    hintEl.textContent = "扰动后的世界法线。它已经偏离 +Y 方向，说明法线贴图真的改变了每一点的朝向。";
+  } else if (!useMapEl.checked) {
+    hintEl.textContent = "关掉法线贴图后只剩几何法线：整块平面一个朝向，砖缝完全消失。几何一点没变，变的只有法线。";
+  } else if (dispEl.checked) {
+    hintEl.textContent = "位移：高度真的加到顶点上了，轮廓会跟着动。对比法线贴图 —— 后者轮廓永远是平的。";
+  } else {
+    hintEl.textContent = "光照随法线走：把「强度」拉到 0 就等于关掉法线贴图，拉大则凹凸对比变强。";
+  }
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+
+  const n = Number(gridEl.value);
+  if (n !== gridN) { gridN = n; rebuild(n); }
+  refreshHint();
+
+  const eye = [
+    Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    Math.sin(cam.pitch) * cam.dist,
+    Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const proj = perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 100);
+  const viewM = lookAt(eye, [0, 0.2, 0], [0, 1, 0]);
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.04, 0.045, 0.07, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+
+  const a = Number(lightAEl.value) * Math.PI / 180;
+  const lightDir = [Math.cos(a) * 0.72, 0.62, Math.sin(a) * 0.72];
+
+  gl.useProgram(prog);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, nmTex);
+  gl.uniform1i(U.u_nrmMap, 0);
+  gl.uniformMatrix4fv(U.u_mvp, false, mul(proj, viewM));
+  gl.uniform1f(U.u_disp, dispEl.checked ? 1 : 0);
+  gl.uniform3fv(U.u_camPos, new Float32Array(eye));
+  gl.uniform3fv(U.u_lightDir, new Float32Array(lightDir));
+  gl.uniform1i(U.u_mode, Number(modeEl.value));
+  gl.uniform1i(U.u_tbn, Number(tbnEl.value));
+  gl.uniform1i(U.u_useMap, useMapEl.checked ? 1 : 0);
+  gl.uniform1f(U.u_strength, Number(strengthEl.value) / 100);
+  gl.bindVertexArray(vao);
+  gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0);
+}
+
+refreshHint();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

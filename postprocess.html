@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · 离屏渲染与后处理</title>
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --panel: #12151f;
+      --line: #243044;
+      --text: #e8eef8;
+      --muted: #8b97a8;
+      --accent: #9fd4ff;
+      --gold: #f3d27a;
+      --ok: #7dcea0;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 940px; }
+    header b { color: var(--accent); }
+    .layout {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 20px;
+      padding: 20px 24px 40px;
+      align-items: start;
+    }
+    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
+    canvas {
+      width: 100%; height: auto; display: block;
+      background: #08090e; border: 1px solid var(--line);
+      border-radius: 8px; cursor: grab;
+    }
+    canvas:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    .pipe { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+    .pipe span {
+      background: #1a2230; border: 1px solid #2c3b52; border-radius: 999px;
+      padding: 4px 10px; font-size: 12px; color: #c9d6e8;
+    }
+    .pipe span.f { color: var(--ok); border-color: #2a4a38; background: #102018; }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code, .note code, pre code { color: var(--gold); font-size: 12px; }
+    pre {
+      margin: 10px 0 0; background: #0a0c12; border: 1px solid var(--line);
+      border-radius: 6px; padding: 12px 14px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #d5deea; white-space: pre;
+    }
+    .note { color: var(--muted); font-size: 13px; margin-top: 10px; }
+    .note b { color: var(--text); }
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 10px 16px;
+      margin-top: 12px; align-items: center;
+      color: var(--muted); font-size: 13px;
+    }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls select { accent-color: #4aa3ff; }
+    .controls input[type="range"] { accent-color: #4aa3ff; }
+    .readout {
+      margin-top: 10px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px 16px; font-size: 12.5px; color: var(--muted);
+    }
+    .readout b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .readout .hl { color: var(--gold); }
+    .hint {
+      margin: 10px 0 0; padding: 10px 12px; border-radius: 6px;
+      background: #1a2230; border: 1px solid #2c3b52; color: var(--text);
+      font-size: 13px; min-height: 3.4em;
+    }
+    .hint.warn { background: #241c10; border-color: #5a4a22; color: #f0cd90; }
+    .hint.ok { background: #102018; border-color: #2a4a38; color: var(--ok); }
+    #err {
+      display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212;
+      border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>离屏渲染与后处理：先把画面画进纹理，再贴回屏幕</h1>
+    <p>
+      阴影图、GPU 拾取、镜子、泛光 —— 它们都靠同一个机制：<b>FBO</b>。
+      这一页先把场景渲染到一张纹理上，再用一个<b>全屏三角形</b>读它、加工它、贴回屏幕。
+      最后用模糊讲清<b>可分离卷积</b>为什么能省掉一个数量级。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <section class="stage">
+        <h2>1. 默认帧缓冲不是唯一选择</h2>
+        <div class="pipe">
+          <span>场景 → FBO 纹理</span>
+          <span class="f">全屏 pass 读纹理</span>
+          <span class="f">加工（模糊 / 边缘 / 阈值）</span>
+          <span>→ 屏幕</span>
+        </div>
+        <ol class="steps">
+          <li>平时画进 <code>null</code> 帧缓冲，也就是 canvas。换成自己建的 <b>FBO</b> 就是画进纹理。</li>
+          <li>FBO = 一组挂载点：颜色附件（纹理）+ 深度附件（renderbuffer 或纹理）。</li>
+          <li>建完必须 <code>checkFramebufferStatus</code>，不完整的话后面全是黑屏。</li>
+          <li>深度用 renderbuffer 就够 —— 我们不打算采样它，只要求它能参与深度测试。</li>
+        </ol>
+        <p class="note">
+          <b>离屏纹理的分辨率不必等于 canvas。</b> 拉低一点就是性能换画质；
+          阴影图、half-res 后处理都是这么做的。
+        </p>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>2. 全屏 pass 怎么写</h2>
+        <ol class="steps">
+          <li>不需要 VBO：顶点着色器直接用 <code>gl_VertexID</code> 生成一个盖住屏幕的大三角形。</li>
+          <li>为什么是三角形不是四边形：一个三角形没有对角线接缝，光栅化更省。</li>
+          <li>片元着色器把 UV 当输入，<code>texture()</code> 取离屏图，加工后输出。</li>
+          <li>这一趟要关掉深度测试和背面剔除 —— 它不参与 3D，只是一次 2D 图像运算。</li>
+        </ol>
+        <p class="note">
+          后处理 pass 可以叠很多层。每多一层就多一次全屏读写，
+          <b>带宽是这类效果的主要成本</b>，所以能合并的 pass 就合并。
+        </p>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>3. 可分离卷积为什么快</h2>
+        <ol class="steps">
+          <li>高斯核在二维上是可分离的：<code>G(x,y) = G(x)·G(y)</code>。</li>
+          <li>所以 N×N 的一趟可以拆成「横着扫一遍 + 竖着扫一遍」。</li>
+          <li>半径 r：单趟要 <code>(2r+1)²</code> 次采样，分离只要 <code>2(2r+1)</code> 次。</li>
+          <li>r = 8 时是 <b>289 次 vs 34 次</b>，差 8.5 倍；r 越大差距越大。</li>
+        </ol>
+        <p class="note">
+          代价是多一趟全屏读写，以及需要两张纹理轮换（<b>ping-pong</b>）——
+          因为一趟不能同时读写同一张纹理。
+        </p>
+      </section>
+    </div>
+
+    <div>
+      <canvas id="c" width="720" height="520"></canvas>
+      <div id="err"></div>
+      <div class="controls">
+        <label>
+          效果
+          <select id="effect">
+            <option value="0">原图（只过一趟 FBO）</option>
+            <option value="1">灰度</option>
+            <option value="2" selected>高斯模糊</option>
+            <option value="3">Sobel 边缘</option>
+            <option value="4">泛光（bloom）</option>
+          </select>
+        </label>
+        <label>半径 <input id="radius" type="range" min="1" max="20" value="8" /> <span id="radiusVal">8</span></label>
+        <label>阈值 <input id="threshold" type="range" min="20" max="90" value="55" /> <span id="threshVal">0.55</span></label>
+      </div>
+      <div class="controls">
+        <label><input id="separable" type="checkbox" checked /> 可分离卷积</label>
+        <label>
+          离屏分辨率
+          <select id="res">
+            <option value="1">1× （= canvas）</option>
+            <option value="0.5">0.5×</option>
+            <option value="0.25">0.25×</option>
+          </select>
+        </label>
+      </div>
+      <div class="readout" id="readout"></div>
+      <p class="hint" id="hint"></p>
+    </div>
+  </div>
+
+  <div class="layout" style="padding-top:0">
+    <section class="stage">
+      <h2>4. 本页真正在跑的核心</h2>
+<pre><code>// ① 建离屏目标：颜色挂纹理，深度挂 renderbuffer
+const fbo = gl.createFramebuffer();
+gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRb);
+if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) fail(...);
+
+// ② 第一趟：3D 场景画进离屏纹理（不是屏幕）
+gl.bindFramebuffer(gl.FRAMEBUFFER, scene.fbo);
+gl.viewport(0, 0, offW, offH);
+gl.enable(gl.DEPTH_TEST);
+drawScene();
+
+// ③ 全屏 pass：读纹理 → 加工 → 贴回屏幕
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+gl.viewport(0, 0, canvas.width, canvas.height);
+gl.disable(gl.DEPTH_TEST);
+gl.drawArrays(gl.TRIANGLES, 0, 3);   // 不需要 VBO，VS 用 gl_VertexID
+
+// 顶点着色器：用 gl_VertexID 直接造一个盖住屏幕的三角形
+vec2 p = vec2(float((gl_VertexID &lt;&lt; 1) &amp; 2), float(gl_VertexID &amp; 2));
+v_uv = p;
+gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+
+// ④ 可分离高斯：横一趟、竖一趟，中间用两张纹理轮换
+blit(postA, bright, dir = vec2(1, 0));   // 横向
+blit(postB, postA,  dir = vec2(0, 1));   // 纵向（读 postA 写 postB）</code></pre>
+      <p class="note">
+        泛光是三步叠出来的：亮度阈值 → 模糊 → 和原图相加。
+        <b>阈值必须在模糊之前</b>，否则亮部会被邻域的暗像素稀释掉。
+      </p>
+    </section>
+
+    <section class="stage">
+      <h2>5. 对照着拧开关看</h2>
+      <ol class="steps">
+        <li>切「原图」：场景只过了一趟 FBO 就贴回来，和直接画几乎一样 —— 这是离屏渲染的最小形态。</li>
+        <li>切「高斯模糊」，在「可分离」和不可分离之间切换：<b>画面一致，看采样数从 34 跳到 289</b>。</li>
+        <li>把半径拉满 20：单趟要 1681 次采样，分离只要 82 次 —— 差距随半径平方增长。</li>
+        <li>离屏分辨率切到 0.25×：画面变糊、出现方块。这就是阴影图和 half-res 后处理的取舍。</li>
+        <li>切「Sobel 边缘」：只有 8 次采样，但输出的是梯度强度，不是颜色。</li>
+        <li>切「泛光」调阈值：调低 = 更多区域发光。注意阈值那一步必须排在模糊前面。</li>
+      </ol>
+    </section>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+const hintEl = document.getElementById("hint");
+const readoutEl = document.getElementById("readout");
+const effectEl = document.getElementById("effect");
+const radiusEl = document.getElementById("radius");
+const radiusVal = document.getElementById("radiusVal");
+const thresholdEl = document.getElementById("threshold");
+const threshVal = document.getElementById("threshVal");
+const separableEl = document.getElementById("separable");
+const resEl = document.getElementById("res");
+
+function fail(msg) {
+  errBox.style.display = "block";
+  errBox.textContent = msg;
+  throw new Error(msg);
+}
+
+const gl = canvas.getContext("webgl2", { antialias: true });
+if (!gl) fail("需要 WebGL2。请用较新的 Chrome / Edge / Firefox。");
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    fail(gl.getShaderInfoLog(s) || "shader compile failed");
+  }
+  return s;
+}
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    fail(gl.getProgramInfoLog(p) || "program link failed");
+  }
+  return p;
+}
+
+// ---------- math ----------
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      o[c * 4 + r] =
+        a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+        a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    }
+  }
+  return o;
+}
+function identity() {
+  return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+}
+function translate(m, x, y, z) {
+  const t = identity();
+  t[12] = x; t[13] = y; t[14] = z;
+  return mul(m, t);
+}
+function scaleMat(sx, sy, sz) {
+  const m = identity();
+  m[0] = sx; m[5] = sy; m[10] = sz;
+  return m;
+}
+function rotY(m, a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return mul(m, new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]));
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2);
+  const nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let len = Math.hypot(zx, zy, zz); zx /= len; zy /= len; zz /= len;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  len = Math.hypot(xx, xy, xz); xx /= len; xy /= len; xz /= len;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+    1,
+  ]);
+}
+
+// ---------- 场景着色器 ----------
+const SCENE_VS = `#version 300 es
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec3 a_normal;
+uniform mat4 u_mvp;
+uniform mat4 u_model;
+out vec3 v_normal;
+out vec3 v_world;
+void main() {
+  vec4 w = u_model * vec4(a_pos, 1.0);
+  v_world = w.xyz;
+  v_normal = mat3(u_model) * a_normal;
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+
+const SCENE_FS = `#version 300 es
+precision mediump float;
+in vec3 v_normal;
+in vec3 v_world;
+uniform vec3 u_color;
+uniform vec3 u_cameraPos;
+uniform vec3 u_lightDir;
+out vec4 outColor;
+void main() {
+  vec3 N = normalize(v_normal);
+  vec3 L = normalize(u_lightDir);
+  vec3 V = normalize(u_cameraPos - v_world);
+  float ndl = max(dot(N, L), 0.0);
+  vec3 H = normalize(L + V);
+  float spec = pow(max(dot(N, H), 0.0), 48.0);
+  // 故意让高光很亮，泛光才有东西可抓
+  vec3 col = u_color * (0.20 + 0.80 * ndl) + vec3(1.0) * spec * 0.85;
+  outColor = vec4(col, 1.0);
+}`;
+
+// ---------- 后处理着色器 ----------
+const POST_VS = `#version 300 es
+out vec2 v_uv;
+void main() {
+  // 不用 VBO：gl_VertexID 0,1,2 → (0,0) (2,0) (0,2)，盖住整个屏幕的大三角形
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  v_uv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const POST_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_src;
+uniform sampler2D u_src2;
+uniform int u_effect;
+uniform vec2 u_dir;
+uniform float u_radius;
+uniform vec2 u_texel;
+uniform float u_threshold;
+uniform float u_strength;
+out vec4 outColor;
+
+const int MAX_R = 20;
+
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// 一维高斯：横着或竖着扫一遍
+vec3 blur1D(sampler2D tex, vec2 uv, vec2 dirStep) {
+  float sigma = max(u_radius / 2.0, 0.0001);
+  vec3 sum = texture(tex, uv).rgb;
+  float wsum = 1.0;
+  for (int i = 1; i <= MAX_R; i++) {
+    if (float(i) > u_radius) break;
+    float fi = float(i);
+    float w = exp(-(fi * fi) / (2.0 * sigma * sigma));
+    sum += texture(tex, uv + dirStep * fi).rgb * w;
+    sum += texture(tex, uv - dirStep * fi).rgb * w;
+    wsum += 2.0 * w;
+  }
+  return sum / wsum;
+}
+
+// 二维高斯：一趟扫完 (2r+1)^2 个格子
+// 注意循环下界必须用动态的 r，写成 -MAX_R 再 break 的话第一次就退出了
+vec3 blur2D(sampler2D tex, vec2 uv) {
+  float sigma = max(u_radius / 2.0, 0.0001);
+  int r = int(u_radius + 0.5);
+  vec3 sum = texture(tex, uv).rgb;
+  float wsum = 1.0;
+  for (int y = -r; y <= r; y++) {
+    for (int x = -r; x <= r; x++) {
+      if (x == 0 && y == 0) continue;
+      float d2 = float(x * x + y * y);
+      float w = exp(-d2 / (2.0 * sigma * sigma));
+      sum += texture(tex, uv + vec2(float(x), float(y)) * u_texel).rgb * w;
+      wsum += w;
+    }
+  }
+  return sum / wsum;
+}
+
+void main() {
+  vec2 uv = v_uv;
+
+  if (u_effect == 0) {                       // 原图
+    outColor = vec4(texture(u_src, uv).rgb, 1.0);
+    return;
+  }
+  if (u_effect == 1) {                       // 灰度
+    outColor = vec4(vec3(luma(texture(u_src, uv).rgb)), 1.0);
+    return;
+  }
+  if (u_effect == 2) {                       // 高斯模糊
+    if (dot(u_dir, u_dir) < 0.5) outColor = vec4(blur2D(u_src, uv), 1.0);
+    else outColor = vec4(blur1D(u_src, uv, u_dir * u_texel), 1.0);
+    return;
+  }
+  if (u_effect == 3) {                       // Sobel 边缘
+    vec2 o = u_texel;
+    float c00 = luma(texture(u_src, uv + vec2(-o.x, -o.y)).rgb);
+    float c10 = luma(texture(u_src, uv + vec2( 0.0, -o.y)).rgb);
+    float c20 = luma(texture(u_src, uv + vec2( o.x, -o.y)).rgb);
+    float c01 = luma(texture(u_src, uv + vec2(-o.x,  0.0)).rgb);
+    float c21 = luma(texture(u_src, uv + vec2( o.x,  0.0)).rgb);
+    float c02 = luma(texture(u_src, uv + vec2(-o.x,  o.y)).rgb);
+    float c12 = luma(texture(u_src, uv + vec2( 0.0,  o.y)).rgb);
+    float c22 = luma(texture(u_src, uv + vec2( o.x,  o.y)).rgb);
+    float gx = -c00 + c20 - 2.0 * c01 + 2.0 * c21 - c02 + c22;
+    float gy = -c00 - 2.0 * c10 - c20 + c02 + 2.0 * c12 + c22;
+    outColor = vec4(vec3(clamp(sqrt(gx * gx + gy * gy), 0.0, 1.0)), 1.0);
+    return;
+  }
+  if (u_effect == 4) {                       // 泛光合成
+    vec3 base = texture(u_src, uv).rgb;
+    vec3 glow = texture(u_src2, uv).rgb;
+    outColor = vec4(base + glow * u_strength, 1.0);
+    return;
+  }
+  if (u_effect == 5) {                       // 亮度阈值（泛光第一步）
+    vec3 c = texture(u_src, uv).rgb;
+    float l = luma(c);
+    outColor = vec4(c * smoothstep(u_threshold, u_threshold * 1.6 + 0.06, l), 1.0);
+    return;
+  }
+  outColor = vec4(texture(u_src, uv).rgb, 1.0);
+}`;
+
+const sceneProg = link(SCENE_VS, SCENE_FS);
+const postProg = link(POST_VS, POST_FS);
+const suMvp = gl.getUniformLocation(sceneProg, "u_mvp");
+const suModel = gl.getUniformLocation(sceneProg, "u_model");
+const suColor = gl.getUniformLocation(sceneProg, "u_color");
+const suCameraPos = gl.getUniformLocation(sceneProg, "u_cameraPos");
+const suLightDir = gl.getUniformLocation(sceneProg, "u_lightDir");
+
+const puSrc = gl.getUniformLocation(postProg, "u_src");
+const puSrc2 = gl.getUniformLocation(postProg, "u_src2");
+const puEffect = gl.getUniformLocation(postProg, "u_effect");
+const puDir = gl.getUniformLocation(postProg, "u_dir");
+const puRadius = gl.getUniformLocation(postProg, "u_radius");
+const puTexel = gl.getUniformLocation(postProg, "u_texel");
+const puThreshold = gl.getUniformLocation(postProg, "u_threshold");
+const puStrength = gl.getUniformLocation(postProg, "u_strength");
+
+// ---------- geometry ----------
+function makeCube() {
+  const faces = [
+    { n: [ 0, 0, 1], v: [[-1,-1, 1],[ 1,-1, 1],[ 1, 1, 1],[-1, 1, 1]] },
+    { n: [ 0, 0,-1], v: [[ 1,-1,-1],[-1,-1,-1],[-1, 1,-1],[ 1, 1,-1]] },
+    { n: [ 1, 0, 0], v: [[ 1,-1, 1],[ 1,-1,-1],[ 1, 1,-1],[ 1, 1, 1]] },
+    { n: [-1, 0, 0], v: [[-1,-1,-1],[-1,-1, 1],[-1, 1, 1],[-1, 1,-1]] },
+    { n: [ 0, 1, 0], v: [[-1, 1, 1],[ 1, 1, 1],[ 1, 1,-1],[-1, 1,-1]] },
+    { n: [ 0,-1, 0], v: [[-1,-1,-1],[ 1,-1,-1],[ 1,-1, 1],[-1,-1, 1]] },
+  ];
+  const pos = [], nrm = [], idx = [];
+  let base = 0;
+  for (const f of faces) {
+    for (const p of f.v) { pos.push(p[0], p[1], p[2]); nrm.push(f.n[0], f.n[1], f.n[2]); }
+    idx.push(base, base+1, base+2, base, base+2, base+3);
+    base += 4;
+  }
+  return { positions: new Float32Array(pos), normals: new Float32Array(nrm), indices: new Uint16Array(idx) };
+}
+
+function makeSphere(radius, stacks, slices) {
+  const pos = [], nrm = [], idx = [];
+  for (let i = 0; i <= stacks; i++) {
+    const theta = (i / stacks) * Math.PI;
+    const sinT = Math.sin(theta), cosT = Math.cos(theta);
+    for (let j = 0; j <= slices; j++) {
+      const phi = (j / slices) * Math.PI * 2;
+      const x = sinT * Math.cos(phi), y = cosT, z = sinT * Math.sin(phi);
+      pos.push(radius * x, radius * y, radius * z);
+      nrm.push(x, y, z);
+    }
+  }
+  const stride = slices + 1;
+  for (let i = 0; i < stacks; i++) {
+    for (let j = 0; j < slices; j++) {
+      const a = i * stride + j, b = a + stride;
+      idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+  }
+  return { positions: new Float32Array(pos), normals: new Float32Array(nrm), indices: new Uint16Array(idx) };
+}
+
+function makeGround() {
+  return {
+    positions: new Float32Array([-8,0,-8, 8,0,-8, 8,0,8, -8,0,8]),
+    normals: new Float32Array([0,1,0, 0,1,0, 0,1,0, 0,1,0]),
+    indices: new Uint16Array([0, 2, 1, 0, 3, 2]),
+  };
+}
+
+function makeMesh(geom) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const pb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, pb);
+  gl.bufferData(gl.ARRAY_BUFFER, geom.positions, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  const nb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, nb);
+  gl.bufferData(gl.ARRAY_BUFFER, geom.normals, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+  const ib = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geom.indices, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return { vao, count: geom.indices.length };
+}
+
+const cubeDraw = makeMesh(makeCube());
+const sphereDraw = makeMesh(makeSphere(1, 20, 28));
+const groundDraw = makeMesh(makeGround());
+
+// 全屏三角形不需要顶点数据，但 WebGL2 要求绑一个 VAO
+const emptyVao = gl.createVertexArray();
+
+// ---------- 离屏目标 ----------
+function createTarget(w, h, withDepth) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+
+  let depthRb = null;
+  if (withDepth) {
+    depthRb = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depthRb);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRb);
+  }
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+    fail("离屏 FBO 不完整（" + w + "×" + h + "）");
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { tex, fbo, depthRb, w, h };
+}
+
+function destroyTarget(t) {
+  if (!t) return;
+  gl.deleteTexture(t.tex);
+  gl.deleteFramebuffer(t.fbo);
+  if (t.depthRb) gl.deleteRenderbuffer(t.depthRb);
+}
+
+let sceneT = null;   // 场景颜色 + 深度
+let postA = null;    // 中间纹理 A
+let postB = null;    // 中间纹理 B
+let brightT = null;  // 阈值结果
+let sizeKey = "";
+
+function ensureTargets() {
+  const scale = Number(resEl.value);
+  const offW = Math.max(1, Math.floor(canvas.width * scale));
+  const offH = Math.max(1, Math.floor(canvas.height * scale));
+  const key = [offW, offH, canvas.width, canvas.height].join("x");
+  if (key === sizeKey) return;
+  sizeKey = key;
+
+  destroyTarget(sceneT); destroyTarget(postA); destroyTarget(postB); destroyTarget(brightT);
+
+  sceneT = createTarget(offW, offH, true);
+  postA = createTarget(canvas.width, canvas.height, false);
+  postB = createTarget(canvas.width, canvas.height, false);
+  brightT = createTarget(canvas.width, canvas.height, false);
+}
+
+// ---------- 全屏 pass ----------
+const PASS_COUNT = { passes: 0, taps: 0 };
+
+function blit(target, srcTex, opts) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fbo : null);
+  if (target) gl.viewport(0, 0, target.w, target.h);
+  else gl.viewport(0, 0, canvas.width, canvas.height);
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.BLEND);
+  gl.disable(gl.CULL_FACE);
+
+  gl.useProgram(postProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, srcTex);
+  gl.uniform1i(puSrc, 0);
+  // u_src2 每次都要显式赋值：如果只在需要时赋值，上一帧的值会残留，
+  // 采样器就会指到别的贴图上。一旦那张贴图正好是本次的渲染目标（feedback loop），
+  // 驱动会直接判 INVALID_OPERATION 把这次绘制丢掉，画面就黑了。
+  if (opts.src2) {
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, opts.src2);
+    gl.uniform1i(puSrc2, 1);
+  } else {
+    gl.uniform1i(puSrc2, 0);
+  }
+  gl.uniform1i(puEffect, opts.effect);
+  gl.uniform2f(puDir, opts.dir ? opts.dir[0] : 0, opts.dir ? opts.dir[1] : 0);
+  gl.uniform1f(puRadius, opts.radius || 0);
+  gl.uniform2f(puTexel, 1 / (opts.srcW || 1), 1 / (opts.srcH || 1));
+  gl.uniform1f(puThreshold, opts.threshold != null ? opts.threshold : 0.55);
+  gl.uniform1f(puStrength, opts.strength != null ? opts.strength : 1.0);
+
+  gl.bindVertexArray(emptyVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  PASS_COUNT.passes++;
+  PASS_COUNT.taps += opts.taps || 1;
+}
+
+// ---------- 相机 ----------
+let yaw = 0.55;
+let pitch = 0.34;
+let dragging = false;
+let lastX = 0, lastY = 0;
+
+canvas.addEventListener("pointerdown", (e) => {
+  dragging = true; lastX = e.clientX; lastY = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  yaw -= (e.clientX - lastX) * 0.005;
+  pitch = Math.max(-0.05, Math.min(1.1, pitch + (e.clientY - lastY) * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+// ---------- 场景 ----------
+function drawScene(viewProj, eye, t) {
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthMask(true);
+  gl.enable(gl.CULL_FACE);
+  gl.disable(gl.BLEND);
+  gl.clearColor(0.035, 0.042, 0.062, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  gl.useProgram(sceneProg);
+  gl.uniform3fv(suCameraPos, eye);
+  gl.uniform3f(suLightDir, 0.45, 0.78, 0.44);
+
+  const put = (mesh, model, color) => {
+    gl.uniformMatrix4fv(suModel, false, model);
+    gl.uniformMatrix4fv(suMvp, false, mul(viewProj, model));
+    gl.uniform3fv(suColor, color);
+    gl.bindVertexArray(mesh.vao);
+    gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0);
+  };
+
+  put(groundDraw, translate(identity(), 0, -1.0, 0), [0.16, 0.18, 0.23]);
+  put(cubeDraw, mul(translate(identity(), -1.15, -0.45, 0.35), rotY(identity(), t * 0.5)), [0.85, 0.32, 0.26]);
+  put(sphereDraw, mul(translate(identity(), 0.95, -0.15, -0.35), scaleMat(0.62, 0.62, 0.62)), [0.24, 0.62, 0.88]);
+  put(cubeDraw, mul(mul(translate(identity(), 0.15, 0.55, 0.55), rotY(identity(), -t * 0.7)), scaleMat(0.5, 0.5, 0.5)), [0.88, 0.76, 0.30]);
+}
+
+// ---------- 读数 ----------
+function sepTaps(r) { return 2 * (1 + 2 * r); }
+function fullTaps(r) { const d = 2 * r + 1; return d * d; }
+
+function updateReadout(effect, radius, separable) {
+  const scale = Number(resEl.value);
+  const offW = Math.max(1, Math.floor(canvas.width * scale));
+  const offH = Math.max(1, Math.floor(canvas.height * scale));
+
+  let taps = 0;
+  let note = "";
+  if (effect === 0) { taps = 1; }
+  else if (effect === 1) { taps = 1; }
+  else if (effect === 2) {
+    taps = separable ? sepTaps(radius) : fullTaps(radius);
+  } else if (effect === 3) { taps = 8; }
+  else if (effect === 4) { taps = 1 + (separable ? sepTaps(radius) : fullTaps(radius)) + 2; }
+
+  readoutEl.innerHTML =
+    `<div>全屏 pass <b>${PASS_COUNT.passes}</b> 趟</div>` +
+    `<div>离屏尺寸 <b>${offW}×${offH}</b></div>` +
+    `<div>模糊采样 <b class="hl">${taps}</b> / 像素</div>` +
+    `<div>半径 ${radius} 时单趟(2r+1)² = <b>${fullTaps(radius)}</b></div>`;
+
+  hintEl.className = "hint";
+  if (effect === 2) {
+    if (separable) {
+      hintEl.className = "hint ok";
+      hintEl.textContent =
+        `可分离：横竖各扫一遍，共 ${sepTaps(radius)} 次采样（2 趟全屏）。` +
+        `旁边对照：单趟二维核要 ${fullTaps(radius)} 次 —— 省了 ${(fullTaps(radius) / sepTaps(radius)).toFixed(1)} 倍。`;
+    } else {
+      hintEl.className = "hint warn";
+      hintEl.textContent =
+        `单趟二维核：一次扫满 (2r+1)² = ${fullTaps(radius)} 次采样，只有 1 趟。` +
+        `半径越大越吃亏 —— 这就是可分离卷积存在的理由。`;
+    }
+  } else if (effect === 0) {
+    hintEl.textContent = "场景只经过一次离屏渲染就贴回来。这是 FBO 的最小形态：渲染到纹理，再把纹理贴到屏幕。";
+  } else if (effect === 1) {
+    hintEl.textContent = "灰度：全屏 pass 只取 1 次样，改一下输出。后处理的成本主要在带宽，不在算术。";
+  } else if (effect === 3) {
+    hintEl.textContent = "Sobel 边缘：8 次采样算梯度，输出的是亮度变化强度。注意它不看颜色，只看亮度差。";
+  } else if (effect === 4) {
+    hintEl.textContent = "泛光 = 阈值 → 横竖模糊 → 和原图相加。阈值必须排在模糊前面，否则亮部会被邻域稀释。";
+  }
+
+  if (scale < 1) {
+    hintEl.textContent += ` 离屏只有 canvas 的 ${scale}×，贴回来时被放大 —— 变糊但省填充率，阴影图和 half-res 后处理都这么干。`;
+  }
+}
+
+function frame(tms) {
+  requestAnimationFrame(frame);
+  const t = tms * 0.001;
+
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+
+  radiusVal.textContent = radiusEl.value;
+  const th = Number(thresholdEl.value) / 100;
+  threshVal.textContent = th.toFixed(2);
+
+  ensureTargets();
+  PASS_COUNT.passes = 0;
+  PASS_COUNT.taps = 0;
+
+  const dist = 4.9;
+  const eye = [
+    Math.sin(yaw) * Math.cos(pitch) * dist,
+    0.9 + Math.sin(pitch) * dist,
+    Math.cos(yaw) * Math.cos(pitch) * dist,
+  ];
+  const proj = perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 60);
+  const view = lookAt(eye, [0, 0.05, 0], [0, 1, 0]);
+  const viewProj = mul(proj, view);
+
+  const effect = Number(effectEl.value);
+  const radius = Number(radiusEl.value);
+  const separable = separableEl.checked;
+
+  // ① 场景 → 离屏纹理
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sceneT.fbo);
+  gl.viewport(0, 0, sceneT.w, sceneT.h);
+  drawScene(viewProj, eye, t);
+
+  // ② 后处理链
+  const sceneOpts = { srcW: sceneT.w, srcH: sceneT.h };
+
+  if (effect === 0 || effect === 1 || effect === 3) {
+    // 单趟：读离屏图 → 加工 → 贴屏幕
+    blit(null, sceneT.tex, {
+      effect,
+      taps: effect === 3 ? 8 : 1,
+      ...sceneOpts,
+    });
+  } else if (effect === 2 && !separable) {
+    // 单趟二维核 (2r+1)²，只有一趟
+    blit(null, sceneT.tex, {
+      effect: 2, radius, dir: [0, 0],
+      taps: fullTaps(radius),
+      ...sceneOpts,
+    });
+  } else if (effect === 2 && separable) {
+    // 横向：scene → postA
+    blit(postA, sceneT.tex, {
+      effect: 2, radius, dir: [1, 0],
+      taps: 1 + 2 * radius,
+      ...sceneOpts,
+    });
+    // 纵向：postA → postB（不能读写同一张纹理，所以要两张轮换）
+    blit(postB, postA.tex, {
+      effect: 2, radius, dir: [0, 1],
+      taps: 1 + 2 * radius,
+      srcW: postA.w, srcH: postA.h,
+    });
+    // 贴屏幕
+    blit(null, postB.tex, { effect: 0, taps: 1, srcW: postB.w, srcH: postB.h });
+  } else {
+    // 泛光：阈值 → 横模糊 → 竖模糊 → 和原图相加
+    blit(brightT, sceneT.tex, { effect: 5, threshold: th, taps: 1, ...sceneOpts });
+    blit(postA, brightT.tex, {
+      effect: 2, radius, dir: [1, 0],
+      taps: 1 + 2 * radius,
+      srcW: brightT.w, srcH: brightT.h,
+    });
+    blit(postB, postA.tex, {
+      effect: 2, radius, dir: [0, 1],
+      taps: 1 + 2 * radius,
+      srcW: postA.w, srcH: postA.h,
+    });
+    blit(null, sceneT.tex, {
+      effect: 4, src2: postB.tex, strength: 1.35,
+      taps: 2,
+      ...sceneOpts,
+    });
+  }
+
+  updateReadout(effect, radius, separable);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

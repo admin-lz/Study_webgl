@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · 索引、绕序与背面剔除</title>
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --panel: #12151f;
+      --line: #243044;
+      --text: #e8eef8;
+      --muted: #8b97a8;
+      --accent: #9fd4ff;
+      --gold: #f3d27a;
+      --ok: #7dcea0;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 940px; }
+    header b { color: var(--accent); }
+    .layout {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 20px;
+      padding: 20px 24px 40px;
+      align-items: start;
+    }
+    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
+    canvas {
+      width: 100%; height: auto; display: block;
+      background: #08090e; border: 1px solid var(--line);
+      border-radius: 8px; cursor: grab;
+    }
+    canvas:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    .pipe { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+    .pipe span {
+      background: #1a2230; border: 1px solid #2c3b52; border-radius: 999px;
+      padding: 4px 10px; font-size: 12px; color: #c9d6e8;
+    }
+    .pipe span.i { color: var(--gold); border-color: #5a4a22; background: #221c10; }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code, .note code, pre code { color: var(--gold); font-size: 12px; }
+    pre {
+      margin: 10px 0 0; background: #0a0c12; border: 1px solid var(--line);
+      border-radius: 6px; padding: 12px 14px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #d5deea; white-space: pre;
+    }
+    .note { color: var(--muted); font-size: 13px; margin-top: 10px; }
+    .note b { color: var(--text); }
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 10px 16px;
+      margin-top: 12px; align-items: center;
+      color: var(--muted); font-size: 13px;
+    }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls select { accent-color: #4aa3ff; }
+    .stats {
+      margin-top: 10px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px 16px; font-size: 12.5px; color: var(--muted);
+    }
+    .stats b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .stats .hl { color: var(--gold); }
+    .hint {
+      margin: 10px 0 0; padding: 10px 12px; border-radius: 6px;
+      background: #1a2230; border: 1px solid #2c3b52; color: var(--text);
+      font-size: 13px; min-height: 3.4em;
+    }
+    .hint.bad { background: #2a1212; border-color: #5a2424; color: #ffb4b4; }
+    .hint.ok { background: #102018; border-color: #2a4a38; color: var(--ok); }
+    #err {
+      display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212;
+      border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>索引、绕序与背面剔除：同一份网格，顶点数差近 6 倍</h1>
+    <p>
+      <code>drawArrays</code> 是每个三角形各写 3 个顶点，<b>drawElements</b> 是顶点只存一份、用索引拼三角形。
+      顺便把 <b>绕序</b> 和 <b>背面剔除</b> 一起讲完 —— 它们和索引是同一件事的两面：都在问「这个顶点/这个面，究竟是谁」。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <section class="stage">
+        <h2>1. 索引缓冲省的是什么</h2>
+        <div class="pipe">
+          <span>顶点表（唯一）</span>
+          <span class="i">索引表</span>
+          <span>→ 图元组装</span>
+          <span>→ 三角形</span>
+        </div>
+        <ol class="steps">
+          <li>一个开口圆筒：<b>48 × 24 个格子、圆周 48 段、高度 25 圈顶点</b>。</li>
+          <li>不共享顶点：2304 个三角形 × 3 = <b>6912 个顶点</b>，位置和法线要重复写近 6 遍。</li>
+          <li>共享顶点：每格只需要一份属性，<b>1200 个顶点 + 6912 个索引</b>。</li>
+          <li>索引是 2 字节整数，比一整套 <code>vec3 pos + vec3 normal</code>（24 字节）便宜得多。</li>
+        </ol>
+        <p class="note">
+          这里选开口圆筒（<b>没有顶盖和底盖</b>）不是偷懒：从斜上方看进去，
+          内壁那一整面在几何上就是<b>背面</b>，正好用来演示剔除和绕序。</p>
+        <p class="note">
+          <b>但不是所有顶点都能共享。</b> 立方体只有 8 个角，却不能只用 8 个顶点 ——
+          三个面共用同一个角，但每个面的法线不同。要共享就得给角点三种法线，
+          所以立方体实际是 <b>24 个顶点</b>（每面 4 个）。索引只在<b>顶点属性完全一致</b>时才省得下来。
+        </p>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>2. 绕序决定谁是正面</h2>
+        <ol class="steps">
+          <li>光栅化之后，GPU 按屏幕坐标算三角形的<b>有向面积</b>（或等价地看叉积符号）。</li>
+          <li>正负号来自顶点顺序：顺时针 / 逆时针。默认 <code>frontFace(CCW)</code>，逆时针算正面。</li>
+          <li><code>enable(CULL_FACE)</code> + <code>cullFace(BACK)</code> 就是把背面的三角形整个跳过。</li>
+          <li>片元着色器里可以用 <code>gl_FrontFacing</code> 知道当前片元属于哪一面。</li>
+        </ol>
+        <p class="note">
+          绕序错了不会报错，只会<b>剔掉该留的、留下该剔的</b>，看起来像「模型里外翻过来了」。
+          这是最常见的自建网格 bug。
+        </p>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>3. 什么时候不能剔除</h2>
+        <ol class="steps">
+          <li><b>单面几何</b>：树叶、旗帜、布片只有一个面，剔了就从背面消失。</li>
+          <li><b>开放几何</b>：没有封口的圆筒、盒子，需要看见内壁（这一页的圆筒就是）。</li>
+          <li><b>透明或不封闭</b>：玻璃面板两面都要画。</li>
+        </ol>
+        <p class="note">
+          标准做法是<b>双面材质</b>：在片元里对背面把法线取反（<code>N = gl_FrontFacing ? N : -N</code>），
+          光照才对，而不是简单地把剔除关掉了事。
+        </p>
+      </section>
+    </div>
+
+    <div>
+      <canvas id="c" width="720" height="520"></canvas>
+      <div id="err"></div>
+      <div class="controls">
+        <label>
+          绘制方式
+          <select id="mode">
+            <option value="indexed">drawElements（索引）</option>
+            <option value="expanded">drawArrays（展开）</option>
+          </select>
+        </label>
+        <label><input id="cull" type="checkbox" checked /> 背面剔除</label>
+        <label>
+          绕序
+          <select id="winding">
+            <option value="ccw">CCW（正面）</option>
+            <option value="cw">CW（翻转）</option>
+          </select>
+        </label>
+        <label><input id="twoSided" type="checkbox" checked /> 背面染洋红</label>
+        <label><input id="normals" type="checkbox" /> 显示法线</label>
+        <label><input id="spin" type="checkbox" checked /> 自动旋转</label>
+      </div>
+      <div class="stats" id="stats"></div>
+      <p class="hint ok" id="hint"></p>
+    </div>
+  </div>
+
+  <div class="layout" style="padding-top:0">
+    <section class="stage">
+      <h2>4. 本页真正在跑的核心</h2>
+<pre><code>// ① 顶点表 + 索引表（开口圆筒，法线是径向解析式，所以接缝处能共用顶点）
+const vertexCount = N * (M + 1);        // 48 × 25 = 1200
+const indexCount  = N * M * 6;          // 每格 2 个三角形
+
+const a = i * V + j,                    b = ((i+1) % N) * V + j;
+const c = ((i+1) % N) * V + (j+1),      d = i * V + (j+1);
+indices.push(a, d, c,  a, c, b);   // 这个顺序的叉积朝外 → 逆时针 → 正面
+
+// ② 两个 VAO：一个走索引，一个把索引在 CPU 上展开
+gl.bindVertexArray(indexedVao);
+gl.drawElements(gl.TRIANGLES, indexCount, gl.UNSIGNED_SHORT, 0);  // 提交 1200 个顶点
+
+gl.bindVertexArray(expandedVao);
+gl.drawArrays(gl.TRIANGLES, 0, indexCount);                       // 提交 6912 个顶点
+
+// ③ 绕序和剔除
+gl.frontFace(ccw ? gl.CCW : gl.CW);
+if (culling) { gl.enable(gl.CULL_FACE); gl.cullFace(gl.BACK); }
+else gl.disable(gl.CULL_FACE);
+
+// ④ 双面材质靠 gl_FrontFacing
+vec3 N = normalize(v_normal);
+if (!gl_FrontFacing) N = -N;    // 背面把法线翻过来，光照才对</code></pre>
+      <p class="note">
+        两种绘制方式画面<b>完全一样</b>，差别只在 GPU 要多读几遍顶点。
+        顶点着色器是每顶点跑一次的，所以省顶点就是省顶点着色器的调用次数。
+      </p>
+    </section>
+
+    <section class="stage">
+      <h2>5. 对照着拧开关看</h2>
+      <ol class="steps">
+        <li>切换「绘制方式」：画面不变，看 <b>提交顶点数</b> 从 1200 跳到 6912。</li>
+        <li>关掉「背面剔除」：从上面看进筒里，内壁露出来，被染成洋红。</li>
+        <li>开着剔除，把「绕序」切成 CW：<b>里面和外面整个对调</b> —— 现在留下的是内壁。这就是绕序写反的后果。</li>
+        <li>关掉「背面染洋红」再翻转绕序：表面变成纯色但光照不对，这正是「绕序错了但不报错」的隐蔽之处。</li>
+        <li>勾上「显示法线」：确认法线全都朝外。如果法线朝里，说明顶点表本身算错了。</li>
+      </ol>
+    </section>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+const hintEl = document.getElementById("hint");
+const statsEl = document.getElementById("stats");
+const modeEl = document.getElementById("mode");
+const cullEl = document.getElementById("cull");
+const windingEl = document.getElementById("winding");
+const twoSidedEl = document.getElementById("twoSided");
+const normalsEl = document.getElementById("normals");
+const spinEl = document.getElementById("spin");
+
+function fail(msg) {
+  errBox.style.display = "block";
+  errBox.textContent = msg;
+  throw new Error(msg);
+}
+
+const gl = canvas.getContext("webgl2", { antialias: true });
+if (!gl) fail("需要 WebGL2。请用较新的 Chrome / Edge / Firefox。");
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    fail(gl.getShaderInfoLog(s) || "shader compile failed");
+  }
+  return s;
+}
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    fail(gl.getProgramInfoLog(p) || "program link failed");
+  }
+  return p;
+}
+
+// ---------- math ----------
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      o[c * 4 + r] =
+        a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+        a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    }
+  }
+  return o;
+}
+function identity() {
+  return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2);
+  const nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let len = Math.hypot(zx, zy, zz); zx /= len; zy /= len; zz /= len;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  len = Math.hypot(xx, xy, xz); xx /= len; xy /= len; xz /= len;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+    1,
+  ]);
+}
+
+// ---------- shaders ----------
+const VS = `#version 300 es
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec3 a_normal;
+uniform mat4 u_mvp;
+uniform mat4 u_model;
+out vec3 v_normal;
+out vec3 v_world;
+void main() {
+  vec4 w = u_model * vec4(a_pos, 1.0);
+  v_world = w.xyz;
+  v_normal = mat3(u_model) * a_normal;
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision mediump float;
+in vec3 v_normal;
+in vec3 v_world;
+uniform vec3 u_cameraPos;
+uniform vec3 u_lightDir;
+uniform float u_twoSided;
+out vec4 outColor;
+void main() {
+  vec3 N = normalize(v_normal);
+  vec3 L = normalize(u_lightDir);
+  vec3 V = normalize(u_cameraPos - v_world);
+
+  // 双面材质：背面把法线翻过来，光照才对
+  if (!gl_FrontFacing) N = -N;
+
+  float ndl = max(dot(N, L), 0.0);
+  vec3 H = normalize(L + V);
+  float spec = pow(max(dot(N, H), 0.0), 56.0);
+
+  vec3 base = gl_FrontFacing ? vec3(0.28, 0.60, 0.90) : vec3(0.88, 0.32, 0.68);
+  if (u_twoSided < 0.5 && !gl_FrontFacing) base = vec3(0.28, 0.60, 0.90);
+
+  vec3 col = base * (0.22 + 0.78 * ndl) + vec3(spec) * 0.4;
+  outColor = vec4(col, 1.0);
+}`;
+
+const LINE_VS = `#version 300 es
+layout(location = 0) in vec3 a_pos;
+uniform mat4 u_mvp;
+void main() { gl_Position = u_mvp * vec4(a_pos, 1.0); }`;
+const LINE_FS = `#version 300 es
+precision mediump float;
+uniform vec3 u_color;
+out vec4 outColor;
+void main() { outColor = vec4(u_color, 1.0); }`;
+
+const prog = link(VS, FS);
+const uMvp = gl.getUniformLocation(prog, "u_mvp");
+const uModel = gl.getUniformLocation(prog, "u_model");
+const uCameraPos = gl.getUniformLocation(prog, "u_cameraPos");
+const uLightDir = gl.getUniformLocation(prog, "u_lightDir");
+const uTwoSided = gl.getUniformLocation(prog, "u_twoSided");
+
+const lineProg = link(LINE_VS, LINE_FS);
+const luMvp = gl.getUniformLocation(lineProg, "u_mvp");
+const luColor = gl.getUniformLocation(lineProg, "u_color");
+
+// ---------- 开口圆筒（没有顶盖、没有底盖）----------
+const N = 48;      // 圆周分段
+const M = 24;      // 高度分段
+const RAD = 0.85;  // 半径
+const HEIGHT = 1.15;
+
+function buildTube() {
+  const V = M + 1;   // 高度方向 M 段 → M+1 圈顶点
+  const positions = new Float32Array(N * V * 3);
+  const normals = new Float32Array(N * V * 3);
+  for (let i = 0; i < N; i++) {
+    const th = (i / N) * Math.PI * 2;
+    const ct = Math.cos(th), st = Math.sin(th);
+    for (let j = 0; j < V; j++) {
+      const k = (i * V + j) * 3;
+      positions[k]     = RAD * ct;
+      positions[k + 1] = -HEIGHT / 2 + (j / M) * HEIGHT;
+      positions[k + 2] = RAD * st;
+      // 圆筒的法线就是径向，和高度无关 → 接缝处可以共用顶点
+      normals[k]     = ct;
+      normals[k + 1] = 0;
+      normals[k + 2] = st;
+    }
+  }
+
+  const idx = [];
+  const at = (i, j) => (i % N) * V + j;
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j < M; j++) {
+      const a = at(i, j), b = at(i + 1, j), c = at(i + 1, j + 1), d = at(i, j + 1);
+      // 这个顺序的叉积朝外 → 屏幕上逆时针 → 正面
+      idx.push(a, d, c, a, c, b);
+    }
+  }
+  return { positions, normals, indices: new Uint16Array(idx) };
+}
+
+function expand(geom) {
+  const n = geom.indices.length;
+  const positions = new Float32Array(n * 3);
+  const normals = new Float32Array(n * 3);
+  for (let t = 0; t < n; t++) {
+    const v = geom.indices[t];
+    positions[t * 3]     = geom.positions[v * 3];
+    positions[t * 3 + 1] = geom.positions[v * 3 + 1];
+    positions[t * 3 + 2] = geom.positions[v * 3 + 2];
+    normals[t * 3]       = geom.normals[v * 3];
+    normals[t * 3 + 1]   = geom.normals[v * 3 + 1];
+    normals[t * 3 + 2]   = geom.normals[v * 3 + 2];
+  }
+  return { positions, normals };
+}
+
+function makeMesh(positions, normals, indices) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const pb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, pb);
+  gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  const nb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, nb);
+  gl.bufferData(gl.ARRAY_BUFFER, normals, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+  const ib = indices ? gl.createBuffer() : null;
+  if (ib) {
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+  }
+  gl.bindVertexArray(null);
+  return { vao, indexCount: indices ? indices.length : 0 };
+}
+
+const tube = buildTube();
+const flat = expand(tube);
+const indexedMesh = makeMesh(tube.positions, tube.normals, tube.indices);
+const expandedMesh = makeMesh(flat.positions, flat.normals, null);
+
+// 法线可视化：抽稀，每 3 个 i、每 4 个 j 取一个
+const normalLines = (() => {
+  const seg = [];
+  const V = M + 1;
+  const stepI = 3, stepJ = 4;
+  for (let i = 0; i < N; i += stepI) {
+    for (let j = 0; j < V; j += stepJ) {
+      const k = (i * V + j) * 3;
+      const p = [tube.positions[k], tube.positions[k + 1], tube.positions[k + 2]];
+      const n = [tube.normals[k], tube.normals[k + 1], tube.normals[k + 2]];
+      seg.push(p[0], p[1], p[2]);
+      seg.push(p[0] + n[0] * 0.2, p[1] + n[1] * 0.2, p[2] + n[2] * 0.2);
+    }
+  }
+  const data = new Float32Array(seg);
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const b = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return { vao, verts: data.length / 3 };
+})();
+
+const VERT_COUNT = N * (M + 1);
+const TRI_COUNT = N * M * 2;
+const INDEX_COUNT = N * M * 6;
+const SAVED = 1 - VERT_COUNT / INDEX_COUNT;
+
+// ---------- camera ----------
+let yaw = 0.5;
+let pitch = 0.62;
+let dragging = false;
+let lastX = 0, lastY = 0;
+let spin = 0;
+
+canvas.addEventListener("pointerdown", (e) => {
+  dragging = true; lastX = e.clientX; lastY = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  yaw -= (e.clientX - lastX) * 0.005;
+  pitch = Math.max(-1.45, Math.min(1.45, pitch + (e.clientY - lastY) * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+function updateReadout(usingIndex) {
+  const submitted = usingIndex ? VERT_COUNT : INDEX_COUNT;
+  statsEl.innerHTML =
+    `<div>三角形 <b>${TRI_COUNT}</b></div>` +
+    `<div>唯一顶点 <b>${VERT_COUNT}</b></div>` +
+    `<div>索引条数 <b>${INDEX_COUNT}</b></div>` +
+    `<div>展开后顶点 <b>${INDEX_COUNT}</b></div>` +
+    `<div>本帧提交顶点 <b class="hl">${submitted}</b></div>` +
+    `<div>每个顶点被复用 <b>${(INDEX_COUNT / VERT_COUNT).toFixed(0)}</b> 次</div>`;
+
+  const culling = cullEl.checked;
+  const ccw = windingEl.value === "ccw";
+  hintEl.className = "hint";
+
+  if (usingIndex) {
+    hintEl.textContent =
+      `drawElements：只提交 ${VERT_COUNT} 个顶点，GPU 再按索引拼出 ${TRI_COUNT} 个三角形。` +
+      `省下 ${(SAVED * 100).toFixed(0)}% 的顶点着色器调用。`;
+  } else {
+    hintEl.textContent =
+      `drawArrays：索引已在 CPU 上展开，提交 ${INDEX_COUNT} 个顶点 —— 是索引方式的 ${(INDEX_COUNT / VERT_COUNT).toFixed(0)} 倍，` +
+      `但画面完全一样。`;
+  }
+
+  if (!culling) {
+    hintEl.className = "hint";
+    hintEl.textContent += " 剔除关着：背面也画了，从上面看进筒里就能看见内壁（洋红）。";
+  } else if (!ccw) {
+    hintEl.className = "hint bad";
+    hintEl.textContent +=
+      " 绕序 = CW + 剔除开着：留下来的全是内壁，外面被剔掉了 —— 这就是绕序写反的样子，不报错，只是里外翻了。";
+  } else {
+    hintEl.className = "hint ok";
+    hintEl.textContent += " 剔除开着、绕序 CCW：只剩朝外的正面。";
+  }
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+
+  if (spinEl.checked && !dragging) {
+    spin += 0.0035;
+  }
+  const ang = spin;
+
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+
+  const dist = 3.3;
+  const eye = [
+    Math.sin(yaw + ang) * Math.cos(pitch) * dist,
+    Math.sin(pitch) * dist,
+    Math.cos(yaw + ang) * Math.cos(pitch) * dist,
+  ];
+  const proj = perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 60);
+  const view = lookAt(eye, [0, 0, 0], [0, 1, 0]);
+  const viewProj = mul(proj, view);
+  const model = identity();   // 圆筒立着，相机从斜上方看进筒里
+  const mvp = mul(viewProj, model);
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.035, 0.04, 0.06, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+
+  // 绕序与剔除
+  const ccw = windingEl.value === "ccw";
+  gl.frontFace(ccw ? gl.CCW : gl.CW);
+  if (cullEl.checked) {
+    gl.enable(gl.CULL_FACE);
+    gl.cullFace(gl.BACK);
+  } else {
+    gl.disable(gl.CULL_FACE);
+  }
+
+  const usingIndex = modeEl.value === "indexed";
+
+  gl.useProgram(prog);
+  gl.uniformMatrix4fv(uMvp, false, mvp);
+  gl.uniformMatrix4fv(uModel, false, model);
+  gl.uniform3fv(uCameraPos, eye);
+  gl.uniform3f(uLightDir, 0.45, 0.72, 0.52);
+  gl.uniform1f(uTwoSided, twoSidedEl.checked ? 1 : 0);
+
+  if (usingIndex) {
+    gl.bindVertexArray(indexedMesh.vao);
+    gl.drawElements(gl.TRIANGLES, indexedMesh.indexCount, gl.UNSIGNED_SHORT, 0);
+  } else {
+    gl.bindVertexArray(expandedMesh.vao);
+    gl.drawArrays(gl.TRIANGLES, 0, INDEX_COUNT);
+  }
+
+  if (normalsEl.checked) {
+    gl.useProgram(lineProg);
+    gl.uniformMatrix4fv(luMvp, false, mvp);
+    gl.uniform3f(luColor, 0.95, 0.82, 0.35);
+    gl.bindVertexArray(normalLines.vao);
+    gl.drawArrays(gl.LINES, 0, normalLines.verts);
+  }
+
+  updateReadout(usingIndex);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

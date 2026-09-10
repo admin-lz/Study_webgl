@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GPU 粒子：无状态粒子、软粒子、排序与 overdraw</title>
+  <style>
+    :root {
+      --bg: #0b0d14; --panel: #12151f; --line: #243044;
+      --text: #e8eef8; --muted: #8b97a8; --accent: #9fd4ff; --gold: #f3d27a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 980px; }
+    header b { color: var(--accent); }
+    .layout { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 20px; padding: 20px 24px 40px; align-items: start; }
+    @media (max-width: 1020px) { .layout { grid-template-columns: 1fr; } }
+    canvas#c { width: 100%; height: auto; display: block; background: #05060a; border: 1px solid var(--line); border-radius: 8px; cursor: grab; }
+    canvas#c:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+    .stage + .stage { margin-top: 16px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre { margin: 8px 0 0; background: #0a0c12; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #d5deea; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; align-items: center; color: var(--muted); font-size: 13px; }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls b { color: var(--text); font-variant-numeric: tabular-nums; min-width: 3.2em; display: inline-block; }
+    table.stats { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 10px; }
+    table.stats td { padding: 4px 6px; border-bottom: 1px solid #1b2434; }
+    table.stats td:first-child { color: var(--muted); }
+    table.stats td:last-child { text-align: right; font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .note b { color: var(--text); }
+    .warn { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: #1a2230; border: 1px solid #2c3b52; font-size: 13px; }
+    #err { display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212; border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>GPU 粒子：一次 draw 画两万个光点，顺便解决"软"和"乱序"</h1>
+    <p>
+      粒子看着像"模拟"，其实大半是<b>渲染问题</b>：怎么把一个小四边形永远朝向相机、怎么和场景正确遮挡、
+      怎么在几十倍 overdraw 下还不爆掉、透明要不要排序。本页的每个粒子都<b>没有状态</b> ——
+      位置是 <code>seed</code> 和时间的<b>闭式函数</b>，顶点着色器现场算出来，一个字节都不用回传。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <canvas id="c" width="720" height="400"></canvas>
+      <section class="stage" style="margin-top:16px">
+        <div class="controls">
+          <label>外观
+            <select id="look">
+              <option value="0" selected>软发光（加色，不需排序）</option>
+              <option value="1">透明软粒子</option>
+              <option value="2">透明硬粒子（不透明碎片）</option>
+            </select>
+          </label>
+          <label>顺序
+            <select id="sort">
+              <option value="0" selected>按 id 顺序</option>
+              <option value="1">每帧按深度排序</option>
+            </select>
+          </label>
+          <label>显示
+            <select id="view">
+              <option value="0" selected>合成结果</option>
+              <option value="1">场景深度</option>
+              <option value="2">粒子覆盖（alpha）</option>
+              <option value="3">overdraw 热力图</option>
+            </select>
+          </label>
+          <label>粒子数 <input type="range" id="count" min="500" max="20000" step="500" value="8000" style="width:130px" /> <b id="countVal">8000</b></label>
+          <label>大小 <input type="range" id="size" min="6" max="60" step="1" value="22" style="width:110px" /> <b id="sizeVal">22</b></label>
+          <label>软边 <input type="range" id="soft" min="0.05" max="3" step="0.05" value="0.7" style="width:110px" /> <b id="softVal">0.70</b></label>
+          <label>亮度 <input type="range" id="inten" min="0.02" max="0.6" step="0.01" value="0.12" style="width:110px" /> <b id="intenVal">0.12</b></label>
+        </div>
+        <table class="stats">
+          <tr><td>粒子数 / draw call</td><td id="sCount">-</td></tr>
+          <tr><td>片段总量（近似）</td><td id="sFrag">-</td></tr>
+          <tr><td>平均 overdraw</td><td id="sOd">-</td></tr>
+          <tr><td>每帧 CPU 排序 + 重传</td><td id="sCpu">-</td></tr>
+          <tr><td>实例缓冲 / 重传带宽</td><td id="sMem">-</td></tr>
+          <tr><td>离屏附件</td><td id="sRt">-</td></tr>
+        </table>
+        <div class="warn" id="warn">-</div>
+        <div id="err"></div>
+      </section>
+    </div>
+
+    <div>
+      <section class="stage">
+        <h2>1. 无状态粒子：位置不存，是"算"出来的</h2>
+        <pre>// seed 是每个粒子唯一的常数；life 是自己循环的寿命
+float life = fract(u_time * 0.22 * (0.6 + 0.9 * s.x) + s.y);
+vec3  c    = 起点 + 上升(life) + 螺旋(life) + 抖动;
+
+// 顶点着色器里把四边形展开成永远朝向相机的 billboard：
+// 在裁剪空间偏移，乘 clip.w 之后屏幕尺寸就与距离无关
+vec4 clip = u_vp * vec4(c, 1.0);
+gl_Position = vec4(clip.xy + a_corner * u_size / u_res * clip.w, clip.z, clip.w);</pre>
+        <ol class="steps">
+          <li><b>没有 ping-pong、没有 transform feedback。</b> 只要轨迹能写成时间的函数（火焰、尘埃、魔法、雨雪），
+            就不需要保存上一帧的状态，GPU 侧零显存、零同步，改一下 <code>u_time</code> 就是另一帧。</li>
+          <li><b>代价是"不能相互作用"。</b> 粒子之间要碰撞、要被上一帧的力场推动，就必须有状态 —— 那才是
+            <a href="transform-feedback.html">transform-feedback.html</a> 那条路。</li>
+          <li><b>billboard 为什么在裁剪空间挤？</b> 因为裁剪空间的 x/y 就是屏幕方向。乘 <code>clip.w</code> 抵消透视除法，
+            得到"屏幕像素尺寸恒定"；不乘就是"世界尺寸恒定"，远处会变小。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>2. 软粒子：拿场景深度当剪刀</h2>
+        <pre>float sceneZ = linearDepth(texture(u_depth, gl_FragCoord.xy / u_res).r);
+float partZ  = linearDepth(gl_FragCoord.z);
+if (partZ &gt; sceneZ + 0.05) discard;                       // 被挡住 → 手动深度测试
+float soft = clamp((sceneZ - partZ) / u_soft, 0.0, 1.0);   // 撞到表面 → 淡出，不再"切一刀"</pre>
+        <p class="note">
+          粒子这一趟<b>故意不挂深度附件</b>，因为要一边深度测试一边采样同一张深度图就构成 feedback loop（未定义行为）。
+          改成在 FS 里手动比较深度：代价是<b>被挡住的粒子也照跑片段着色器</b>（丢了 early-Z），
+          好处是可以顺手做软边，而且和绘制顺序无关。想省回来就得自己分块剔除，或者把深度拷一份用。
+        </p>
+      </section>
+
+      <section class="stage">
+        <h2>3. 加色 vs 透明：排序到底要花多少</h2>
+        <ol class="steps">
+          <li><b>加色混合可交换</b>（<code>a+b = b+a</code>），所以不用排序、不用回读，随便画。
+            火焰、光晕、能量全都用它，这不是"省事"，是数学上就不需要。</li>
+          <li><b>alpha 混合不可交换</b>，理论上必须从远到近。而本页粒子没有位置缓冲 ——
+            排序意味着<b>CPU 把两万个粒子的轨迹再算一遍</b>、排序、然后<b>每帧重传实例缓冲</b>。
+            把「顺序」切到排序，看右下角 CPU 时间和带宽怎么跳。</li>
+          <li><b>但要先问"错多少"。</b> 顺序带来的误差是 <code>a₁·a₂·Δ颜色</code> —— 两个都接近透明的软粒子叠在一起时，
+            它只是二阶小量，所以市面上的烟雾/尘埃经常干脆不排序。一旦粒子接近不透明（勾「硬粒子」），
+            顺序立刻变成硬遮挡，这时候<b>不排序就是穿帮</b>。先算误差，再决定要不要为排序付那份 CPU。</li>
+          <li><b>overdraw 才是粒子的性能大头。</b> 切到热力图：一个像素被几十个粒子盖住，
+            每个都要跑完整的 FS（采样深度、算软边）。所以粒子渲染的优化永远是"少算几个像素"：
+            缩小屏幕占比、近处淡出、用低分辨率层、把粒子画在降采样的缓冲上。</li>
+        </ol>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => { errBox.style.display = "block"; errBox.textContent += (e.message || e.error) + "\n"; });
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let l = Math.hypot(zx, zy, zz); zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  l = Math.hypot(xx, xy, xz); xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]), 1,
+  ]);
+}
+
+const W = canvas.width, H = canvas.height;
+const NEAR = 0.1, FAR = 80;
+
+// ---------------------------------------------------------------- 离屏附件
+function makeColorTex() {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function makeFbo(tex, depthTex) {
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  if (depthTex) gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depthTex, 0);
+  const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (st !== gl.FRAMEBUFFER_COMPLETE) throw new Error("FBO incomplete: 0x" + st.toString(16));
+  return f;
+}
+const sceneTex = makeColorTex();
+const depthTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, depthTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, W, H, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+const partTex = makeColorTex();
+const sceneFbo = makeFbo(sceneTex, depthTex);
+const partFbo = makeFbo(partTex, null);          // 粒子这一趟故意不挂深度
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+// ---------------------------------------------------------------- 场景几何
+function boxVerts(out, cx, cy, cz, sx, sy, sz, col) {
+  const F = [
+    [[1, 0, 0], [[1, -1, 1], [1, -1, -1], [1, 1, -1], [1, 1, 1]]],
+    [[-1, 0, 0], [[-1, -1, -1], [-1, -1, 1], [-1, 1, 1], [-1, 1, -1]]],
+    [[0, 1, 0], [[-1, 1, 1], [1, 1, 1], [1, 1, -1], [-1, 1, -1]]],
+    [[0, -1, 0], [[-1, -1, -1], [1, -1, -1], [1, -1, 1], [-1, -1, 1]]],
+    [[0, 0, 1], [[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]]],
+    [[0, 0, -1], [[1, -1, -1], [-1, -1, -1], [-1, 1, -1], [1, 1, -1]]],
+  ];
+  const tri = (n, a, b, c) => {
+    for (const v of [a, b, c]) out.push(cx + v[0] * sx, cy + v[1] * sy, cz + v[2] * sz, n[0], n[1], n[2], col[0], col[1], col[2]);
+  };
+  for (let f = 0; f < 6; f++) {
+    const q = F[f][1];
+    tri(F[f][0], q[0], q[1], q[2]); tri(F[f][0], q[0], q[2], q[3]);
+  }
+}
+const sceneData = [];
+boxVerts(sceneData, 0, -0.5, 0, 14, 0.5, 14, [0.13, 0.145, 0.17]);      // 地面
+const pillarCol = [0.26, 0.29, 0.36];
+const PILLARS = [[-2.6, 0, -1.4, 0.7], [2.5, 0, -1.1, 0.9], [1.2, 0, 2.4, 0.6], [-1.8, 0, 2.2, 0.75], [3.6, 0, 2.0, 0.5]];
+for (const [x, , z, s] of PILLARS) boxVerts(sceneData, x, s * 0.5, z, s * 0.45, s, s * 0.45, pillarCol);
+
+const sceneVao = gl.createVertexArray();
+const sceneBuf = gl.createBuffer();
+gl.bindVertexArray(sceneVao);
+gl.bindBuffer(gl.ARRAY_BUFFER, sceneBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(sceneData), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 36, 0);
+gl.enableVertexAttribArray(1);
+gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 36, 12);
+gl.enableVertexAttribArray(2);
+gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 36, 24);
+const SCENE_VERTS = sceneData.length / 9;
+
+// ---------------------------------------------------------------- 粒子的四边形 + seed
+const partVao = gl.createVertexArray();
+const quadBuf = gl.createBuffer();
+const seedBuf = gl.createBuffer();
+gl.bindVertexArray(partVao);
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.bindBuffer(gl.ARRAY_BUFFER, seedBuf);
+gl.enableVertexAttribArray(1);
+gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 16, 0);
+gl.vertexAttribDivisor(1, 1);
+gl.bindVertexArray(null);
+
+const fullVao = gl.createVertexArray();   // 全屏三角形用 gl_VertexID，不需要缓冲
+
+// ---------------------------------------------------------------- 着色器
+const SCENE_VS = `#version 300 es
+precision highp float;
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec3 a_nrm;
+layout(location = 2) in vec3 a_col;
+uniform mat4 u_vp;
+out vec3 v_nrm; out vec3 v_col; out vec3 v_world;
+void main() {
+  v_nrm = a_nrm; v_col = a_col; v_world = a_pos;
+  gl_Position = u_vp * vec4(a_pos, 1.0);
+}`;
+
+const SCENE_FS = `#version 300 es
+precision highp float;
+in vec3 v_nrm; in vec3 v_col; in vec3 v_world;
+uniform vec3 u_eye;
+out vec4 outColor;
+void main() {
+  vec3 n = normalize(v_nrm);
+  vec3 L = normalize(vec3(0.45, 0.85, 0.30));
+  float dif = max(dot(n, L), 0.0);
+  float rim = pow(1.0 - max(dot(n, normalize(u_eye - v_world)), 0.0), 3.0);
+  vec3 col = v_col * (0.16 + 0.85 * dif) + v_col * rim * 0.8;
+  // 雾：远处压暗，粒子才跳得出来
+  float d = length(v_world - u_eye);
+  col = mix(col, vec3(0.02, 0.025, 0.04), clamp(1.0 - exp(-d * 0.045), 0.0, 1.0));
+  outColor = vec4(col, 1.0);
+}`;
+
+const PART_VS = `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 a_corner;
+layout(location = 1) in vec4 i_seed;
+uniform mat4 u_vp;
+uniform vec2 u_res;
+uniform float u_time;
+uniform float u_size;
+out vec2 v_local;
+out float v_alpha;
+
+// ↓↓↓ 这段必须和 JS 里的 particlePos() 一字不差：CPU 排序要用同一套位置
+float lifeOf(vec4 s) { return fract(u_time * 0.22 * (0.6 + 0.9 * s.x) + s.y); }
+vec3 posOf(vec4 s, float life) {
+  float rise = life * (1.55 + 1.45 * s.x);
+  float ang  = s.z * 6.2831853 + u_time * 0.45 + life * 1.6;
+  float rad  = 0.15 + 2.60 * s.w * (0.18 + 1.05 * life);
+  float wob  = 0.18 * sin(u_time * 1.7 + s.z * 9.0);
+  return vec3(cos(ang) * rad + wob,
+              0.06 + rise + 0.25 * sin(u_time * 1.1 + s.x * 7.0),
+              sin(ang) * rad + wob * 0.7);
+}
+void main() {
+  float life = lifeOf(i_seed);
+  vec3 c = posOf(i_seed, life);
+  v_alpha = smoothstep(0.0, 0.09, life) * (1.0 - smoothstep(0.45, 1.0, life));
+  v_local = a_corner;
+  vec4 clip = u_vp * vec4(c, 1.0);
+  // 裁剪空间偏移 × clip.w → 屏幕尺寸恒定，永远正对相机
+  gl_Position = vec4(clip.xy + a_corner * u_size / u_res * clip.w, clip.z, clip.w);
+}`;
+
+const PART_FS = `#version 300 es
+precision highp float;
+in vec2 v_local;
+in float v_alpha;
+uniform sampler2D u_depth;
+uniform vec2 u_res;
+uniform float u_near, u_far, u_soft, u_inten;
+uniform int u_alphaBlend;     // 0 = 加色, 1 = 透明
+uniform int u_hard;           // 1 = 不透明硬粒子（顺序 = 硬遮挡）
+uniform int u_countMode;      // 1 = 只数 overdraw，不上色
+out vec4 outColor;
+
+float linearDepth(float zw) {
+  float ndc = zw * 2.0 - 1.0;
+  return (2.0 * u_near * u_far) / (u_far + u_near - ndc * (u_far - u_near));
+}
+void main() {
+  float d = length(v_local);
+  float mask = 1.0 - smoothstep(0.12, 0.5, d);
+  if (mask <= 0.002) discard;
+  float disc = 1.0 - smoothstep(0.30, 0.345, d);
+  if (u_hard == 1 && disc <= 0.0) discard;                   // 硬粒子：形状外直接丢
+
+  if (u_countMode == 1) { outColor = vec4(1.0 / 64.0, 0.0, 0.0, 0.0); return; }
+
+  float sceneZ = linearDepth(texture(u_depth, gl_FragCoord.xy / u_res).r);
+  float partZ  = linearDepth(gl_FragCoord.z);
+  if (partZ > sceneZ + 0.05) discard;                        // 手动深度测试
+  float soft = clamp((sceneZ - partZ) / max(u_soft, 0.001), 0.0, 1.0);
+
+  vec3 tint = vec3(0.45, 0.72, 1.0) + vec3(0.35, 0.16, 0.6) * (1.0 - v_alpha) * 2.0;
+  float cov = (u_hard == 1 ? disc : mask) * v_alpha * soft;
+  float a;
+  vec3 rgb;
+  if (u_hard == 1) {
+    // 硬粒子：不透明度只由形状决定，和亮度无关 → 前后顺序变成硬遮挡
+    a = cov;
+    rgb = tint * cov;
+  } else {
+    a = cov * u_inten;
+    rgb = tint * a;
+  }
+  outColor = vec4(rgb, a);     // 预乘 alpha
+}`;
+
+const COMP_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_scene, u_part, u_depth;
+uniform float u_near, u_far;
+uniform int u_view, u_alphaBlend;
+out vec4 outColor;
+
+float linearDepth(float zw) {
+  float ndc = zw * 2.0 - 1.0;
+  return (2.0 * u_near * u_far) / (u_far + u_near - ndc * (u_far - u_near));
+}
+vec3 heat(float t) {
+  t = clamp(t, 0.0, 1.0);
+  vec3 c = mix(vec3(0.04, 0.05, 0.22), vec3(0.0, 0.65, 1.0), smoothstep(0.0, 0.35, t));
+  c = mix(c, vec3(1.0, 0.95, 0.25), smoothstep(0.35, 0.72, t));
+  return mix(c, vec3(1.0, 0.18, 0.10), smoothstep(0.72, 1.0, t));
+}
+void main() {
+  vec3 s = texture(u_scene, v_uv).rgb;
+  vec4 p = texture(u_part, v_uv);
+  vec3 col;
+  if (u_view == 1) {
+    float z = linearDepth(texture(u_depth, v_uv).r);
+    col = vec3(pow(clamp(1.0 - z / 26.0, 0.0, 1.0), 0.6));
+  } else if (u_view == 2) {
+    col = vec3(p.a);
+  } else if (u_view == 3) {
+    col = heat(pow(clamp(p.r * 64.0 / 110.0, 0.0, 1.0), 0.45));
+  } else {
+    col = u_alphaBlend == 1 ? (s * (1.0 - p.a) + p.rgb) : (s + p.rgb);
+    col = 1.0 - exp(-col * 1.35);          // 软饱和，避免加色直接糊成白色
+  }
+  outColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
+}`;
+
+const FULL_VS = `#version 300 es
+precision highp float;
+out vec2 v_uv;
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  v_uv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const progScene = link(SCENE_VS, SCENE_FS);
+const progPart = link(PART_VS, PART_FS);
+const progComp = link(FULL_VS, COMP_FS);
+const uni = (p, names) => { const o = {}; for (const n of names) o[n] = gl.getUniformLocation(p, n); return o; };
+const uS = uni(progScene, ["u_vp", "u_eye"]);
+const uP = uni(progPart, ["u_vp", "u_res", "u_time", "u_size", "u_depth", "u_near", "u_far", "u_soft", "u_inten", "u_alphaBlend", "u_hard", "u_countMode"]);
+const uC = uni(progComp, ["u_scene", "u_part", "u_depth", "u_near", "u_far", "u_view", "u_alphaBlend"]);
+
+// ---------------------------------------------------------------- 粒子数据（JS 侧同一套运动）
+function hash1(n) {
+  let x = (n ^ 0x2545f491) >>> 0;
+  x = Math.imul(x ^ (x >>> 16), 0x7feb352d) >>> 0;
+  x = Math.imul(x ^ (x >>> 15), 0x846ca68b) >>> 0;
+  return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+}
+const seedsBase = new Float32Array(20000 * 4);
+for (let i = 0; i < 20000; i++) {
+  seedsBase[i * 4] = hash1(i * 7 + 1);
+  seedsBase[i * 4 + 1] = hash1(i * 7 + 3);
+  seedsBase[i * 4 + 2] = hash1(i * 7 + 5);
+  seedsBase[i * 4 + 3] = hash1(i * 7 + 7);
+}
+let seedsDraw = new Float32Array(20000 * 4);
+let depthArr = new Float32Array(20000);
+let ordArr = new Array(20000);
+let curCount = 0;
+let bufferSorted = false;
+
+function ensureParticles(n) {
+  if (n === curCount) return;
+  gl.bindBuffer(gl.ARRAY_BUFFER, seedBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, seedsBase.subarray(0, n * 4), gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  curCount = n;
+  bufferSorted = false;
+}
+// 和 PART_VS 里一字不差的同一套公式
+const posTmp = [0, 0, 0];
+function particlePos(s, off, t, out) {
+  const life = (t * 0.22 * (0.6 + 0.9 * s[off]) + s[off + 1]) % 1;
+  const L = life < 0 ? life + 1 : life;
+  const rise = L * (1.55 + 1.45 * s[off]);
+  const ang = s[off + 2] * 6.2831853 + t * 0.45 + L * 1.6;
+  const rad = 0.15 + 2.6 * s[off + 3] * (0.18 + 1.05 * L);
+  const wob = 0.18 * Math.sin(t * 1.7 + s[off + 2] * 9.0);
+  out[0] = Math.cos(ang) * rad + wob;
+  out[1] = 0.06 + rise + 0.25 * Math.sin(t * 1.1 + s[off] * 7.0);
+  out[2] = Math.sin(ang) * rad + wob * 0.7;
+  return L;
+}
+
+// ---------------------------------------------------------------- 交互
+const el = (id) => document.getElementById(id);
+const lookEl = el("look"), sortEl = el("sort"), viewEl = el("view");
+const countEl = el("count"), sizeEl = el("size"), softEl = el("soft"), intenEl = el("inten");
+const cam = { yaw: 0.8, pitch: 0.26, dist: 9.0 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.006;
+  cam.pitch = Math.max(0.03, Math.min(1.1, cam.pitch - (e.clientY - lastY) * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+});
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  cam.dist = Math.max(3, Math.min(26, cam.dist * (1 + Math.sign(e.deltaY) * 0.08)));
+}, { passive: false });
+
+let cpuEMA = 0, frames = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  frames++;
+  const t = now / 1000;
+  const look = Number(lookEl.value);
+  const blend = look === 0 ? 0 : 1;          // 只有第一种是加色
+  const hard = look === 2 ? 1 : 0;
+  const doSort = Number(sortEl.value) === 1;
+  const view = Number(viewEl.value);
+  const count = Number(countEl.value);
+  const size = Number(sizeEl.value);
+  const soft = Number(softEl.value);
+  const inten = Number(intenEl.value);
+  el("countVal").textContent = count;
+  el("sizeVal").textContent = size;
+  el("softVal").textContent = soft.toFixed(2);
+  el("intenVal").textContent = inten.toFixed(2);
+
+  ensureParticles(count);
+
+  const eye = [
+    Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    1.8 + Math.sin(cam.pitch) * cam.dist,
+    Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const vp = mul(perspective(Math.PI / 3.2, W / H, NEAR, FAR), lookAt(eye, [0, 1.1, 0], [0, 1, 0]));
+
+  // ---- ① 不透明场景 → sceneFbo（颜色 + 深度纹理）
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFbo);
+  gl.viewport(0, 0, W, H);
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthMask(true);
+  gl.disable(gl.BLEND);
+  gl.clearColor(0.02, 0.025, 0.04, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(progScene);
+  gl.uniformMatrix4fv(uS.u_vp, false, vp);
+  gl.uniform3fv(uS.u_eye, eye);
+  gl.bindVertexArray(sceneVao);
+  gl.drawArrays(gl.TRIANGLES, 0, SCENE_VERTS);
+
+  // ---- CPU 排序（透明混合才需要）：算位置 → 排序 → 重排 seed
+  const t0 = performance.now();
+  let uploaded = 0;
+  if (doSort && count > 1) {
+    const s = seedsBase;
+    const dx = eye[0], dy = eye[1], dz = eye[2];
+    for (let i = 0; i < count; i++) {
+      const L = particlePos(s, i * 4, t, posTmp);
+      const ax = posTmp[0] - dx, ay = posTmp[1] - dy, az = posTmp[2] - dz;
+      depthArr[i] = ax * ax + ay * ay + az * az;
+    }
+    for (let i = 0; i < count; i++) ordArr[i] = i;
+    ordArr.length = count;
+    ordArr.sort((a, b) => depthArr[b] - depthArr[a]);        // 远 → 近
+    for (let i = 0; i < count; i++) seedsDraw.set(s.subarray(ordArr[i] * 4, ordArr[i] * 4 + 4), i * 4);
+    gl.bindBuffer(gl.ARRAY_BUFFER, seedBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, seedsDraw, 0, count * 4);   // 顺序每帧都在变 → 每帧重传
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    uploaded = count * 16;
+    bufferSorted = true;
+  } else if (bufferSorted || count !== curCount) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, seedBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, seedsBase, 0, count * 4);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    uploaded = count * 16;
+    bufferSorted = false;
+  }
+  const cpu = performance.now() - t0;
+  cpuEMA = frames < 8 ? cpu : cpuEMA * 0.9 + cpu * 0.1;
+
+  // ---- ② 粒子 → partFbo（加色 / 透明，手动深度测试 + 软边）
+  gl.bindFramebuffer(gl.FRAMEBUFFER, partFbo);
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  if (view === 3) {
+    gl.blendFunc(gl.ONE, gl.ONE);                       // overdraw：累加计数
+  } else if (blend === 1) {
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);       // 预乘 alpha
+  } else {
+    gl.blendFunc(gl.ONE, gl.ONE);                       // 加色
+  }
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.useProgram(progPart);
+  gl.uniformMatrix4fv(uP.u_vp, false, vp);
+  gl.uniform2f(uP.u_res, W, H);
+  gl.uniform1f(uP.u_time, t);
+  gl.uniform1f(uP.u_size, size);
+  gl.uniform1f(uP.u_near, NEAR);
+  gl.uniform1f(uP.u_far, FAR);
+  gl.uniform1f(uP.u_soft, soft);
+  gl.uniform1f(uP.u_inten, inten);
+  gl.uniform1i(uP.u_alphaBlend, blend);
+  gl.uniform1i(uP.u_hard, hard);
+  gl.uniform1i(uP.u_countMode, view === 3 ? 1 : 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, depthTex);
+  gl.uniform1i(uP.u_depth, 0);
+  gl.bindVertexArray(partVao);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, count);
+
+  // ---- ③ 合成到屏幕
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, W, H);
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.BLEND);
+  gl.useProgram(progComp);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex); gl.uniform1i(uC.u_scene, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, partTex); gl.uniform1i(uC.u_part, 1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, depthTex); gl.uniform1i(uC.u_depth, 2);
+  gl.uniform1f(uC.u_near, NEAR);
+  gl.uniform1f(uC.u_far, FAR);
+  gl.uniform1i(uC.u_view, view);
+  gl.uniform1i(uC.u_alphaBlend, blend);
+  gl.bindVertexArray(fullVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.activeTexture(gl.TEXTURE0);
+
+  // ---- 读数
+  const area = Math.PI * 0.25 * size * size * 0.72;     // 圆片有效面积
+  const px = W * H;
+  el("sCount").textContent = count + " / 1";
+  el("sFrag").textContent = ((count * area) / 1e6).toFixed(1) + " M";
+  el("sOd").textContent = (count * area / px).toFixed(1) + " ×";
+  el("sCpu").textContent = cpuEMA.toFixed(2) + " ms";
+  el("sMem").textContent = (count * 16 / 1024).toFixed(0) + " KB / " + (uploaded / 1024).toFixed(0) + " KB 每帧";
+  el("sRt").textContent = "场景 RGBA8 + 深度24 / 粒子 RGBA8（共 " + ((px * 4 * 2 + px * 4) / 1048576).toFixed(1) + " MB）";
+
+  const wn = el("warn");
+  wn.textContent = view === 3
+    ? "热力图 = 每个像素被多少个粒子盖住。红 / 白区域是几十层叠加 —— 每一层都要跑一遍完整 FS（取深度、算软边）。"
+      + "粒子渲染的优化几乎都围绕这张图：缩小尺寸、近处淡出、降到半分辨率再叠加。"
+    : hard === 1
+      ? "硬粒子：不透明度只由形状决定，前后的层变成硬遮挡 —— 这时绘制顺序就是画面本身。"
+        + (doSort ? "现在是从远到近，正确。" : "现在是按 id 顺序（乱序），近处的粒子会被远处的盖住 —— 切「每帧按深度排序」看差别。")
+      : blend === 0
+        ? "加色混合：a+b=b+a，天然与顺序无关，所以不用排序、不用每帧重传。火焰 / 光晕 / 能量都该用这个。"
+        : doSort
+          ? "透明软粒子 + 每帧排序：CPU 把 " + count + " 个粒子的轨迹重算一遍、按距离排序、再重传 " + (uploaded / 1024).toFixed(0)
+            + " KB。看 CPU 时间 —— 排序贵的不是比较，是「再算一遍 + 重传」。"
+          : "透明软粒子：alpha 很小，顺序的差别是二阶小量（a₁·a₂·Δ颜色），画面几乎看不出来 —— "
+            + "这也是很多引擎敢不排序的原因。切成「硬粒子」再对比，顺序就变成硬遮挡了。";
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

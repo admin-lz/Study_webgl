@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · 四元数与插值</title>
+  <style>
+    :root {
+      --bg: #0b0d14; --panel: #12151f; --line: #243044;
+      --text: #e8eef8; --muted: #8b97a8; --accent: #9fd4ff; --gold: #f3d27a; --bad: #ff9c9c;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 980px; }
+    header b { color: var(--accent); }
+    .layout { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 20px; padding: 20px 24px 40px; align-items: start; }
+    @media (max-width: 1020px) { .layout { grid-template-columns: 1fr; } }
+    canvas { width: 100%; height: auto; display: block; background: #08090e; border: 1px solid var(--line); border-radius: 8px; cursor: grab; }
+    canvas:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+    .stage + .stage { margin-top: 16px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre { margin: 8px 0 0; background: #0a0c12; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #d5deea; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; align-items: center; color: var(--muted); font-size: 13px; }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls b { color: var(--text); font-variant-numeric: tabular-nums; min-width: 3.1em; display: inline-block; }
+    .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 12.5px; margin-top: 10px; }
+    .kv span:nth-child(odd) { color: var(--muted); }
+    .kv span:nth-child(even) { font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .warn { margin-top: 10px; padding: 8px 10px; border-radius: 6px; background: #1a2230; border: 1px solid #2c3b52; font-size: 13px; }
+    .warn.bad { background: #2a1212; border-color: #5a2424; color: #ffb4b4; }
+    .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+    .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+    .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .note b { color: var(--text); }
+    #err { display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212; border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>四元数：为什么旋转要用 4 个数存 3 个自由度</h1>
+    <p>
+      欧拉角能表示任意朝向，但它有 <b>万向节锁</b>、插值会绕远路、而且有两个值对应同一个朝向。
+      四元数用 4 个数换来了<b>统一的最短弧插值</b>和<b>没有奇点</b>。
+      左边是三种插值方式的对比，右边是万向节的实体演示。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <canvas id="c" width="980" height="520"></canvas>
+      <div class="legend">
+        <span><i style="background:#f0a35e"></i>欧拉角线性插值（角度各自 lerp）</span>
+        <span><i style="background:#6ec6ff"></i>四元数 nlerp（先 lerp 再归一化）</span>
+        <span><i style="background:#7dcea0"></i>四元数 slerp（球面最短弧）</span>
+      </div>
+      <section class="stage" style="margin-top:16px">
+        <div class="controls">
+          <label>插值方式
+            <select id="mode">
+              <option value="0" selected>欧拉角 lerp</option>
+              <option value="1">四元数 nlerp</option>
+              <option value="2">四元数 slerp</option>
+            </select>
+          </label>
+          <label>t <input type="range" id="t" min="0" max="100" step="1" value="35" style="width:180px" /> <b id="tVal">0.35</b></label>
+          <label><input type="checkbox" id="fixSign" checked /> 处理 q·q₁ &lt; 0（取反）</label>
+          <label><input type="checkbox" id="showTrail" checked /> 画轨迹</label>
+          <label><input type="checkbox" id="showAxes" checked /> 画本地坐标轴</label>
+        </div>
+        <div class="controls">
+          <label>yaw <input type="range" id="yaw" min="-180" max="180" step="1" value="35" style="width:150px" /> <b id="yawVal">35°</b></label>
+          <label>pitch <input type="range" id="pitch" min="-90" max="90" step="1" value="18" style="width:150px" /> <b id="pitchVal">18°</b></label>
+          <label>roll <input type="range" id="roll" min="-180" max="180" step="1" value="-25" style="width:150px" /> <b id="rollVal">-25°</b></label>
+        </div>
+        <p class="note">
+          左边：物体从<b>起始朝向</b>插值到<b>目标朝向</b>（yaw 150°、pitch 72°、roll −120°），
+          <code>t</code> 就是插值参数。黄色 = 起始，紫色 = 目标，中间是当前姿态。
+          右侧：三环万向节，把 pitch 拉到 ±90° 看会发生什么。
+        </p>
+      </section>
+      <div id="err"></div>
+    </div>
+
+    <div>
+      <section class="stage">
+        <h2>1. 三个数的病：万向节锁</h2>
+        <ol class="steps">
+          <li>欧拉角是<b>三次连续旋转的复合</b>（这里是 Y·X·Z）。中间的 pitch 转到 ±90° 时，
+            最外圈的轴和最内圈的轴<b>方向重合</b>，两个自由度塌缩成一个 —— 这就是万向节锁。</li>
+          <li>它不是"数值 bug"，是这种表示法本身的拓扑限制：欧拉角要覆盖 SO(3) 就得有奇点，
+            就像用经纬度表示球面必须在两极退化一样。</li>
+          <li>另一个病：<b>(yaw, pitch, roll) 和 (yaw±180°, 180°−pitch, roll±180°) 是同一个朝向</b>，
+            所以两个朝向之间"插值"时，直接 lerp 三个角度可能绕一大圈。</li>
+        </ol>
+        <div class="warn" id="lockWarn">-</div>
+      </section>
+
+      <section class="stage">
+        <h2>2. 四元数怎么来的</h2>
+        <pre>q = (axis · sin(θ/2), cos(θ/2))     // 绕 axis 转 θ
+q 旋转向量：v' = q v q⁻¹            // q⁻¹ = 共轭（单位四元数）
+两个旋转合成：q = q₂ ⊗ q₁            // 顺序不能换，和矩阵一样
+插值：slerp(q₀,q₁,t) = sin((1−t)Ω)/sinΩ · q₀ + sin(tΩ)/sinΩ · q₁
+      Ω = acos(q₀·q₁)                // 两颗四元数的"夹角"</pre>
+        <div class="kv">
+          <span>当前 q</span><span id="qNow">-</span>
+          <span>|q|</span><span id="qLen">-</span>
+          <span>旋转角 θ</span><span id="qAngle">-</span>
+          <span>q₀ · q₁</span><span id="qDot">-</span>
+          <span>是否取了反号</span><span id="qFlip">-</span>
+        </div>
+        <ol class="steps" style="margin-top:10px">
+          <li><b>为什么是 θ/2：</b>因为 q 作用一次是"转一半"，<code>q v q⁻¹</code> 左右各乘一次才凑成 θ。
+            这个半角也是"转 2π 才回到 q 的相反数、4π 才回到 q"的来源。</li>
+          <li><b>q 和 −q 表示同一个旋转。</b>所以插值前必须统一符号：<code>if (dot(q0,q1) &lt; 0) q1 = -q1;</code>
+            不做这一步，slerp 会带你走 360°−θ 的那条远路。取消勾选上面的"取反"就能看到轨迹绕一大圈。</li>
+          <li><b>nlerp 其实够用：</b>它不是匀速的，但偏差很小，实现便宜（一次 lerp + 一次 normalize），
+            而且没有 sin/acos。动画系统里常用 nlerp 做过渡。slerp 只在需要严格匀速时用。</li>
+          <li><b>别自己转成欧拉角再插值。</b>要读给 UI 看可以转欧拉角，但插值请留在四元数域里做。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>3. 面试会问到的边界</h2>
+        <ol class="steps">
+          <li>q₀·q₁ → 1（两个朝向几乎相同）时，<code>sinΩ</code> → 0，slerp 公式会除零 —— 必须退化成直接返回 q₀ 或用 nlerp。</li>
+          <li>q₀·q₁ → −1 时同理，这也是"必须处理反号"的另一个原因。</li>
+          <li>四元数<b>不能直接插值位置</b>，位置还是线性 lerp；它只负责朝向。</li>
+          <li>多个骨骼的层级旋转，写成四元数乘法比矩阵省 3 个浮点，而且归一化能消除累积误差。</li>
+        </ol>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => { errBox.style.display = "block"; errBox.textContent += (e.message || e.error) + "\n"; });
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let l = Math.hypot(zx, zy, zz); zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  l = Math.hypot(xx, xy, xz); xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]), 1,
+  ]);
+}
+const D2R = Math.PI / 180;
+
+// ---------- 四元数 ----------
+function qAxisAngle(ax, ang) {
+  const h = ang / 2, s = Math.sin(h);
+  const l = Math.hypot(ax[0], ax[1], ax[2]) || 1;
+  return [ax[0] / l * s, ax[1] / l * s, ax[2] / l * s, Math.cos(h)];
+}
+function qMul(a, b) {
+  return [
+    a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+    a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+    a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+    a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+  ];
+}
+function qNorm(q) { const l = Math.hypot(q[0], q[1], q[2], q[3]) || 1; return q.map((x) => x / l); }
+function qDot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]; }
+function qFromEulerYXZ(yaw, pitch, roll) {
+  const qy = qAxisAngle([0, 1, 0], yaw * D2R);
+  const qx = qAxisAngle([1, 0, 0], pitch * D2R);
+  const qz = qAxisAngle([0, 0, 1], roll * D2R);
+  return qNorm(qMul(qy, qMul(qx, qz)));
+}
+function qToMat4(q) {
+  const [x, y, z, w] = q;
+  const x2 = x + x, y2 = y + y, z2 = z + z;
+  const xx = x * x2, xy = x * y2, xz = x * z2;
+  const yy = y * y2, yz = y * z2, zz = z * z2;
+  const wx = w * x2, wy = w * y2, wz = w * z2;
+  return new Float32Array([
+    1 - (yy + zz), xy + wz, xz - wy, 0,
+    xy - wz, 1 - (xx + zz), yz + wx, 0,
+    xz + wy, yz - wx, 1 - (xx + yy), 0,
+    0, 0, 0, 1,
+  ]);
+}
+function eulerToMat4(yaw, pitch, roll) {
+  const q = qFromEulerYXZ(yaw, pitch, roll);
+  return qToMat4(q);
+}
+function qSlerp(a, b, t, fix) {
+  let d = qDot(a, b);
+  let bb = b.slice();
+  if (fix && d < 0) { bb = bb.map((x) => -x); d = -d; }
+  if (d > 0.9995) { return qNorm(a.map((x, i) => x + (bb[i] - x) * t)); }  // 太近，退化成 nlerp
+  const om = Math.acos(Math.max(-1, Math.min(1, d)));
+  const s = Math.sin(om);
+  const k0 = Math.sin((1 - t) * om) / s, k1 = Math.sin(t * om) / s;
+  return qNorm(a.map((x, i) => x * k0 + bb[i] * k1));
+}
+function qNlerp(a, b, t, fix) {
+  const d = qDot(a, b);
+  const bb = fix && d < 0 ? b.map((x) => -x) : b;
+  return qNorm(a.map((x, i) => x + (bb[i] - x) * t));
+}
+
+const VS = `#version 300 es
+in vec3 a_pos;
+in vec3 a_nrm;
+uniform mat4 u_mvp;
+uniform mat4 u_model;
+out vec3 v_nrm;
+void main() {
+  v_nrm = mat3(u_model) * a_nrm;
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+const FS = `#version 300 es
+precision highp float;
+in vec3 v_nrm;
+uniform vec3 u_color;
+uniform int u_unlit;
+out vec4 outColor;
+void main() {
+  if (u_unlit == 1) { outColor = vec4(u_color, 1.0); return; }
+  vec3 N = normalize(v_nrm);
+  if (!gl_FrontFacing) N = -N;
+  vec3 L1 = normalize(vec3(0.5, 0.75, 0.55));
+  vec3 L2 = normalize(vec3(-0.6, 0.2, -0.4));
+  float d = max(dot(N, L1), 0.0) * 0.85 + max(dot(N, L2), 0.0) * 0.25 + 0.22;
+  outColor = vec4(pow(u_color * d, vec3(1.0 / 2.2)), 1.0);
+}`;
+const prog = link(VS, FS);
+gl.useProgram(prog);
+const U = {};
+for (const n of ["u_mvp", "u_model", "u_color", "u_unlit"]) U[n] = gl.getUniformLocation(prog, n);
+const A = { pos: gl.getAttribLocation(prog, "a_pos"), nrm: gl.getAttribLocation(prog, "a_nrm") };
+
+const VAO_BUFS = new Map();
+function makeVao(pos, nrm, idx) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const bufs = [];
+  const put = (loc, data, size) => {
+    const b = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+    bufs.push(b);
+  };
+  put(A.pos, pos, 3);
+  put(A.nrm, nrm, 3);
+  if (idx) {
+    const ib = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  }
+  VAO_BUFS.set(vao, bufs);
+  return vao;
+}
+function updateStream(vao, attrIndex, data) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, VAO_BUFS.get(vao)[attrIndex]);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+}
+function makeBox(sx, sy, sz) {
+  const faces = [[0,0,1],[0,0,-1],[1,0,0],[-1,0,0],[0,1,0],[0,-1,0]];
+  const ext = [sx, sy, sz];
+  const p = [], n = [], idx = [];
+  faces.forEach((nn, fi) => {
+    const t = Math.abs(nn[1]) > 0.5 ? [1,0,0] : [0,1,0];
+    const u = [t[1]*nn[2]-t[2]*nn[1], t[2]*nn[0]-t[0]*nn[2], t[0]*nn[1]-t[1]*nn[0]];
+    const v = [nn[1]*u[2]-nn[2]*u[1], nn[2]*u[0]-nn[0]*u[2], nn[0]*u[1]-nn[1]*u[0]];
+    const cs = [[-1,-1],[1,-1],[1,1],[-1,1]];
+    for (const c of cs) {
+      p.push(nn[0]*ext[0] + u[0]*c[0]*ext[0] + v[0]*c[1]*ext[1],
+             nn[1]*ext[1] + u[1]*c[0]*ext[0] + v[1]*c[1]*ext[1],
+             nn[2]*ext[2] + u[2]*c[0]*ext[0] + v[2]*c[1]*ext[2]);
+      n.push(nn[0], nn[1], nn[2]);
+    }
+    const b = fi * 4;
+    idx.push(b, b+1, b+2, b, b+2, b+3);
+  });
+  return { pos: new Float32Array(p), nrm: new Float32Array(n), idx: new Uint16Array(idx) };
+}
+function makeCone(r, h, seg) {
+  const p = [], n = [], idx = [];
+  const tip = [0, 0, h];
+  p.push(tip[0], tip[1], tip[2]); n.push(0, 0, 1);
+  for (let i = 0; i <= seg; i++) {
+    const th = i / seg * Math.PI * 2;
+    const c = Math.cos(th), s = Math.sin(th);
+    p.push(c * r, s * r, 0); n.push(c * 0.8, s * 0.8, 0.6);
+  }
+  for (let i = 0; i < seg; i++) idx.push(0, 1 + i + 1, 1 + i);
+  const base = p.length / 3;
+  p.push(0, 0, 0); n.push(0, 0, -1);
+  for (let i = 0; i <= seg; i++) {
+    const th = i / seg * Math.PI * 2;
+    p.push(Math.cos(th) * r, Math.sin(th) * r, 0); n.push(0, 0, -1);
+  }
+  for (let i = 0; i < seg; i++) idx.push(base, base + 1 + i, base + 1 + i + 1);
+  return { pos: new Float32Array(p), nrm: new Float32Array(n), idx: new Uint16Array(idx) };
+}
+function makeTorus(R, r, seg, side) {
+  const p = [], n = [], idx = [];
+  for (let i = 0; i <= seg; i++) {
+    const u = i / seg * Math.PI * 2, cu = Math.cos(u), su = Math.sin(u);
+    for (let j = 0; j <= side; j++) {
+      const v = j / side * Math.PI * 2, cv = Math.cos(v), sv = Math.sin(v);
+      p.push((R + r * cv) * cu, r * sv, (R + r * cv) * su);
+      n.push(cv * cu, sv, cv * su);
+    }
+  }
+  for (let i = 0; i < seg; i++) for (let j = 0; j < side; j++) {
+    const a = i * (side + 1) + j, b = a + side + 1;
+    idx.push(a, b, a + 1, a + 1, b, b + 1);
+  }
+  return { pos: new Float32Array(p), nrm: new Float32Array(n), idx: new Uint16Array(idx) };
+}
+function makeCircle(R, seg) {
+  const p = [];
+  for (let i = 0; i < seg; i++) { const th = i / seg * Math.PI * 2; p.push(Math.cos(th) * R, 0, Math.sin(th) * R); }
+  return new Float32Array(p);
+}
+
+const box = makeBox(0.5, 0.28, 1.0);
+const boxVao = makeVao(box.pos, box.nrm, box.idx);
+const cone = makeCone(0.42, 1.0, 24);
+const coneVao = makeVao(cone.pos, cone.nrm, cone.idx);
+const ray = makeBox(0.06, 0.06, 0.8);
+ray.pos = ray.pos.map((x, i) => (i % 3 === 2 ? x * 1.6 : x));
+const rayVao = makeVao(new Float32Array(ray.pos), ray.nrm, ray.idx);
+const torus = makeTorus(1.5, 0.045, 64, 8);
+const torusVao = makeVao(torus.pos, torus.nrm, torus.idx);
+const marker = makeBox(0.11, 0.11, 0.11);
+const markerVao = makeVao(marker.pos, marker.nrm, marker.idx);
+const TRAIL_N = 72;
+const trailVao = makeVao(new Float32Array(TRAIL_N * 3), new Float32Array(TRAIL_N * 3), null);
+
+const el = (id) => document.getElementById(id);
+const modeEl = el("mode"), tEl = el("t"), fixSignEl = el("fixSign");
+const showTrailEl = el("showTrail"), showAxesEl = el("showAxes");
+const yawEl = el("yaw"), pitchEl = el("pitch"), rollEl = el("roll");
+
+const cam = { yaw: 0.62, pitch: 0.42, dist: 7.4 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.006;
+  cam.pitch = Math.max(-0.2, Math.min(1.4, cam.pitch - (e.clientY - lastY) * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+// 起点 / 终点朝向
+const START = { yaw: 0, pitch: 0, roll: 0 };
+const END = { yaw: 150, pitch: 72, roll: -120 };
+const Q0 = qFromEulerYXZ(START.yaw, START.pitch, START.roll);
+const Q1_RAW = qFromEulerYXZ(END.yaw, END.pitch, END.roll);
+
+function poseAt(mode, t, fix) {
+  if (mode === 0) {
+    const y = START.yaw + (END.yaw - START.yaw) * t;
+    const p = START.pitch + (END.pitch - START.pitch) * t;
+    const r = START.roll + (END.roll - START.roll) * t;
+    return { q: qFromEulerYXZ(y, p, r), m: eulerToMat4(y, p, r) };
+  }
+  const q = mode === 1 ? qNlerp(Q0, Q1_RAW, t, fix) : qSlerp(Q0, Q1_RAW, t, fix);
+  return { q, m: qToMat4(q) };
+}
+
+function drawMesh(vp, model, vao, count, color, unlit, mode) {
+  gl.uniformMatrix4fv(U.u_mvp, false, mul(vp, model));
+  gl.uniformMatrix4fv(U.u_model, false, model);
+  gl.uniform3fv(U.u_color, new Float32Array(color));
+  gl.uniform1i(U.u_unlit, unlit);
+  gl.bindVertexArray(vao);
+  if (mode === gl.LINES || mode === gl.LINE_STRIP) gl.drawArrays(mode, 0, count);
+  else gl.drawElements(mode, count, gl.UNSIGNED_SHORT, 0);
+}
+function axisMatrix(vp, m, s, color) {
+  // 用细长方块拼出本地 X/Y/Z 轴
+  const rot = [m[0],m[1],m[2], 0, m[4],m[5],m[6], 0, m[8],m[9],m[10], 0, 0,0,0,1];
+  const axes = [
+    [s, 0, 0, [1, 0.35, 0.35]],
+    [0, s, 0, [0.45, 1, 0.5]],
+    [0, 0, s, [0.45, 0.6, 1]],
+  ];
+  for (const a of axes) {
+    const mm = new Float32Array(rot);
+    mm[12] = a[0]; mm[13] = a[1]; mm[14] = a[2];
+    drawMesh(vp, mm, rayVao, ray.idx.length, color || a[3], 1, gl.TRIANGLES);
+  }
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const W = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const H = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+
+  const mode = Number(modeEl.value);
+  const t = Number(tEl.value) / 100;
+  const fix = fixSignEl.checked;
+  el("tVal").textContent = t.toFixed(2);
+  const yaw = Number(yawEl.value), pitch = Number(pitchEl.value), roll = Number(rollEl.value);
+  el("yawVal").textContent = yaw + "°";
+  el("pitchVal").textContent = pitch + "°";
+  el("rollVal").textContent = roll + "°";
+
+  const pose = poseAt(mode, t, fix);
+  const qt = pose.q;
+  const q0dot = qDot(Q0, Q1_RAW);
+  el("qNow").textContent = "(" + qt.map((x) => x.toFixed(3)).join(", ") + ")";
+  el("qLen").textContent = Math.hypot(qt[0], qt[1], qt[2], qt[3]).toFixed(6);
+  el("qAngle").textContent = (2 * Math.acos(Math.min(1, Math.abs(qt[3]))) / D2R).toFixed(1) + "°";
+  el("qDot").textContent = q0dot.toFixed(4) + (q0dot < 0 ? "（负 → 需要取反）" : "（正 → 不用取反）");
+  el("qFlip").textContent = q0dot < 0 ? (fix ? "已取反，走短弧" : "未取反，会绕远路") : "不需要";
+
+  const lock = Math.abs(Math.abs(pitch) - 90) < 4;
+  const lw = el("lockWarn");
+  lw.className = "warn" + (lock ? " bad" : "");
+  lw.textContent = lock
+    ? "pitch = " + pitch + "°：万向节锁！内圈（roll）的轴和外圈（yaw）的轴已经重合，右边两个环共面了 —— 这时调 yaw 和调 roll 是同一个效果（符号相反），你丢了一个自由度。"
+    : "当前 pitch = " + pitch + "°，三根轴互相独立。把 pitch 推到 ±90° 看内外两环重合。";
+
+  const eye = [
+    Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    Math.sin(cam.pitch) * cam.dist,
+    Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const view = lookAt(eye, [0, 0, 0], [0, 1, 0]);
+
+  gl.useProgram(prog);
+  gl.enable(gl.DEPTH_TEST);
+  gl.disable(gl.SCISSOR_TEST);
+  gl.viewport(0, 0, W, H);
+  gl.clearColor(0.02, 0.023, 0.035, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  // ---- 左：插值 ----
+  const splitX = Math.floor(W * 0.56);
+  gl.enable(gl.SCISSOR_TEST);
+  gl.scissor(0, 0, splitX - 6, H);
+  gl.viewport(0, 0, splitX - 6, H);
+  const projA = perspective(Math.PI / 4.6, (splitX - 6) / H, 0.1, 60);
+  const vpA = mul(projA, view);
+
+  // 起点 / 目标的半透明姿态
+  for (const g of [{ q: Q0, c: [0.95, 0.8, 0.3] }, { q: Q1_RAW, c: [0.72, 0.5, 0.95] }]) {
+    const m = qToMat4(g.q);
+    drawMesh(vpA, m, boxVao, box.idx.length, [g.c[0] * 0.55, g.c[1] * 0.55, g.c[2] * 0.55], 0, gl.TRIANGLES);
+  }
+  // 当前姿态
+  drawMesh(vpA, pose.m, boxVao, box.idx.length, [0.86, 0.86, 0.9], 0, gl.TRIANGLES);
+  const coneM = mul(pose.m, new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,1.0,1]));
+  drawMesh(vpA, coneM, coneVao, cone.idx.length, [0.95, 0.62, 0.3], 0, gl.TRIANGLES);
+  if (showAxesEl.checked) axisMatrix(vpA, pose.m, 1.75);
+
+  // 轨迹
+  if (showTrailEl.checked) {
+    const verts = new Float32Array(TRAIL_N * 3);
+    for (let i = 0; i < TRAIL_N; i++) {
+      const tt = i / (TRAIL_N - 1);
+      const p = poseAt(mode, tt, fix);
+      // 机头尖端 (0,0,2.0) 经过姿态变换
+      const v = [p.m[8] * 2.0, p.m[9] * 2.0, p.m[10] * 2.0];
+      verts[i * 3] = v[0]; verts[i * 3 + 1] = v[1]; verts[i * 3 + 2] = v[2];
+    }
+    updateStream(trailVao, 0, verts);
+    const col = mode === 0 ? [0.94, 0.64, 0.37] : mode === 1 ? [0.43, 0.78, 1.0] : [0.49, 0.81, 0.63];
+    gl.uniformMatrix4fv(U.u_mvp, false, vpA);
+    gl.uniformMatrix4fv(U.u_model, false, new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]));
+    gl.uniform3fv(U.u_color, new Float32Array(col));
+    gl.uniform1i(U.u_unlit, 1);
+    gl.bindVertexArray(trailVao);
+    gl.drawArrays(gl.LINE_STRIP, 0, TRAIL_N);
+  }
+
+  // ---- 右：万向节 ----
+  gl.scissor(splitX + 6, 0, W - splitX - 6, H);
+  gl.viewport(splitX + 6, 0, W - splitX - 6, H);
+  gl.clearColor(0.04, 0.05, 0.075, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  const projB = perspective(Math.PI / 4.6, (W - splitX - 6) / H, 0.1, 60);
+  const vpB = mul(projB, view);
+
+  const yM = eulerToMat4(yaw, 0, 0);
+  const yxM = eulerToMat4(yaw, pitch, 0);
+  const fullM = eulerToMat4(yaw, pitch, roll);
+  // 圆环绕自己的轴转是看不出来的，所以给每个环挂一个小方块当刻度；
+  // 环的几何默认是"轴 = Y"，中环/内环分别把轴掰到 X/Z。
+  const RING_TILT_X = new Float32Array([0,-1,0,0, 1,0,0,0, 0,0,1,0, 0,0,0,1]);  // Rz(-90°)
+  const RING_TILT_Z = new Float32Array([1,0,0,0, 0,0,1,0, 0,-1,0,0, 0,0,0,1]);  // Rx(90°)
+  const tr = (x, y, z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]);
+  drawMesh(vpB, yM, torusVao, torus.idx.length, [0.95, 0.72, 0.35], 0, gl.TRIANGLES);
+  drawMesh(vpB, mul(yxM, RING_TILT_X), torusVao, torus.idx.length, [0.45, 0.8, 0.95], 0, gl.TRIANGLES);
+  drawMesh(vpB, mul(fullM, RING_TILT_Z), torusVao, torus.idx.length, [0.62, 0.9, 0.6], 0, gl.TRIANGLES);
+  drawMesh(vpB, mul(yM, tr(1.5, 0, 0)), markerVao, marker.idx.length, [1.0, 0.8, 0.4], 1, gl.TRIANGLES);
+  drawMesh(vpB, mul(yxM, tr(0, 1.5, 0)), markerVao, marker.idx.length, [0.5, 0.85, 1.0], 1, gl.TRIANGLES);
+  drawMesh(vpB, mul(fullM, tr(1.5, 0, 0)), markerVao, marker.idx.length, [0.65, 0.95, 0.65], 1, gl.TRIANGLES);
+  drawMesh(vpB, fullM, boxVao, box.idx.length, [0.85, 0.85, 0.9], 0, gl.TRIANGLES);
+  const coneB = mul(fullM, new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,1.0,1]));
+  drawMesh(vpB, coneB, coneVao, cone.idx.length, [0.95, 0.62, 0.3], 0, gl.TRIANGLES);
+  if (showAxesEl.checked) axisMatrix(vpB, fullM, 1.75);
+
+  gl.disable(gl.SCISSOR_TEST);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

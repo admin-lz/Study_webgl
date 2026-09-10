@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · MRT 与延迟着色</title>
+  <style>
+    :root {
+      --bg: #0b0d14; --panel: #12151f; --line: #243044;
+      --text: #e8eef8; --muted: #8b97a8; --accent: #9fd4ff; --gold: #f3d27a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 980px; }
+    header b { color: var(--accent); }
+    .layout { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 20px; padding: 20px 24px 40px; align-items: start; }
+    @media (max-width: 1020px) { .layout { grid-template-columns: 1fr; } }
+    canvas#c { width: 100%; height: auto; display: block; background: #08090e; border: 1px solid var(--line); border-radius: 8px; cursor: grab; }
+    canvas#c:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+    .stage + .stage { margin-top: 16px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre { margin: 8px 0 0; background: #0a0c12; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #d5deea; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; align-items: center; color: var(--muted); font-size: 13px; }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls b { color: var(--text); font-variant-numeric: tabular-nums; min-width: 3.2em; display: inline-block; }
+    table.stats { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 10px; }
+    table.stats td { padding: 4px 6px; border-bottom: 1px solid #1b2434; }
+    table.stats td:first-child { color: var(--muted); }
+    table.stats td:last-child { text-align: right; font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .note b { color: var(--text); }
+    .warn { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: #1a2230; border: 1px solid #2c3b52; font-size: 13px; }
+    #err { display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212; border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>MRT / 延迟着色：先把几何信息摊到几张图上，再统一算光照</h1>
+    <p>
+      前向渲染里光照是按<b>物体</b>算的：100 个物体 × 40 盏灯 = 4000 次光照计算，还得把物体重画一遍。
+      延迟着色把顺序倒过来 —— 一遍把 albedo / 法线 / 位置画进 G-buffer（这就是 <b>MRT</b>：一次 draw 写多张附件），
+      然后一张全屏 pass 按<b>像素</b>算光照：复杂度变成"像素 × 灯"，跟物体数量无关。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <canvas id="c" width="960" height="480"></canvas>
+      <section class="stage" style="margin-top:16px">
+        <div class="controls">
+          <label>显示
+            <select id="view">
+              <option value="0" selected>最终光照</option>
+              <option value="1">G-buffer: albedo</option>
+              <option value="2">G-buffer: 法线</option>
+              <option value="3">G-buffer: 深度</option>
+              <option value="4">G-buffer: 世界坐标</option>
+              <option value="5">只留光照贡献</option>
+            </select>
+          </label>
+          <label>位置来源
+            <select id="posMode">
+              <option value="0" selected>从深度反投影（省一张附件）</option>
+              <option value="1">RGBA8 存世界坐标</option>
+              <option value="2">RGBA16F 存世界坐标</option>
+              <option value="3">RGBA32F 存世界坐标</option>
+            </select>
+          </label>
+          <label>灯数 <input type="range" id="lights" min="1" max="64" step="1" value="24" style="width:140px" /> <b id="lightsVal">24</b></label>
+          <label>灯半径 <input type="range" id="radius" min="0.5" max="14" step="0.1" value="4.5" style="width:140px" /> <b id="radiusVal">4.5</b></label>
+          <label>扩散 <input type="range" id="scatter" min="0" max="12" step="0.1" value="6" style="width:140px" /> <b id="scatterVal">6.0</b></label>
+          <label>环境光 <input type="range" id="ambient" min="0" max="0.6" step="0.01" value="0.06" style="width:140px" /> <b id="ambientVal">0.06</b></label>
+          <label>相位 <input type="range" id="phase" min="0" max="6.28" step="0.01" value="0.8" style="width:140px" /> <b id="phaseVal">0.80</b></label>
+          <label><input type="checkbox" id="tone" checked /> 色调映射</label>
+        </div>
+        <table class="stats">
+          <tr><td>G-buffer 附件</td><td id="sAttach">-</td></tr>
+          <tr><td>每像素写入（G-buffer pass）</td><td id="sWrite">-</td></tr>
+          <tr><td>每像素读取（光照 pass）</td><td id="sRead">-</td></tr>
+          <tr><td>1920×1080 下总带宽 / 帧</td><td id="sTotal">-</td></tr>
+          <tr><td>光照计算次数</td><td id="sCost">-</td></tr>
+        </table>
+        <div class="note" id="hint">-</div>
+        <div id="err"></div>
+      </section>
+    </div>
+
+    <div>
+      <section class="stage">
+        <h2>1. 一次 draw，写多张附件</h2>
+        <pre>// FBO：3 张 RGBA8 + 1 张位置附件 + 一张可采样的深度纹理
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, rtAlbedo, 0);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, rtNormal, 0);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT2, gl.TEXTURE_2D, rtMat,    0);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT3, gl.TEXTURE_2D, rtPos,    0);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT,  gl.TEXTURE_2D, rtDepth,  0);
+gl.drawBuffers([COLOR_ATTACHMENT0, 1, 2, 3]);   // ← 少写这句，多出的附件就是"废的"</pre>
+        <pre>// 片元着色器：每个 out 变量对应一个 attachment
+layout(location = 0) out vec4 gAlbedo;
+layout(location = 1) out vec4 gNormal;
+layout(location = 2) out vec4 gMaterial;
+layout(location = 3) out vec4 gPosition;</pre>
+        <p class="note">
+          <code>drawBuffers</code> 是 MRT 最容易漏的一步：不写它，默认只写 COLOR_ATTACHMENT0，其他附件一律是未定义内容。
+        </p>
+      </section>
+
+      <section class="stage">
+        <h2>2. 位置到底存不存？</h2>
+        <ol class="steps">
+          <li>位置可以<b>不存</b>：用深度纹理 + <code>gl_FragCoord</code> 反投影出来，省一张附件。
+            <pre>vec4 ndc = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+vec3 world = (u_invViewProj * ndc).xyz / (u_invViewProj * ndc).w;</pre>
+          </li>
+          <li>也可以存：写起来直观，但<b>格式选错就出事</b>。世界坐标范围是 ±20 这种量级，
+            RGBA8 只有 256 级 → 每级约 0.16 个单位，光照里会看到明显的条纹和块状跳变。</li>
+          <li>RGBA16F / RGBA32F 精度够，但每像素 8 / 16 字节。1920×1080 下，32F 存位置一张附件就是 8.3 MB，
+            而且 G-buffer 要"写一遍 + 读一遍"，实际带宽翻倍。切上面的下拉框能直接看到量化带来的差别。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>3. 延迟着色的代价</h2>
+        <ol class="steps">
+          <li><b>透明物体没地方放。</b>G-buffer 每像素只能存一份几何信息，"一层"就是它最大的限制。
+            半透明只能退回前向渲染，再叠加到结果上。</li>
+          <li><b>带宽换计算。</b>好处是光照与物体数解耦，坏处是 G-buffer 的读写带宽很大 ——
+            这也是为什么移动端更爱 Tile-based Deferred（把 G-buffer 放在片上）或者干脆继续前向。</li>
+          <li><b>MSAA 变贵。</b>G-buffer 每张附件都要按采样数放大，而且法线/AO 这类数据要单独 resolve。</li>
+          <li><b>看不到的像素也在算。</b>G-buffer 覆盖了屏幕所有像素，被遮挡的物体照样写进去。
+            所以重场景里常常先做一遍深度预 pass（depth prepass）再着色。</li>
+        </ol>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => { errBox.style.display = "block"; errBox.textContent += (e.message || e.error) + "\n"; });
+const cbfExt = gl.getExtension("EXT_color_buffer_float");
+const hasFloatRT = !!cbfExt;
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let l = Math.hypot(zx, zy, zz); zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  l = Math.hypot(xx, xy, xz); xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]), 1,
+  ]);
+}
+function invert4(m) {
+  const o = new Float32Array(16);
+  const a00=m[0],a01=m[1],a02=m[2],a03=m[3], a10=m[4],a11=m[5],a12=m[6],a13=m[7];
+  const a20=m[8],a21=m[9],a22=m[10],a23=m[11], a30=m[12],a31=m[13],a32=m[14],a33=m[15];
+  const b00=a00*a11-a01*a10, b01=a00*a12-a02*a10, b02=a00*a13-a03*a10, b03=a01*a12-a02*a11;
+  const b04=a01*a13-a03*a11, b05=a02*a13-a03*a12, b06=a20*a31-a21*a30, b07=a20*a32-a22*a30;
+  const b08=a20*a33-a23*a30, b09=a21*a32-a22*a31, b10=a21*a33-a23*a31, b11=a22*a33-a23*a32;
+  let det = b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06;
+  if (!det) return o;
+  det = 1 / det;
+  o[0]=(a11*b11-a12*b10+a13*b09)*det;  o[1]=(a02*b10-a01*b11-a03*b09)*det;
+  o[2]=(a31*b05-a32*b04+a33*b03)*det;  o[3]=(a22*b04-a21*b05-a23*b03)*det;
+  o[4]=(a12*b08-a10*b11-a13*b07)*det;  o[5]=(a00*b11-a02*b08+a03*b07)*det;
+  o[6]=(a32*b02-a30*b05-a33*b01)*det;  o[7]=(a20*b05-a22*b02+a23*b01)*det;
+  o[8]=(a10*b10-a11*b08+a13*b06)*det;  o[9]=(a01*b08-a00*b10-a03*b06)*det;
+  o[10]=(a30*b04-a31*b02+a33*b00)*det; o[11]=(a21*b02-a20*b04-a23*b00)*det;
+  o[12]=(a11*b07-a10*b09-a12*b06)*det; o[13]=(a00*b09-a01*b07+a02*b06)*det;
+  o[14]=(a31*b01-a30*b03-a32*b00)*det; o[15]=(a20*b03-a21*b01+a22*b00)*det;
+  return o;
+}
+
+// ---------- 几何 ----------
+function sphereMesh(seg = 32, ring = 20) {
+  const pos = [], nrm = [], idx = [];
+  for (let y = 0; y <= ring; y++) {
+    const v = y / ring, phi = v * Math.PI;
+    for (let x = 0; x <= seg; x++) {
+      const u = x / seg, th = u * Math.PI * 2;
+      const nx = Math.sin(phi) * Math.cos(th), ny = Math.cos(phi), nz = Math.sin(phi) * Math.sin(th);
+      pos.push(nx, ny, nz); nrm.push(nx, ny, nz);
+    }
+  }
+  for (let y = 0; y < ring; y++) for (let x = 0; x < seg; x++) {
+    const a = y * (seg + 1) + x, b = a + seg + 1;
+    idx.push(a, b, a + 1, a + 1, b, b + 1);
+  }
+  return { pos: new Float32Array(pos), nrm: new Float32Array(nrm), idx: new Uint16Array(idx) };
+}
+const SPH = sphereMesh();
+const GROUND = {
+  pos: new Float32Array([-22,0,-22, 22,0,-22, 22,0,22, -22,0,-22, 22,0,22, -22,0,22]),
+  nrm: new Float32Array([0,1,0, 0,1,0, 0,1,0, 0,1,0, 0,1,0, 0,1,0]),
+};
+const meshFor = (m) => {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const aPos = gl.getAttribLocation(progGBuf, "a_pos");
+  const aNrm = gl.getAttribLocation(progGBuf, "a_nrm");
+  const put = (loc, d) => {
+    const b = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, d, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 3, gl.FLOAT, false, 0, 0);
+  };
+  put(aPos, m.pos); put(aNrm, m.nrm);
+  let count = 0, type = gl.TRIANGLES;
+  if (m.idx) {
+    const b = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, b); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, m.idx, gl.STATIC_DRAW);
+    count = m.idx.length;
+    type = gl.TRIANGLES;
+  } else {
+    count = m.pos.length / 3;
+  }
+  gl.bindVertexArray(null);
+  return { vao, count, type, indexed: !!m.idx };
+};
+
+// ---------- 着色器 ----------
+const GBUF_VS = `#version 300 es
+in vec3 a_pos;
+in vec3 a_nrm;
+uniform mat4 u_model;
+uniform mat4 u_mvp;
+uniform mat3 u_nrmMat;
+out vec3 v_nrm;
+out vec3 v_world;
+out vec2 v_uv;
+void main() {
+  vec4 w = u_model * vec4(a_pos, 1.0);
+  v_world = w.xyz;
+  v_nrm = normalize(u_nrmMat * a_nrm);
+  v_uv = a_pos.xz;
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+const GBUF_FS = `#version 300 es
+precision highp float;
+in vec3 v_nrm;
+in vec3 v_world;
+in vec2 v_uv;
+uniform vec3 u_albedo;
+uniform float u_rough;
+uniform float u_metal;
+uniform int u_posEncode;    // 1 = 编码进 [0,1]（给 8 位附件用）
+uniform float u_posScale;
+layout(location = 0) out vec4 gAlbedo;
+layout(location = 1) out vec4 gNormal;
+layout(location = 2) out vec4 gMaterial;
+layout(location = 3) out vec4 gPosition;
+void main() {
+  gAlbedo = vec4(u_albedo, 1.0);
+  gNormal = vec4(normalize(v_nrm) * 0.5 + 0.5, 1.0);
+  gMaterial = vec4(u_rough, u_metal, 0.0, 1.0);
+  // 世界坐标范围是 ±22：直接塞给 RGBA8 会被截断，必须先归一化到 [0,1]
+  gPosition = u_posEncode == 1
+    ? vec4(v_world / u_posScale + 0.5, 1.0)
+    : vec4(v_world, 1.0);
+}`;
+const LIGHT_VS = `#version 300 es
+out vec2 v_uv;
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  v_uv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+const LIGHT_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_albedo;
+uniform sampler2D u_normal;
+uniform sampler2D u_mat;
+uniform sampler2D u_pos;
+uniform sampler2D u_depth;
+uniform mat4 u_invVP;
+uniform vec3 u_eye;
+uniform int u_view;
+uniform int u_posMode;      // 0 = 从深度反投影, 1 = 编码的 8 位, 2/3 = 原始浮点
+uniform float u_posScale;
+uniform int u_lightCount;
+uniform vec4 u_lights[64];     // xyz = 位置, w = 强度
+uniform vec4 u_lightCol[64];   // rgb = 颜色
+uniform float u_radius;
+uniform float u_ambient;
+uniform int u_tone;
+uniform float u_far;
+out vec4 outColor;
+
+vec3 decodeNormal(vec3 n) { return normalize(n * 2.0 - 1.0); }
+
+float linDepth(float d) {
+  float n = 0.1;
+  float z = d * 2.0 - 1.0;
+  return (2.0 * n * u_far) / (u_far + n - z * (u_far - n));
+}
+
+void main() {
+  vec3 albedo = texture(u_albedo, v_uv).rgb;
+  vec3 N = decodeNormal(texture(u_normal, v_uv).rgb);
+  vec2 mat = texture(u_mat, v_uv).rg;
+  float rough = mat.x, metal = mat.y;
+  float d = texture(u_depth, v_uv).r;
+  bool isBg = d >= 0.999999;
+
+  vec3 P;
+  if (u_posMode == 0) {
+    vec4 ndc = vec4(v_uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+    vec4 w = u_invVP * ndc;
+    P = w.xyz / w.w;
+  } else if (u_posMode == 1) {
+    P = (texture(u_pos, v_uv).rgb - 0.5) * u_posScale;   // 8 位 → 每级约 0.17 个单位
+  } else {
+    P = texture(u_pos, v_uv).rgb;                        // 浮点附件：原样存
+  }
+
+  if (u_view == 1) { outColor = vec4(pow(albedo, vec3(1.0 / 2.2)), 1.0); return; }
+  if (u_view == 2) { outColor = vec4(N * 0.5 + 0.5, 1.0); return; }
+  if (u_view == 3) {
+    float lz = linDepth(d);
+    float t = isBg ? 1.0 : clamp(lz / u_far, 0.0, 1.0);
+    outColor = vec4(vec3(1.0 - t), 1.0);
+    return;
+  }
+  if (u_view == 4) { outColor = vec4(P * 0.04 + 0.5, 1.0); return; }
+
+  vec3 V = normalize(u_eye - P);
+  float NV = max(dot(N, V), 0.0);
+  vec3 lit = vec3(0.0);
+  if (!isBg) {
+    for (int i = 0; i < 64; i++) {
+      if (i >= u_lightCount) break;
+      vec3 lp = u_lights[i].xyz;
+      float inten = u_lights[i].w;
+      vec3 Lv = lp - P;
+      float dist = length(Lv);
+      vec3 L = Lv / max(dist, 1e-4);
+      float atten = inten / (1.0 + dist * dist / (u_radius * u_radius));
+      float NL = max(dot(N, L), 0.0);
+      vec3 H = normalize(L + V);
+      float spec = pow(max(dot(N, H), 0.0), mix(4.0, 160.0, 1.0 - rough)) * (1.0 - rough) * 0.7;
+      float metalTint = mix(1.0, 0.5, metal);
+      lit += (albedo * NL * metalTint + vec3(spec)) * atten * u_lightCol[i].rgb;
+    }
+    lit += albedo * u_ambient;
+  } else {
+    lit = vec3(0.012);
+  }
+
+  if (u_view == 5) {
+    outColor = vec4(pow(clamp(lit / max(albedo, vec3(0.02)), 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
+    return;
+  }
+  vec3 col = lit;
+  if (u_tone == 1) col = col * 0.85 / (col * 0.85 + vec3(1.0));   // Reinhard
+  outColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
+}`;
+
+const progGBuf = link(GBUF_VS, GBUF_FS);
+const progLight = link(LIGHT_VS, LIGHT_FS);
+const groundMesh = meshFor(GROUND);
+const sphereVao = meshFor(SPH);
+
+// ---------- G-buffer ----------
+const rt = { albedo: null, normal: null, mat: null, pos: null, depth: null, fbo: null, w: 0, h: 0, posFmt: -1 };
+function makeTex(w, h, internal, formatType) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, internal, w, h);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function posInternal(mode) {
+  if (mode === 1 || !hasFloatRT) return gl.RGBA8;
+  if (mode === 2) return gl.RGBA16F;
+  return gl.RGBA32F;
+}
+function ensureTargets(w, h, posMode) {
+  const wantInt = posInternal(posMode);
+  if (rt.fbo && rt.w === w && rt.h === h && rt.posFmt === wantInt) return;
+  if (rt.fbo) {
+    gl.deleteFramebuffer(rt.fbo);
+    for (const k of ["albedo", "normal", "mat", "pos", "depth"]) gl.deleteTexture(rt[k]);
+  }
+  rt.w = w; rt.h = h; rt.posFmt = wantInt;
+  rt.albedo = makeTex(w, h, gl.RGBA8);
+  rt.normal = makeTex(w, h, gl.RGBA8);
+  rt.mat = makeTex(w, h, gl.RGBA8);
+  rt.pos = makeTex(w, h, wantInt);
+  rt.depth = makeTex(w, h, gl.DEPTH_COMPONENT24);
+  rt.fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, rt.albedo, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, rt.normal, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT2, gl.TEXTURE_2D, rt.mat, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT3, gl.TEXTURE_2D, rt.pos, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, rt.depth, 0);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2, gl.COLOR_ATTACHMENT3]);
+  const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (st !== gl.FRAMEBUFFER_COMPLETE) throw new Error("G-buffer FBO incomplete: 0x" + st.toString(16));
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.drawBuffers([gl.BACK]);
+}
+
+// ---------- 场景 ----------
+const OBJS = [];
+function hsv(h, s, v) {
+  const k = (n) => (n + h * 6) % 6;
+  const f = (n) => v - v * s * Math.max(0, Math.min(k(n), 4 - k(n), 1));
+  return [f(5), f(3), f(1)];
+}
+for (let i = 0; i < 9; i++) {
+  const col = i % 3, row = (i / 3) | 0;
+  OBJS.push({
+    x: (col - 1) * 3.6, z: (row - 1) * 3.6, r: 1.0,
+    albedo: hsv((i * 0.13 + 0.55) % 1, 0.72, 0.9), rough: 0.15 + 0.1 * i,
+  });
+}
+const groundModel = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+const IDENT3 = new Float32Array([1,0,0, 0,1,0, 0,0,1]);
+const scaleMat = (s) => new Float32Array([s,0,0,0, 0,s,0,0, 0,0,s,0, 0,0,0,1]);
+const transMat = (x, y, z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]);
+
+const el = (id) => document.getElementById(id);
+const viewEl = el("view"), posEl = el("posMode"), lightsEl = el("lights"), radiusEl = el("radius");
+const scatterEl = el("scatter"), ambientEl = el("ambient"), phaseEl = el("phase"), toneEl = el("tone");
+const cam = { yaw: 0.62, pitch: 0.42, dist: 20 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.005;
+  cam.pitch = Math.max(0.08, Math.min(1.35, cam.pitch - (e.clientY - lastY) * 0.004));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+const lightData = new Float32Array(64 * 4);
+const lightCol = new Float32Array(64 * 4);
+const uG = {};
+for (const n of ["u_model", "u_mvp", "u_nrmMat", "u_albedo", "u_rough", "u_metal", "u_posEncode", "u_posScale"]) uG[n] = gl.getUniformLocation(progGBuf, n);
+const uL = {};
+for (const n of ["u_albedo", "u_normal", "u_mat", "u_pos", "u_depth", "u_invVP", "u_eye", "u_view",
+  "u_posMode", "u_posScale", "u_lightCount", "u_lights", "u_lightCol", "u_radius", "u_ambient", "u_tone", "u_far"]) uL[n] = gl.getUniformLocation(progLight, n);
+
+const fsVao = gl.createVertexArray();   // 全屏三角形不需要任何顶点数据
+const POS_SCALE = 44.0;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const W = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const H = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+
+  const posModeRaw = Number(posEl.value);
+  // 环境不支持浮点渲染目标时，16F/32F 只能退回"编码进 8 位"
+  const posMode = (posModeRaw >= 2 && !hasFloatRT) ? 1 : posModeRaw;
+  const posEncode = posMode === 1 ? 1 : 0;
+  const view = Number(viewEl.value);
+  const nLights = Number(lightsEl.value);
+  const radius = Number(radiusEl.value);
+  const scatter = Number(scatterEl.value);
+  const ambient = Number(ambientEl.value);
+  const phase = Number(phaseEl.value);
+  el("lightsVal").textContent = nLights;
+  el("radiusVal").textContent = radius.toFixed(1);
+  el("scatterVal").textContent = scatter.toFixed(1);
+  el("ambientVal").textContent = ambient.toFixed(2);
+  el("phaseVal").textContent = phase.toFixed(2);
+
+  ensureTargets(W, H, posMode);
+
+  const FAR = 80;
+  const eye = [
+    Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    2.5 + Math.sin(cam.pitch) * cam.dist,
+    Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const view4 = lookAt(eye, [0, 1, 0], [0, 1, 0]);
+  const proj = perspective(Math.PI / 4, W / H, 0.1, FAR);
+  const vp = mul(proj, view4);
+  const invVP = invert4(vp);
+
+  // ---------------- pass 1: G-buffer ----------------
+  gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo);
+  gl.viewport(0, 0, W, H);
+  gl.enable(gl.DEPTH_TEST);
+  gl.disable(gl.BLEND);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(progGBuf);
+  gl.uniform1i(uG.u_posEncode, posEncode);
+  gl.uniform1f(uG.u_posScale, POS_SCALE);
+
+  const setObj = (model, nrmMat, albedo, rough, metal) => {
+    gl.uniformMatrix4fv(uG.u_model, false, model);
+    gl.uniformMatrix4fv(uG.u_mvp, false, mul(vp, model));
+    gl.uniformMatrix3fv(uG.u_nrmMat, false, nrmMat);
+    gl.uniform3fv(uG.u_albedo, albedo);
+    gl.uniform1f(uG.u_rough, rough);
+    gl.uniform1f(uG.u_metal, metal);
+  };
+  setObj(groundModel, IDENT3, [0.34, 0.35, 0.4], 0.9, 0.0);
+  gl.bindVertexArray(groundMesh.vao);
+  gl.drawArrays(gl.TRIANGLES, 0, groundMesh.count);
+  gl.bindVertexArray(sphereVao.vao);
+  for (const o of OBJS) {
+    setObj(mul(transMat(o.x, o.r + 0.02, o.z), scaleMat(o.r)), IDENT3, o.albedo, o.rough, o.rough < 0.3 ? 0.8 : 0.0);
+    gl.drawElements(gl.TRIANGLES, SPH.idx.length, gl.UNSIGNED_SHORT, 0);
+  }
+
+  // ---------------- pass 2: 全屏光照 ----------------
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.drawBuffers([gl.BACK]);
+  gl.viewport(0, 0, W, H);
+  gl.disable(gl.DEPTH_TEST);
+  gl.useProgram(progLight);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rt.albedo); gl.uniform1i(uL.u_albedo, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, rt.normal); gl.uniform1i(uL.u_normal, 1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, rt.mat); gl.uniform1i(uL.u_mat, 2);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, rt.pos); gl.uniform1i(uL.u_pos, 3);
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, rt.depth); gl.uniform1i(uL.u_depth, 4);
+  gl.uniformMatrix4fv(uL.u_invVP, false, invVP);
+  gl.uniform3fv(uL.u_eye, eye);
+  gl.uniform1i(uL.u_view, view);
+  gl.uniform1i(uL.u_posMode, posMode);
+  gl.uniform1f(uL.u_posScale, POS_SCALE);
+  gl.uniform1i(uL.u_lightCount, nLights);
+  gl.uniform1f(uL.u_radius, radius);
+  gl.uniform1f(uL.u_ambient, ambient);
+  gl.uniform1i(uL.u_tone, toneEl.checked ? 1 : 0);
+  gl.uniform1f(uL.u_far, FAR);
+  for (let i = 0; i < nLights; i++) {
+    const k = i / nLights;
+    const rr = scatter * (0.35 + 0.65 * ((i % 7) / 7));
+    const a = k * 6.2831 * 3 + phase;
+    lightData[i * 4 + 0] = Math.cos(a) * rr;
+    lightData[i * 4 + 1] = 1.2 + 1.8 * ((i % 5) / 5);
+    lightData[i * 4 + 2] = Math.sin(a) * rr;
+    lightData[i * 4 + 3] = 2.2;
+    const c = hsv((i * 0.17 + 0.02) % 1, 0.6, 1.0);
+    lightCol[i * 4 + 0] = c[0]; lightCol[i * 4 + 1] = c[1]; lightCol[i * 4 + 2] = c[2]; lightCol[i * 4 + 3] = 1;
+  }
+  gl.uniform4fv(uL.u_lights, lightData);
+  gl.uniform4fv(uL.u_lightCol, lightCol);
+  gl.bindVertexArray(fsVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.enable(gl.DEPTH_TEST);
+
+  // ---- readouts ----
+  const bppBase = 4 + 4 + 4 + 4;               // albedo + normal + mat + depth
+  const posBpp = posMode === 0 ? 0 : posMode === 1 ? 4 : posMode === 2 ? 8 : 16;
+  const writeBpp = bppBase + posBpp;
+  const totalBytes = writeBpp * 2 * 1920 * 1080;   // 写一遍 + 光照 pass 读一遍
+  el("sAttach").textContent = posMode === 0
+    ? "albedo + normal + material (各 RGBA8) + depth D24"
+    : "albedo + normal + material + position " + (posMode === 1 ? "RGBA8（编码）" : posMode === 2 ? "RGBA16F" : "RGBA32F") + " + depth D24";
+  el("sWrite").textContent = writeBpp + " B";
+  el("sRead").textContent = writeBpp + " B";
+  el("sTotal").textContent = (totalBytes / 1048576).toFixed(1) + " MB";
+  el("sCost").textContent = "物体数无关，" + nLights + " 灯 × 207 万像素";
+  const hint = el("hint");
+  const fw = hasFloatRT ? "" : "（此环境不支持浮点渲染目标，16F/32F 会自动退回 8 位编码）";
+  const viewHint = {
+    1: "albedo 附件：纯材质颜色，没有任何光照信息 —— 后面所有光都靠光照 pass 加上去。",
+    2: "法线附件：以 [0,1] 编码存 8 位。反解回来有量化误差，所以实际引擎常把法线压成两个分量（第三分量开方算回来）。",
+    3: "深度附件：非线性分布（近处精度高、远处稀疏）。用 invVP 反投影世界坐标时读的就是这张图。",
+    4: "世界坐标：这一张是「可选」的。位置来源下拉框切到「从深度反投影」时，这张附件就白留了。",
+    5: "把 albedo 除掉，只剩光照项本身：能看出光照是被物体数量解耦的 —— 与场景里有几个物体完全无关。",
+  };
+  if (viewHint[view]) {
+    hint.textContent = viewHint[view];
+  } else if (posMode === 1) {
+    hint.textContent = fw + "RGBA8 存位置：范围 ±" + (POS_SCALE / 2).toFixed(0) + " 压进 256 级 → 每级约 " +
+      (POS_SCALE / 255).toFixed(2) + " 个单位。切到「最终光照」看高光上的条纹和块状跳变，切到「世界坐标」看阶梯。";
+  } else if (posMode === 0) {
+    hint.textContent = fw + "位置不存，用深度 + invVP 反投影：G-buffer 少一张附件、带宽最小，代价是光照 pass 里每个像素多一次矩阵乘法。";
+  } else {
+    hint.textContent = fw + "浮点位置附件：精度够，但每像素 " + posBpp + " 字节 —— 对比上表里的总带宽。";
+  }
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

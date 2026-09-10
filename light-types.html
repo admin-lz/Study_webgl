@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · 多种光源与衰减</title>
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --panel: #12151f;
+      --line: #243044;
+      --text: #e8eef8;
+      --muted: #8b97a8;
+      --accent: #9fd4ff;
+      --gold: #f3d27a;
+      --ok: #7dcea0;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 940px; }
+    header b { color: var(--accent); }
+    .layout {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 20px;
+      padding: 20px 24px 40px;
+      align-items: start;
+    }
+    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
+    canvas {
+      width: 100%; height: auto; display: block;
+      background: #08090e; border: 1px solid var(--line);
+      border-radius: 8px; cursor: grab;
+    }
+    canvas:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre {
+      margin: 10px 0 0; background: #0a0c12; border: 1px solid var(--line);
+      border-radius: 6px; padding: 12px 14px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #d5deea; white-space: pre;
+    }
+    .note { color: var(--muted); font-size: 13px; margin-top: 10px; }
+    .note b { color: var(--text); }
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 10px 16px;
+      margin-top: 12px; align-items: center;
+      color: var(--muted); font-size: 13px;
+    }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .stats {
+      margin-top: 12px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px 16px; font-size: 12.5px; color: var(--muted);
+    }
+    .stats b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .stats .hl { color: var(--gold); }
+    .hint {
+      margin: 10px 0 0; padding: 10px 12px; border-radius: 6px;
+      background: #1a2230; border: 1px solid #2c3b52; color: var(--text);
+      font-size: 13px; min-height: 4.2em;
+    }
+    #err {
+      display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212;
+      border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>光源类型与衰减：为什么点光源必须有个"范围"</h1>
+    <p>
+      平行光没有位置、点光源按距离衰减、聚光灯再加一层角度锥 —— 三种光源的区别其实只有两件事：
+      <b>光的方向怎么来</b>、<b>强度怎么随距离和角度掉</b>。这一页把衰减曲线单独拎出来调。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <section class="stage">
+        <h2>1. 三种光源，三个方向公式</h2>
+        <pre>平行光：L = -lightDir                        （不衰减，太阳）
+点光源：L = normalize(lightPos - p)          × att(dist)
+聚光灯：L = normalize(lightPos - p)          × att(dist) × spot(cosθ)
+半球光：无方向，直接按 N.y 在天空色/地面色之间插值（环境光的廉价近似）</pre>
+        <p class="note">
+          平行光其实是"距离无穷远的点光源"：方向处处相同，所以没有距离项。
+          它还有个好处是<b>光照与位置无关</b>，可以在顶点着色器里算，也可以直接预热进法线。
+        </p>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>2. 衰减怎么写</h2>
+        <pre>// 物理：平方反比。距离趋近 0 时会爆到无穷大，必须 clamp
+att = 1.0 / max(dist * dist, eps);
+
+// 工程：加一个"影响半径"，超出就彻底归零 —— 这样才能做光源剔除
+float f = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
+att = f * f / (dist * dist + 1.0);
+
+// 美术：线性/恒定衰减，好调但不物理
+att = clamp(1.0 - dist / range, 0.0, 1.0);</pre>
+        <ol class="steps">
+          <li>纯 <code>1/d²</code> 的问题不是亮度，而是<b>永远不为零</b> —— 一盏灯会影响场景里的每个像素。</li>
+          <li>有了 <code>range</code> 截断，才能把光源分桶（Forward+ / Clustered），这是现代引擎能跑几百盏灯的前提。</li>
+          <li>把衰减从"固定曲线"换成 <code>1/d²</code> 时，<b>画面会整体变暗</b>：同一盏灯在同样的距离上亮度变了。所以强度必须跟着重算，别以为是 bug。</li>
+        </ol>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>3. 聚光灯的锥</h2>
+        <pre>float cd = dot(-L, spotDir);                  // cosθ
+float inner = cos(angle * (1.0 - penumbra));  // 内锥：完全亮
+float outer = cos(angle);                     // 外锥：完全暗
+float spot = smoothstep(outer, inner, cd);    // 中间平滑过渡</pre>
+        <p class="note">
+          注意 <code>smoothstep(outer, inner, ...)</code> 里 <b>outer &lt; inner</b>：
+          角度越大 cos 越小，所以"外锥"对应更小的 cos 值。写反了不会报错，只会得到一圈硬边或者完全没光。
+          半影 = 1 时内外锥重合，等于硬边；半影 = 0 时整个锥体都是渐变，没有明确边界。
+        </p>
+      </section>
+    </div>
+
+    <div>
+      <canvas id="c" width="900" height="560"></canvas>
+
+      <section class="stage" style="margin-top:16px">
+        <div class="controls">
+          <label><input type="checkbox" id="dirOn" /> 平行光</label>
+          <label><input type="checkbox" id="ptOn" checked /> 点光源</label>
+          <label><input type="checkbox" id="spotOn" checked /> 聚光灯</label>
+          <label><input type="checkbox" id="hemiOn" checked /> 半球光</label>
+          <label><input type="checkbox" id="gizmo" checked /> 光源标记</label>
+          <label>衰减
+            <select id="falloff">
+              <option value="0" selected>1/d²（物理）</option>
+              <option value="1">1/d² + 范围截断</option>
+              <option value="2">线性衰减</option>
+              <option value="3">不做衰减</option>
+            </select>
+          </label>
+          <label>光源高度 <input type="range" id="lightY" min="40" max="900" step="10" value="260" style="width:96px" /> <b id="lightYVal">2.6</b></label>
+          <label>强度 <input type="range" id="intensity" min="0" max="300" step="5" value="100" style="width:96px" /> <b id="intVal">1.00</b></label>
+          <label>锥角 <input type="range" id="spotAngle" min="8" max="70" step="1" value="34" style="width:96px" /> <b id="spotAngleVal">34°</b></label>
+          <label>半影 <input type="range" id="penumbra" min="0" max="100" step="1" value="45" style="width:96px" /> <b id="penVal">0.45</b></label>
+          <label>日光方向 <input type="range" id="dirAngle" min="0" max="360" step="1" value="130" style="width:96px" /> <b id="dirAngleVal">130°</b></label>
+        </div>
+        <div class="stats">
+          <div>点光源距离地面：<b id="sDist" class="hl">-</b></div>
+          <div>该距离处衰减：<b id="sAtt">-</b></div>
+          <div>影响半径 range：<b id="sRange">9.0</b></div>
+          <div>当前光源数：<b id="sCount">-</b></div>
+        </div>
+        <p class="hint" id="hint"></p>
+        <div id="err"></div>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => {
+  errBox.style.display = "block";
+  errBox.textContent += (e.message || e.error) + "\n";
+});
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+      a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  }
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let len = Math.hypot(zx, zy, zz); zx /= len; zy /= len; zz /= len;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  len = Math.hypot(xx, xy, xz); xx /= len; xy /= len; xz /= len;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+    1,
+  ]);
+}
+
+const VS = `#version 300 es
+in vec3 a_pos;
+in vec3 a_nrm;
+uniform mat4 u_mvp;
+uniform mat4 u_model;
+out vec3 v_world;
+out vec3 v_nrm;
+void main() {
+  v_world = (u_model * vec4(a_pos, 1.0)).xyz;
+  v_nrm = mat3(u_model) * a_nrm;
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec3 v_world;
+in vec3 v_nrm;
+uniform vec3 u_camPos;
+uniform vec3 u_albedo;
+uniform int u_unlit;
+uniform int u_falloff;
+uniform float u_range;
+
+uniform int u_dirOn;   uniform vec3 u_dirDir;   uniform vec3 u_dirColor;
+uniform int u_ptOn;    uniform vec3 u_ptPos;    uniform vec3 u_ptColor;
+uniform int u_spotOn;  uniform vec3 u_spotPos;  uniform vec3 u_spotDir; uniform vec3 u_spotColor;
+uniform int u_hemiOn;  uniform vec3 u_sky;      uniform vec3 u_ground;
+uniform float u_spotInner; uniform float u_spotOuter;
+
+out vec4 outColor;
+
+float attenuation(float dist) {
+  if (u_falloff == 3) return 1.0;
+  if (u_falloff == 2) return clamp(1.0 - dist / u_range, 0.0, 1.0);
+  if (u_falloff == 1) {
+    float f = clamp(1.0 - pow(dist / u_range, 4.0), 0.0, 1.0);
+    return f * f / (dist * dist + 1.0);
+  }
+  return 1.0 / max(dist * dist, 0.01);
+}
+
+vec3 shade(vec3 N, vec3 V, vec3 L, vec3 lightCol, float att) {
+  float NL = max(dot(N, L), 0.0);
+  vec3 H = normalize(L + V);
+  float spec = pow(max(dot(N, H), 0.0), 48.0) * 0.35;
+  return lightCol * att * (NL + spec * NL);
+}
+
+void main() {
+  if (u_unlit == 1) { outColor = vec4(u_albedo, 1.0); return; }
+  vec3 N = normalize(v_nrm);
+  if (!gl_FrontFacing) N = -N;
+  vec3 V = normalize(u_camPos - v_world);
+  vec3 col = vec3(0.0);
+
+  if (u_hemiOn == 1) col += u_albedo * mix(u_ground, u_sky, N.y * 0.5 + 0.5) * 0.35;
+  if (u_dirOn == 1) col += u_albedo * shade(N, V, u_dirDir, u_dirColor, 1.0);
+  if (u_ptOn == 1) {
+    vec3 d = u_ptPos - v_world;
+    float dist = length(d);
+    col += u_albedo * shade(N, V, d / max(dist, 1e-4), u_ptColor, attenuation(dist));
+  }
+  if (u_spotOn == 1) {
+    vec3 d = u_spotPos - v_world;
+    float dist = length(d);
+    vec3 L = d / max(dist, 1e-4);
+    float cd = dot(-L, u_spotDir);
+    float spot = smoothstep(u_spotOuter, u_spotInner, cd);
+    col += u_albedo * shade(N, V, L, u_spotColor, attenuation(dist) * spot);
+  }
+  outColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
+}`;
+
+const prog = link(VS, FS);
+gl.useProgram(prog);
+const U = {};
+for (const n of ["u_mvp", "u_model", "u_camPos", "u_albedo", "u_unlit", "u_falloff", "u_range",
+                 "u_dirOn", "u_dirDir", "u_dirColor", "u_ptOn", "u_ptPos", "u_ptColor",
+                 "u_spotOn", "u_spotPos", "u_spotDir", "u_spotColor",
+                 "u_hemiOn", "u_sky", "u_ground", "u_spotInner", "u_spotOuter"]) {
+  U[n] = gl.getUniformLocation(prog, n);
+}
+const A = { pos: gl.getAttribLocation(prog, "a_pos"), nrm: gl.getAttribLocation(prog, "a_nrm") };
+
+function makeSphere(seg, ring) {
+  const pos = [], nrm = [], idx = [];
+  for (let y = 0; y <= ring; y++) {
+    const phi = (y / ring) * Math.PI;
+    for (let x = 0; x <= seg; x++) {
+      const th = (x / seg) * Math.PI * 2;
+      const nx = Math.sin(phi) * Math.cos(th), ny = Math.cos(phi), nz = Math.sin(phi) * Math.sin(th);
+      pos.push(nx, ny, nz); nrm.push(nx, ny, nz);
+    }
+  }
+  for (let y = 0; y < ring; y++) for (let x = 0; x < seg; x++) {
+    const a = y * (seg + 1) + x, b = a + seg + 1;
+    idx.push(a, b, a + 1, a + 1, b, b + 1);
+  }
+  return { pos: new Float32Array(pos), nrm: new Float32Array(nrm), idx: new Uint16Array(idx) };
+}
+function makeVao(pos, nrm, idx) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const put = (loc, data, size) => {
+    const b = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+  };
+  put(A.pos, pos, 3);
+  put(A.nrm, nrm, 3);
+  if (idx) {
+    const ib = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  }
+  return vao;
+}
+const sphere = makeSphere(32, 16);
+const sphereVao = makeVao(sphere.pos, sphere.nrm, sphere.idx);
+const G = new Float32Array([-16, 0, -16, 16, 0, -16, 16, 0, 16, -16, 0, -16, 16, 0, 16, -16, 0, 16]);
+const GN = new Float32Array([0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0]);
+const groundVao = makeVao(G, GN, null);
+
+const BALLS = [];
+for (let i = -3; i <= 3; i++) BALLS.push({ x: i * 2.6, r: 0.85, color: [0.85, 0.82, 0.78] });
+const GIZMOS = [
+  { kind: "pt", color: [1.0, 0.85, 0.35] },
+  { kind: "spot", color: [0.55, 0.85, 1.0] },
+];
+
+function modelMatrix(x, y, z, s) {
+  return new Float32Array([s, 0, 0, 0, 0, s, 0, 0, 0, 0, s, 0, x, y, z, 1]);
+}
+
+const el = (id) => document.getElementById(id);
+const dirOn = el("dirOn"), ptOn = el("ptOn"), spotOn = el("spotOn"), hemiOn = el("hemiOn"), gizmoEl = el("gizmo");
+const falloffEl = el("falloff"), lightYEl = el("lightY"), intensityEl = el("intensity");
+const spotAngleEl = el("spotAngle"), penumbraEl = el("penumbra"), dirAngleEl = el("dirAngle");
+const hintEl = el("hint");
+const RANGE = 9;
+
+const cam = { yaw: 0.0, pitch: 0.36, dist: 20 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.005;
+  cam.pitch = Math.max(0.06, Math.min(1.35, cam.pitch - (e.clientY - lastY) * 0.004));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+let hintKey = "";
+function refreshHint(ptPos) {
+  const key = [falloffEl.value, lightYEl.value, spotAngleEl.value, penumbraEl.value, dirOn.checked, ptOn.checked, spotOn.checked, hemiOn.checked].join(",");
+  el("lightYVal").textContent = (Number(lightYEl.value) / 100).toFixed(1);
+  el("intVal").textContent = (Number(intensityEl.value) / 100).toFixed(2);
+  el("spotAngleVal").textContent = spotAngleEl.value + "°";
+  el("penVal").textContent = (Number(penumbraEl.value) / 100).toFixed(2);
+  el("dirAngleVal").textContent = dirAngleEl.value + "°";
+  if (ptPos) {
+    const dist = Math.hypot(ptPos[0], ptPos[1] - 0, ptPos[2]);
+    el("sDist").textContent = dist.toFixed(2);
+    let att;
+    const f = Number(falloffEl.value);
+    if (f === 3) att = 1;
+    else if (f === 2) att = Math.max(0, 1 - dist / RANGE);
+    else if (f === 1) { const w = Math.max(0, 1 - Math.pow(dist / RANGE, 4)); att = w * w / (dist * dist + 1); }
+    else att = 1 / Math.max(dist * dist, 0.01);
+    el("sAtt").textContent = att.toFixed(4);
+  }
+  if (key === hintKey) return;
+  hintKey = key;
+  const f = Number(falloffEl.value);
+  if (f === 0) hintEl.textContent = "1/d²：只有灯正下方一小块亮，往外掉得极快，而且永远不归零。这就是「物理正确但不好用」的原始形态。";
+  else if (f === 1) hintEl.textContent = "1/d² + 范围截断：近处和上面一样，但在 range 边界平滑地归零 —— 这样才可以把光源按影响范围分桶剔除。";
+  else if (f === 2) hintEl.textContent = "线性衰减：光池很大、边缘很软，调起来最直观，但和物理差得最远（远处也会被照亮，衰减到 0 的位置完全由 range 决定）。";
+  else hintEl.textContent = "不做衰减：点光源退化成「半平行光」，整个地面亮度一样 —— 对比一下就能看出衰减到底在做什么。";
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+
+  const strength = Number(intensityEl.value) / 100;
+  const lightY = Number(lightYEl.value) / 100;
+  const ptPos = [2.6, lightY, 2.6];
+  const spotPos = [-5.2, 5.4, 4.2];
+  const spotTarget = [-5.2, 0, -1.0];
+  const sd = [spotTarget[0] - spotPos[0], spotTarget[1] - spotPos[1], spotTarget[2] - spotPos[2]];
+  const sl = Math.hypot(sd[0], sd[1], sd[2]);
+  const spotDir = [sd[0] / sl, sd[1] / sl, sd[2] / sl];
+  const dirA = Number(dirAngleEl.value) * Math.PI / 180;
+  const dirDir = [-Math.cos(dirA) * 0.7, -0.72, -Math.sin(dirA) * 0.7];
+  const dl = Math.hypot(dirDir[0], dirDir[1], dirDir[2]);
+  dirDir[0] /= dl; dirDir[1] /= dl; dirDir[2] /= dl;
+
+  refreshHint(ptPos);
+
+  const eye = [
+    Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    Math.sin(cam.pitch) * cam.dist,
+    Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const proj = perspective(Math.PI / 4.2, canvas.width / canvas.height, 0.2, 200);
+  const viewM = lookAt(eye, [0, 0.6, 0], [0, 1, 0]);
+  const viewProj = mul(proj, viewM);
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.02, 0.023, 0.035, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+
+  gl.useProgram(prog);
+  gl.uniform3fv(U.u_camPos, new Float32Array(eye));
+  gl.uniform1i(U.u_falloff, Number(falloffEl.value));
+  gl.uniform1f(U.u_range, RANGE);
+  gl.uniform1i(U.u_dirOn, dirOn.checked ? 1 : 0);
+  gl.uniform3fv(U.u_dirDir, new Float32Array(dirDir));
+  gl.uniform3fv(U.u_dirColor, new Float32Array([1.0 * strength, 0.96 * strength, 0.88 * strength]));
+  gl.uniform1i(U.u_ptOn, ptOn.checked ? 1 : 0);
+  gl.uniform3fv(U.u_ptPos, new Float32Array(ptPos));
+  gl.uniform3fv(U.u_ptColor, new Float32Array([9.0 * strength, 7.4 * strength, 4.4 * strength]));
+  gl.uniform1i(U.u_spotOn, spotOn.checked ? 1 : 0);
+  gl.uniform3fv(U.u_spotPos, new Float32Array(spotPos));
+  gl.uniform3fv(U.u_spotDir, new Float32Array(spotDir));
+  gl.uniform3fv(U.u_spotColor, new Float32Array([6.0 * strength, 8.0 * strength, 11.0 * strength]));
+  gl.uniform1i(U.u_hemiOn, hemiOn.checked ? 1 : 0);
+  gl.uniform3fv(U.u_sky, new Float32Array([0.30, 0.44, 0.72]));
+  gl.uniform3fv(U.u_ground, new Float32Array([0.20, 0.17, 0.14]));
+  const ang = Number(spotAngleEl.value) * Math.PI / 180;
+  const pen = Number(penumbraEl.value) / 100;
+  gl.uniform1f(U.u_spotOuter, Math.cos(ang));
+  gl.uniform1f(U.u_spotInner, Math.cos(ang * (1 - pen)));
+  el("sCount").textContent = [dirOn, ptOn, spotOn, hemiOn].filter((c) => c.checked).length + " 盏";
+
+  // 地面
+  gl.uniformMatrix4fv(U.u_mvp, false, viewProj);
+  gl.uniformMatrix4fv(U.u_model, false, modelMatrix(0, 0, 0, 1));
+  gl.uniform3fv(U.u_albedo, new Float32Array([0.62, 0.60, 0.58]));
+  gl.uniform1i(U.u_unlit, 0);
+  gl.bindVertexArray(groundVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  // 球
+  gl.bindVertexArray(sphereVao);
+  for (let i = 0; i < BALLS.length; i++) {
+    const b = BALLS[i];
+    const m = modelMatrix(b.x, b.r, 0, b.r);
+    gl.uniformMatrix4fv(U.u_mvp, false, mul(viewProj, m));
+    gl.uniformMatrix4fv(U.u_model, false, m);
+    gl.uniform3fv(U.u_albedo, new Float32Array(b.color));
+    gl.drawElements(gl.TRIANGLES, sphere.idx.length, gl.UNSIGNED_SHORT, 0);
+  }
+
+  // 光源标记（自发光小球）
+  if (gizmoEl.checked) {
+    gl.uniform1i(U.u_unlit, 1);
+    const marks = [];
+    if (dirOn.checked) marks.push([-dirDir[0] * 14, -dirDir[1] * 14, -dirDir[2] * 14, [1.0, 0.96, 0.7]]);
+    if (ptOn.checked) marks.push([ptPos[0], ptPos[1], ptPos[2], [1.0, 0.85, 0.35]]);
+    if (spotOn.checked) marks.push([spotPos[0], spotPos[1], spotPos[2], [0.55, 0.85, 1.0]]);
+    for (const m of marks) {
+      const mm = modelMatrix(m[0], m[1], m[2], 0.28);
+      gl.uniformMatrix4fv(U.u_mvp, false, mul(viewProj, mm));
+      gl.uniformMatrix4fv(U.u_model, false, mm);
+      gl.uniform3fv(U.u_albedo, new Float32Array(m[3]));
+      gl.drawElements(gl.TRIANGLES, sphere.idx.length, gl.UNSIGNED_SHORT, 0);
+    }
+    gl.uniform1i(U.u_unlit, 0);
+  }
+}
+
+refreshHint([2.6, 2.6, 2.6]);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

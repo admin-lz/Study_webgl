@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · 变换反馈</title>
+  <style>
+    :root {
+      --bg: #0b0d14; --panel: #12151f; --line: #243044;
+      --text: #e8eef8; --muted: #8b97a8; --accent: #9fd4ff; --gold: #f3d27a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 980px; }
+    header b { color: var(--accent); }
+    .layout { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 20px; padding: 20px 24px 40px; align-items: start; }
+    @media (max-width: 1020px) { .layout { grid-template-columns: 1fr; } }
+    canvas#c { width: 100%; height: auto; display: block; background: #05060a; border: 1px solid var(--line); border-radius: 8px; cursor: grab; }
+    canvas#c:active { cursor: grabbing; }
+    canvas#plot { width: 100%; height: auto; display: block; background: #0a0c12; border: 1px solid var(--line); border-radius: 8px; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+    .stage + .stage { margin-top: 16px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre { margin: 8px 0 0; background: #0a0c12; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #d5deea; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; align-items: center; color: var(--muted); font-size: 13px; }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls b { color: var(--text); font-variant-numeric: tabular-nums; min-width: 3em; display: inline-block; }
+    table.stats { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 10px; }
+    table.stats td { padding: 4px 6px; border-bottom: 1px solid #1b2434; }
+    table.stats td:first-child { color: var(--muted); }
+    table.stats td:last-child { text-align: right; font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .note b { color: var(--text); }
+    .warn { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: #1a2230; border: 1px solid #2c3b52; font-size: 13px; }
+    #err { display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212; border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>变换反馈：把顶点着色器的输出存回缓冲，让 GPU 自己迭代状态</h1>
+    <p>
+      顶点着色器正常只有一条出路：光栅化。变换反馈（Transform Feedback）给它开了第二条路 ——
+      <b>把 varying 写进一个 buffer</b>，下次再把这个 buffer 当顶点数据读回来。
+      不需要 compute shader，就能在 GPU 上跑一个"粒子积分"：状态在显存里，CPU 什么都不用管。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <canvas id="c" width="900" height="480"></canvas>
+      <section class="stage" style="margin-top:16px">
+        <h2>读回来的前 512 个粒子（证明状态真的在 GPU 上）</h2>
+        <canvas id="plot" width="880" height="210"></canvas>
+        <div class="controls">
+          <label>重力 <input type="range" id="gravity" min="0" max="24" step="0.1" value="11" style="width:130px" /> <b id="gravityVal">11.0</b></label>
+          <label>风 <input type="range" id="wind" min="0" max="14" step="0.1" value="4" style="width:130px" /> <b id="windVal">4.0</b></label>
+          <label>弹性 <input type="range" id="bounce" min="0" max="0.98" step="0.01" value="0.55" style="width:130px" /> <b id="bounceVal">0.55</b></label>
+          <label>粒子数 <input type="range" id="count" min="500" max="20000" step="500" value="8000" style="width:130px" /> <b id="countVal">8000</b></label>
+          <label>每帧迭代 <input type="range" id="steps" min="1" max="8" step="1" value="2" style="width:130px" /> <b id="stepsVal">2</b></label>
+          <label>dt <input type="range" id="dt" min="0.004" max="0.03" step="0.001" value="0.012" style="width:130px" /> <b id="dtVal">0.012</b></label>
+          <label>点大小 <input type="range" id="size" min="1" max="7" step="0.5" value="2.5" style="width:110px" /> <b id="sizeVal">2.5</b></label>
+          <label><input type="checkbox" id="bySpeed" checked /> 按速度着色（关掉=按寿命）</label>
+          <label><input type="checkbox" id="readback" checked /> 启用 CPU 回读</label>
+        </div>
+        <table class="stats">
+          <tr><td>粒子状态（每粒子 8 float）</td><td id="sState">-</td></tr>
+          <tr><td>显存占用（两块 ping-pong）</td><td id="sMem">-</td></tr>
+          <tr><td>本帧 TF 绘制调用</td><td id="sTf">-</td></tr>
+          <tr><td>CPU 回读</td><td id="sRead">-</td></tr>
+          <tr><td>模拟时间</td><td id="sTime">-</td></tr>
+        </table>
+        <div class="note" id="hint">-</div>
+        <div id="err"></div>
+      </section>
+    </div>
+
+    <div>
+      <section class="stage">
+        <h2>1. 一次"跑在 GPU 上的物理步"</h2>
+        <pre>// 链接之前必须声明要捕获哪些 varying —— 链接之后再调是无效的
+gl.transformFeedbackVaryings(progSim, ["v_pos", "v_vel", "v_life", "v_seed"],
+                             gl.INTERLEAVED_ATTRIBS);
+gl.linkProgram(progSim);
+
+// 把输出缓冲绑到 TF 的 0 号槽（注意和 uniform 的槽位是两套体系）
+gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tf);
+gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, nextBuf);
+gl.enable(gl.RASTERIZER_DISCARD);           // 纯计算：不光栅化，省一大截
+gl.beginTransformFeedback(gl.POINTS);
+gl.drawArrays(gl.POINTS, 0, count);         // 顶点数就是粒子数
+gl.endTransformFeedback();
+gl.disable(gl.RASTERIZER_DISCARD);</pre>
+        <ol class="steps">
+          <li>顶点着色器里照常算物理，把结果写进 <code>out</code>；光栅化被丢掉，只有 varying 被存下来。</li>
+          <li><b>不能读写同一块缓冲。</b>所以必须 ping-pong：这一帧读 A 写 B，下一帧读 B 写 A。</li>
+          <li><code>gl_Position</code> 还是要写（给个 <code>vec4(0.0)</code> 就行），否则行为未定义。</li>
+          <li>捕获的 <code>INTERLEAVED</code> 排布就是 varying 声明顺序：这里是 3+3+1+1 = 8 个 float，正好和输入的顶点布局一致 ——
+            所以同一块 buffer 既能当输出、又能当下一次迭代的输入。</li>
+          <li><b>踩过的坑：</b>TF 输出缓冲不能同时是"当前绑定的 <code>ARRAY_BUFFER</code>"。踩中了 <code>drawArrays</code> 会直接
+            <code>INVALID_OPERATION</code>，而且不报任何别的信息 —— 每次迭代前把 <code>ARRAY_BUFFER</code> 解绑最省心。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>2. 回读为什么要等</h2>
+        <pre>const fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+gl.flush();
+// ... 这一帧里可以做别的事 ...
+gl.clientWaitSync(fence, gl.SYNC_FLUSH_COMMANDS_BIT, 0);
+gl.getBufferSubData(gl.TRANSFORM_FEEDBACK_BUFFER, 0, dst);  // 现在才是最新的</pre>
+        <p class="note">
+          GPU 是异步的：<code>drawArrays</code> 返回时数据还没写出来。同步回读（直接 gl.readPixels / getBufferSubData）
+          会让 CPU 卡在等 GPU，这就是所谓的"同步点"，是性能杀手。所以真实引擎里回读要尽量少、尽量晚。
+          <b>本页默认每帧回读前 512 个粒子</b>只是为了画右下角那张图证明状态在 GPU 上；把开关关掉，粒子照常飞。
+        </p>
+      </section>
+
+      <section class="stage">
+        <h2>3. 什么时候用 TF</h2>
+        <ol class="steps">
+          <li><b>粒子 / 布料 / 群体模拟</b>：状态简单、每个粒子独立、不需要粒子间通信。</li>
+          <li><b>GPU 剔除 / 变形缓存</b>：先跑一遍视锥剔除或骨骼蒙皮，把结果存下来给后续 pass 复用（比如把蒙皮后的顶点喂给阴影 pass）。</li>
+          <li><b>不能做的事</b>：没有随机写入、没有原子操作、没有粒子间通信 —— 这些要等 compute shader（WebGPU / WebGL 没有）。
+            散列表、排序、粒子碰撞这类需求，TF 干不了。</li>
+          <li><b>和 WebGPU 的关系</b>：在 WebGPU 里这件事直接用 compute shader 做，代码更直白（能读写 storage buffer、有 workgroup 共享内存）。
+            但 TF 在 WebGL2 里是唯一的选择，理解了它也就理解了"GPU 上的状态迭代"这件事本身。</li>
+        </ol>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const plot = document.getElementById("plot");
+const px2d = plot.getContext("2d");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => { errBox.style.display = "block"; errBox.textContent += (e.message || e.error) + "\n"; });
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let l = Math.hypot(zx, zy, zz); zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  l = Math.hypot(xx, xy, xz); xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]), 1,
+  ]);
+}
+
+const STRIDE_FLOATS = 8;   // pos(3) vel(3) life(1) seed(1)
+const MAX_COUNT = 20000;
+
+const VS_SIM = `#version 300 es
+in vec3 a_pos;
+in vec3 a_vel;
+in float a_life;
+in float a_seed;
+uniform float u_dt;
+uniform vec3 u_gravity;
+uniform vec3 u_wind;
+uniform float u_bounce;
+uniform float u_time;
+out vec3 v_pos;
+out vec3 v_vel;
+out float v_life;
+out float v_seed;
+
+float hash1(float n) { return fract(sin(n * 78.233) * 43758.5453); }
+vec3 hash3(float n) {
+  return vec3(hash1(n), hash1(n + 17.17), hash1(n + 43.31));
+}
+
+void main() {
+  vec3 p = a_pos, v = a_vel;
+  float life = a_life, seed = a_seed;
+
+  // 一步显式欧拉积分：速度 += 加速度 * dt，位置 += 速度 * dt
+  vec3 acc = u_gravity + u_wind * (0.4 + 0.6 * sin(u_time * 1.3 + seed * 6.2831));
+  v += acc * u_dt;
+  p += v * u_dt;
+
+  // 地面反弹
+  if (p.y < 0.0) {
+    p.y = -p.y;
+    v.y = abs(v.y) * u_bounce;
+    v.xz *= 0.92;
+  }
+  // 四周软墙
+  if (abs(p.x) > 9.0) { p.x = sign(p.x) * 9.0; v.x *= -u_bounce * 0.6; }
+  if (abs(p.z) > 9.0) { p.z = sign(p.z) * 9.0; v.z *= -u_bounce * 0.6; }
+
+  // 寿命到了就在喷口重生：新速度完全由 seed 和当前时间散列出来
+  life += u_dt * 0.16;
+  if (life > 1.0) {
+    life -= 1.0;
+    vec3 r = hash3(seed * 91.7 + u_time * 13.1);
+    p = vec3(0.0, 0.6, 0.0) + (r - 0.5) * 0.5;
+    v = normalize(vec3(r.x - 0.5, abs(r.y - 0.5) * 1.6 + 0.9, r.z - 0.5)) * (5.0 + 7.0 * hash1(seed * 37.1));
+  }
+
+  v_pos = p; v_vel = v; v_life = life; v_seed = seed;
+  gl_Position = vec4(0.0);
+  gl_PointSize = 1.0;
+}`;
+
+const VS_DRAW = `#version 300 es
+in vec3 a_pos;
+in vec3 a_vel;
+in float a_life;
+in float a_seed;
+uniform mat4 u_vp;
+uniform float u_size;
+uniform int u_bySpeed;
+out vec3 v_col;
+out float v_alpha;
+void main() {
+  gl_Position = u_vp * vec4(a_pos, 1.0);
+  // 屏幕空间恒定大小：粒子云散开后也不会"消失成一个点"
+  gl_PointSize = u_size * (0.6 + a_seed * 0.9);
+  float s = length(a_vel);
+  vec3 hot = vec3(1.0, 0.55, 0.15);
+  vec3 cool = vec3(0.25, 0.6, 1.0);
+  v_col = u_bySpeed == 1
+    ? mix(cool, hot, clamp(s / 14.0, 0.0, 1.0))
+    : mix(hot, cool, a_life);
+  v_alpha = 0.35 + 0.65 * (1.0 - a_life);
+}`;
+const FS_DRAW = `#version 300 es
+precision highp float;
+in vec3 v_col;
+in float v_alpha;
+out vec4 outColor;
+void main() {
+  vec2 d = gl_PointCoord * 2.0 - 1.0;
+  float r2 = dot(d, d);
+  if (r2 > 1.0) discard;
+  float a = v_alpha * (1.0 - r2) * 0.9;
+  outColor = vec4(v_col * a, a);
+}`;
+
+function makeSimProg() {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, VS_SIM));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, `#version 300 es
+precision mediump float;
+void main() {}`));
+  // 必须在 link 之前声明要捕获的 varying
+  gl.transformFeedbackVaryings(p, ["v_pos", "v_vel", "v_life", "v_seed"], gl.INTERLEAVED_ATTRIBS);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function makeDrawProg() {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, VS_DRAW));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, FS_DRAW));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+const progSim = makeSimProg();
+const progDraw = makeDrawProg();
+
+// ---- 粒子初始状态 ----
+function makeData(count) {
+  const d = new Float32Array(MAX_COUNT * STRIDE_FLOATS);
+  let s = 12345;
+  const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+  for (let i = 0; i < count; i++) {
+    const o = i * STRIDE_FLOATS;
+    const a = rnd() * 6.2831, sp = 2 + rnd() * 8;
+    d[o + 0] = (rnd() - 0.5) * 0.5;
+    d[o + 1] = 0.6 + rnd() * 0.4;
+    d[o + 2] = (rnd() - 0.5) * 0.5;
+    d[o + 3] = Math.cos(a) * sp * 0.6;
+    d[o + 4] = 6 + rnd() * 8;
+    d[o + 5] = Math.sin(a) * sp * 0.6;
+    d[o + 6] = rnd();          // life
+    d[o + 7] = rnd();          // seed
+  }
+  return d;
+}
+const stateBufs = [gl.createBuffer(), gl.createBuffer()];
+for (const b of stateBufs) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, MAX_COUNT * STRIDE_FLOATS * 4, gl.DYNAMIC_COPY);
+}
+const initial = makeData(MAX_COUNT);
+for (const b of stateBufs) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, initial);
+}
+
+function makeVao(buf, prog, forSim) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  const put = (name, size, offset) => {
+    const loc = gl.getAttribLocation(prog, name);
+    if (loc < 0) return;
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, STRIDE_FLOATS * 4, offset * 4);
+  };
+  put("a_pos", 3, 0);
+  put("a_vel", 3, 3);
+  put("a_life", 1, 6);
+  put("a_seed", 1, 7);
+  gl.bindVertexArray(null);
+  return vao;
+}
+const simVaos = [makeVao(stateBufs[0], progSim), makeVao(stateBufs[1], progSim)];
+const drawVaos = [makeVao(stateBufs[0], progDraw), makeVao(stateBufs[1], progDraw)];
+
+const tf = gl.createTransformFeedback();
+const readDst = new Float32Array(512 * STRIDE_FLOATS);
+
+const el = (id) => document.getElementById(id);
+const gravityEl = el("gravity"), windEl = el("wind"), bounceEl = el("bounce"), countEl = el("count");
+const stepsEl = el("steps"), dtEl = el("dt"), sizeEl = el("size");
+const bySpeedEl = el("bySpeed"), readbackEl = el("readback");
+const uS = {};
+for (const n of ["u_dt", "u_gravity", "u_wind", "u_bounce", "u_time"]) uS[n] = gl.getUniformLocation(progSim, n);
+const uD = {};
+for (const n of ["u_vp", "u_size", "u_bySpeed"]) uD[n] = gl.getUniformLocation(progDraw, n);
+
+const cam = { yaw: 0.7, pitch: 0.34, dist: 24 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.005;
+  cam.pitch = Math.max(0.08, Math.min(1.35, cam.pitch - (e.clientY - lastY) * 0.004));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+let src = 0, simTime = 0, lastReadFrame = -1, readOK = false;
+
+function drawPlot(positions) {
+  const W = plot.width, H = plot.height;
+  px2d.fillStyle = "#0a0c12"; px2d.fillRect(0, 0, W, H);
+  const pad = 24, size = Math.min(H - pad * 2, 150);
+  const x0 = 16, y0 = H - pad;
+  px2d.strokeStyle = "#232e42";
+  px2d.strokeRect(x0 + 0.5, y0 - size + 0.5, size, size);
+  px2d.fillStyle = "#8b97a8";
+  px2d.font = "11px monospace";
+  px2d.fillText("XZ 平面（64 个粒子/行）", x0, 16);
+  for (let i = 0; i < positions.length / STRIDE_FLOATS; i++) {
+    const o = i * STRIDE_FLOATS;
+    const x = positions[o], y = positions[o + 1], z = positions[o + 2];
+    if (!isFinite(x) || !isFinite(y) || !isFinite(z)) continue;
+    const sx = x0 + (x / 10 * 0.5 + 0.5) * size;
+    const sy = y0 - (z / 10 * 0.5 + 0.5) * size;
+    const h = Math.max(0, Math.min(1, y / 12));
+    px2d.fillStyle = `rgba(${Math.round(120 + 135 * h)}, ${Math.round(160 - 60 * h)}, ${Math.round(255 - 200 * h)}, 0.9)`;
+    px2d.fillRect(sx, sy, 2, 2);
+  }
+  // 高度分布直方图
+  const hx = x0 + size + 30, hw = W - hx - 20;
+  const bins = new Array(24).fill(0);
+  let n = 0;
+  for (let i = 0; i < positions.length / STRIDE_FLOATS; i++) {
+    const y = positions[i * STRIDE_FLOATS + 1];
+    if (!isFinite(y)) continue;
+    const b = Math.max(0, Math.min(23, Math.floor(y / 12 * 24)));
+    bins[b]++; n++;
+  }
+  px2d.fillStyle = "#8b97a8";
+  px2d.fillText("高度分布", hx, 16);
+  const maxBin = Math.max(1, ...bins);
+  for (let b = 0; b < 24; b++) {
+    const bw = hw / 24;
+    const bh = (bins[b] / maxBin) * (size * 0.9);
+    px2d.fillStyle = "#4b7fa8";
+    px2d.fillRect(hx + b * bw + 1, y0 - bh, bw - 2, bh);
+  }
+  px2d.strokeStyle = "#232e42";
+  px2d.strokeRect(hx + 0.5, y0 - size + 0.5, hw, size);
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const W = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const H = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+
+  const gravity = Number(gravityEl.value);
+  const wind = Number(windEl.value);
+  const bounce = Number(bounceEl.value);
+  const count = Number(countEl.value);
+  const steps = Number(stepsEl.value);
+  const dt = Number(dtEl.value);
+  const size = Number(sizeEl.value);
+  el("gravityVal").textContent = gravity.toFixed(1);
+  el("windVal").textContent = wind.toFixed(1);
+  el("bounceVal").textContent = bounce.toFixed(2);
+  el("countVal").textContent = count;
+  el("stepsVal").textContent = steps;
+  el("dtVal").textContent = dt.toFixed(3);
+  el("sizeVal").textContent = size.toFixed(1);
+
+  // ---------- TF 迭代 ----------
+  // 关键：当前 ARRAY_BUFFER 绑定不能同时是本次 TF 的输出缓冲，
+  // 否则 drawArrays 会直接 INVALID_OPERATION（SwiftShader/ANGLE 实测如此）。
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  gl.useProgram(progSim);
+  gl.uniform3f(uS.u_gravity, 0, -gravity, 0);
+  gl.uniform1f(uS.u_bounce, bounce);
+  gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tf);
+  gl.enable(gl.RASTERIZER_DISCARD);
+  for (let s = 0; s < steps; s++) {
+    const dst = 1 - src;
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, stateBufs[dst]);
+    gl.uniform1f(uS.u_dt, dt);
+    gl.uniform3f(uS.u_wind, wind, 0, wind * 0.35);
+    gl.uniform1f(uS.u_time, simTime);
+    gl.bindVertexArray(simVaos[src]);
+    gl.beginTransformFeedback(gl.POINTS);
+    gl.drawArrays(gl.POINTS, 0, count);
+    gl.endTransformFeedback();
+    simTime += dt;
+    src = dst;
+  }
+  gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, null);
+  gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+  gl.disable(gl.RASTERIZER_DISCARD);
+
+  // ---------- 绘制 ----------
+  const eye = [
+    Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    2 + Math.sin(cam.pitch) * cam.dist,
+    Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const vp = mul(perspective(Math.PI / 4, W / H, 0.2, 200), lookAt(eye, [0, 2.5, 0], [0, 1, 0]));
+  gl.viewport(0, 0, W, H);
+  gl.clearColor(0.018, 0.02, 0.03, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE);       // 加法混合：粒子叠起来更亮
+  gl.useProgram(progDraw);
+  gl.uniformMatrix4fv(uD.u_vp, false, vp);
+  gl.uniform1f(uD.u_size, size);
+  gl.uniform1i(uD.u_bySpeed, bySpeedEl.checked ? 1 : 0);
+  gl.bindVertexArray(drawVaos[src]);
+  gl.drawArrays(gl.POINTS, 0, count);
+  gl.disable(gl.BLEND);
+
+  // ---------- 回读（要等 fence） ----------
+  let readText = "未启用（画面照常，因为状态本来就在 GPU 上）";
+  if (readbackEl.checked) {
+    const fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+    gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, stateBufs[src]);
+    const st = gl.clientWaitSync(fence, gl.SYNC_FLUSH_COMMANDS_BIT, 0);
+    gl.getBufferSubData(gl.TRANSFORM_FEEDBACK_BUFFER, 0, readDst, 0, readDst.length);
+    gl.deleteSync(fence);
+    gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, null);
+    drawPlot(readDst);
+    readText = "前 512 个粒子，共 " + readDst.byteLength + " B" + (st === gl.TIMEOUT_EXPIRED ? "（超时，可能拿到旧数据）" : "（fence 已通过）");
+    readOK = true;
+  } else if (readOK) {
+    px2d.fillStyle = "#0a0c12"; px2d.fillRect(0, 0, plot.width, plot.height);
+    px2d.fillStyle = "#5a6a80"; px2d.font = "12px monospace";
+    px2d.fillText("回读已关闭 —— 粒子照样在 GPU 上飞，只是 CPU 不再看", 16, 24);
+  }
+
+  el("sState").textContent = count + " × 8 float = " + (count * 32 / 1024).toFixed(0) + " KB";
+  el("sMem").textContent = (MAX_COUNT * 32 * 2 / 1048576).toFixed(1) + " MB";
+  el("sTf").textContent = steps + " 次 × " + count + " 顶点";
+  el("sRead").textContent = readText;
+  el("sTime").textContent = simTime.toFixed(2) + " s";
+  el("hint").textContent = readbackEl.checked
+    ? "每帧一次 fence + getBufferSubData 就是一个同步点：CPU 要等 GPU 把这一帧算完。真实项目里这个开关要尽量关着。"
+    : "关掉回读后，CPU 每帧只发命令、不看结果 —— 这才是 TF 的正确用法：状态和迭代全留在显存里。";
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

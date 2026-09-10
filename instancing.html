@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>实例化：一次 draw 画一万株草</title>
+  <style>
+    :root {
+      --bg: #0b0d14; --panel: #12151f; --line: #243044;
+      --text: #e8eef8; --muted: #8b97a8; --accent: #9fd4ff; --gold: #f3d27a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 980px; }
+    header b { color: var(--accent); }
+    .layout { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 20px; padding: 20px 24px 40px; align-items: start; }
+    @media (max-width: 1020px) { .layout { grid-template-columns: 1fr; } }
+    canvas#c { width: 100%; height: auto; display: block; background: #05060a; border: 1px solid var(--line); border-radius: 8px; cursor: grab; }
+    canvas#c:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+    .stage + .stage { margin-top: 16px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre { margin: 8px 0 0; background: #0a0c12; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #d5deea; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; align-items: center; color: var(--muted); font-size: 13px; }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls b { color: var(--text); font-variant-numeric: tabular-nums; min-width: 3.4em; display: inline-block; }
+    table.stats { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 10px; }
+    table.stats td { padding: 4px 6px; border-bottom: 1px solid #1b2434; }
+    table.stats td:first-child { color: var(--muted); }
+    table.stats td:last-child { text-align: right; font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .note b { color: var(--text); }
+    .warn { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: #1a2230; border: 1px solid #2c3b52; font-size: 13px; }
+    #err { display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212; border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>实例化：把「N 个物体」变成「1 次 draw + N 份差异」</h1>
+    <p>
+      一万株草，几何完全相同，只有位置、朝向、高低、颜色不一样。逐个 draw 就是一万次 JS→GL 的往返；
+      把它们那份<b>「差异」</b>放进缓冲，让顶点着色器自己按实例号去取，就只剩一次 <code>drawElementsInstanced</code>。
+      本页三种写法可以随时切换 —— <b>画面像素级相同</b>，差别全在 CPU 提交和 GPU 取数方式上。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <canvas id="c" width="720" height="380"></canvas>
+      <section class="stage" style="margin-top:16px">
+        <div class="controls">
+          <label>画法
+            <select id="mode">
+              <option value="0">逐个 draw（N 次）</option>
+              <option value="1" selected>实例化属性（1 次）</option>
+              <option value="2">数据纹理（1 次）</option>
+            </select>
+          </label>
+          <label>显示
+            <select id="debug">
+              <option value="0" selected>光照</option>
+              <option value="1">实例配色</option>
+              <option value="2">法线</option>
+              <option value="3">每株相位</option>
+            </select>
+          </label>
+          <label>株数 <input type="range" id="count" min="200" max="20000" step="200" value="9000" style="width:140px" /> <b id="countVal">9000</b></label>
+          <label>风 <input type="range" id="wind" min="0" max="1.2" step="0.02" value="0.45" style="width:110px" /> <b id="windVal">0.45</b></label>
+          <label>风向 <input type="range" id="windDir" min="0" max="6.28" step="0.02" value="0.6" style="width:110px" /> <b id="windDirVal">0.60</b></label>
+          <label>叶宽 <input type="range" id="bladeW" min="0.01" max="0.09" step="0.002" value="0.034" style="width:110px" /> <b id="bladeWVal">0.034</b></label>
+        </div>
+        <table class="stats">
+          <tr><td>draw call 次数</td><td id="sDraws">-</td></tr>
+          <tr><td>实际画的株数</td><td id="sInst">-</td></tr>
+          <tr><td>三角形提交</td><td id="sTris">-</td></tr>
+          <tr><td>顶点着色器调用</td><td id="sVs">-</td></tr>
+          <tr><td>实例数据显存</td><td id="sMem">-</td></tr>
+          <tr><td>JS 提交 draw 的 CPU 时间（平滑）</td><td id="sCpu">-</td></tr>
+        </table>
+        <div class="warn" id="warn">-</div>
+        <div id="err"></div>
+      </section>
+    </div>
+
+    <div>
+      <section class="stage">
+        <h2>1. 实例化只加了两样东西</h2>
+        <pre>// ① 告诉 GL：这个 attribute 不是"每顶点取一次"，
+//    而是"每实例取一次"（divisor = 1）
+gl.vertexAttribPointer(aXform, 4, gl.FLOAT, false, 32, 0);
+gl.vertexAttribDivisor(aXform, 1);   // ← 关键就这一行
+
+// ② 一次 draw 画 N 个实例
+gl.drawElementsInstanced(gl.TRIANGLES, 18, gl.UNSIGNED_SHORT, 0, N);</pre>
+        <ol class="steps">
+          <li><b>几何只上传一份。</b> 一株草 = 8 个顶点 / 6 个三角形，显存里只有这一份；
+            一万株不需要一万份顶点，只需要一万份 <b>32 字节</b>的「差异」（位置、朝向、高度、颜色、相位）。</li>
+          <li><b>draw call 从 N 变 1。</b> 每个 draw call 在驱动里都有固定开销：状态校验、命令打包、提交到 GPU。
+            N=10000 时这个开销通常是毫秒级，而 GPU 本身可能只花了几十微秒 —— 也就是 <b>CPU 成了瓶颈</b>。</li>
+          <li><b>顶点着色器照常跑 N×8 次。</b> 实例化省掉的是"提交"，<b>不是</b>"计算"：
+            顶点处理和光栅化的工作量一个不少，实例化不是 LOD，也不是剔除。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>2. 同一个「差异」，三种取法</h2>
+        <pre>// A. 逐个 draw：差异走 uniform（每画一株改一次 uniform）
+for (i = 0; i &lt; N; i++) {
+  gl.uniform4fv(uXform, data, i*8, 4);
+  gl.uniform4fv(uTint,  data, i*8+4, 4);
+  gl.drawElements(TRIANGLES, 18, UNSIGNED_SHORT, 0);
+}
+
+// B. 实例属性：差异走 divisor=1 的 attribute
+layout(location = 1) in vec4 i_xform;
+// C. 数据纹理：差异走 texelFetch，用 gl_InstanceID 当索引
+int i0 = gl_InstanceID * 2;
+vec4 X = texelFetch(u_inst, ivec2(i0 % u_w, i0 / u_w), 0);
+vec4 T = texelFetch(u_inst, ivec2((i0+1) % u_w, (i0+1) / u_w), 0);</pre>
+        <p class="note">
+          三种写法在本页<b>画出来的像素完全一样</b>（同一份数据，只是搬运方式不同），但成本曲线不一样：<br />
+          A 的 CPU 开销 ∝ N，一万一株就废了；B 是现在的主流，属性带宽高、延迟低；<br />
+          C 是 WebGL1 时代的兜底（那时没有 divisor），现在依然有用 —— 实例数上百万时，一张纹理比一堆 attribute 更好管理，
+          代价是取数要过纹理单元，而且<b>显存会被行宽padding 撑大</b>。
+        </p>
+      </section>
+
+      <section class="stage">
+        <h2>3. 实例化解决不了什么</h2>
+        <ol class="steps">
+          <li><b>每个实例换贴图 / 换 program。</b> 实例化是"一次 draw 一个状态"，所以同一次 draw 里只能共用同一套 shader 和纹理。
+            要按实例换贴图，得靠纹理数组 / 图集 / bindless，或者 <code>multiDrawElements</code> 分组。</li>
+          <li><b>剔除。</b> 实例在 VS 里只是被搬到世界空间，被裁掉的实例照样跑完整个顶点阶段。
+            要真省下来，得在 CPU 侧把可见实例挑出来重排缓冲（或者用 VS 把不可见的顶点退化，但那只省光栅化）。</li>
+          <li><b>排序 / 透明。</b> 实例在缓冲里的顺序就是绘制顺序，透明混合要正确就得按深度重排整份实例数据，每帧重传。</li>
+          <li><b>阴影。</b> 阴影 pass 要把同一份实例缓冲再画一遍（换灯光 VP），所以实例化对阴影管线的收益是翻倍的 —— 这也是它几乎必用的原因。</li>
+        </ol>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => { errBox.style.display = "block"; errBox.textContent += (e.message || e.error) + "\n"; });
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let l = Math.hypot(zx, zy, zz); zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  l = Math.hypot(xx, xy, xz); xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]), 1,
+  ]);
+}
+
+// ---------------------------------------------------------------- 着色器
+// 叶片的 VS 由三段拼出来：公共头 + 「差异从哪来」 + 公共体
+const VS_HEAD = `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 a_pos;        // x = 叶宽方向(-1..1)，y = 沿叶高(0..1)
+uniform mat4 u_vp;
+uniform float u_time;
+uniform float u_wind;
+uniform float u_windDir;
+uniform float u_bladeW;
+out vec3 v_tint;
+out vec3 v_n;
+out vec3 v_world;
+out float v_t;
+out float v_phase;
+`;
+
+const VS_BODY = `
+vec2 rot2(vec2 p, float a) {
+  float c = cos(a), s = sin(a);
+  return vec2(c * p.x - s * p.y, s * p.x + c * p.y);
+}
+void main() {
+  GET
+  float t = a_pos.y;
+  float height = X.w;
+  // 风：t² 保证根部钉死，叶尖摆得最厉害
+  float gust = 0.55 + 0.45 * sin(u_time * 0.55 + X.x * 0.35 + X.y * 0.28);
+  float sway = sin(u_time * 1.7 + T.w) * 0.6 + sin(u_time * 2.9 + T.w * 1.7) * 0.25;
+  vec2 wdir = vec2(cos(u_windDir), sin(u_windDir));
+  float bend = u_wind * gust * sway * t * t * height;
+
+  vec3 local = vec3(a_pos.x * u_bladeW, t * height, 0.0);
+  local.xz = rot2(local.xz, X.z);
+  vec3 wp = vec3(X.x, 0.0, X.y) + local + vec3(wdir.x, 0.0, wdir.y) * bend;
+
+  v_t = t;
+  v_tint = T.xyz;
+  // 草叶细到没有真实法线，用"朝上偏一点"的假法线，正反面都不会黑
+  v_n = normalize(vec3(sin(X.z) * 0.55, 1.0, cos(X.z) * 0.55));
+  v_phase = T.w;
+  v_world = wp;
+  gl_Position = u_vp * vec4(wp, 1.0);
+}`;
+
+const DECL_ATTR = `
+layout(location = 1) in vec4 i_xform;
+layout(location = 2) in vec4 i_tint;
+`;
+const GET_ATTR = `vec4 X = i_xform; vec4 T = i_tint;`;
+
+const DECL_UNIFORM = `
+uniform vec4 i_xform;
+uniform vec4 i_tint;
+`;
+const GET_UNIFORM = `vec4 X = i_xform; vec4 T = i_tint;`;
+
+const DECL_TEX = `
+uniform sampler2D u_inst;
+uniform int u_w;
+`;
+const GET_TEX = `int i0 = gl_InstanceID * 2;
+  vec4 X = texelFetch(u_inst, ivec2(i0 % u_w, i0 / u_w), 0);
+  vec4 T = texelFetch(u_inst, ivec2((i0 + 1) % u_w, (i0 + 1) / u_w), 0);`;
+
+const makeVS = (decl, get) => VS_HEAD + decl + VS_BODY.replace("GET", get);
+
+const FS = `#version 300 es
+precision highp float;
+in vec3 v_tint;
+in vec3 v_n;
+in vec3 v_world;
+in float v_t;
+in float v_phase;
+uniform vec3 u_eye;
+uniform int u_debug;
+out vec4 outColor;
+
+vec3 sky(vec3 rd) {
+  return mix(vec3(0.30, 0.42, 0.62), vec3(0.10, 0.22, 0.45), clamp(rd.y * 1.6 + 0.18, 0.0, 1.0));
+}
+
+void main() {
+  vec3 n = normalize(v_n);
+  vec3 rd = normalize(v_world - u_eye);
+
+  if (u_debug == 1) { outColor = vec4(pow(v_tint, vec3(1.0 / 2.2)), 1.0); return; }
+  if (u_debug == 2) { outColor = vec4(n * 0.5 + 0.5, 1.0); return; }
+  if (u_debug == 3) {
+    float p = 0.5 + 0.5 * sin(v_phase);
+    outColor = vec4(p, 0.35 + 0.5 * p * p, 1.0 - p, 1.0);
+    return;
+  }
+
+  vec3 L = normalize(vec3(0.50, 0.80, 0.35));
+  float dif = clamp(dot(n, L), 0.0, 1.0);
+  float amb = 0.42 + 0.30 * n.y;
+  float ao = 0.42 + 0.58 * v_t;                 // 根部被周围叶片遮住
+  float back = pow(max(dot(rd, L), 0.0), 1.6);   // 逆光时叶片透光
+
+  vec3 col = v_tint * (amb * 0.55 + 0.95 * dif) * ao
+           + v_tint * back * 0.55 * (0.4 + 0.6 * v_t)
+           + vec3(0.10, 0.14, 0.02) * v_t * v_t * dif;   // 叶尖偏黄绿
+  float dist = length(v_world - u_eye);
+  col = mix(col, sky(rd), clamp(1.0 - exp(-dist * 0.030), 0.0, 1.0));
+  outColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
+}`;
+
+const GROUND_VS = `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 a_xz;
+uniform mat4 u_vp;
+out vec3 v_world;
+void main() {
+  v_world = vec3(a_xz.x, -0.012, a_xz.y);
+  gl_Position = u_vp * vec4(v_world, 1.0);
+}`;
+
+const GROUND_FS = `#version 300 es
+precision highp float;
+in vec3 v_world;
+uniform vec3 u_eye;
+out vec4 outColor;
+vec3 sky(vec3 rd) {
+  return mix(vec3(0.30, 0.42, 0.62), vec3(0.10, 0.22, 0.45), clamp(rd.y * 1.6 + 0.18, 0.0, 1.0));
+}
+float hash(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+}
+void main() {
+  vec2 q = floor(v_world.xz * 6.0);
+  float n = hash(q) * 0.6 + hash(q * 0.37) * 0.4;
+  vec3 soil = mix(vec3(0.085, 0.115, 0.070), vec3(0.16, 0.19, 0.10), n);
+  vec3 rd = normalize(v_world - u_eye);
+  float dist = length(v_world - u_eye);
+  vec3 col = mix(soil, sky(rd), clamp(1.0 - exp(-dist * 0.035), 0.0, 1.0));
+  outColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
+}`;
+
+const progAttr = link(makeVS(DECL_ATTR, GET_ATTR), FS);
+const progLoop = link(makeVS(DECL_UNIFORM, GET_UNIFORM), FS);
+const progTex = link(makeVS(DECL_TEX, GET_TEX), FS);
+const progGround = link(GROUND_VS, GROUND_FS);
+
+const NAMES = ["u_vp", "u_time", "u_wind", "u_windDir", "u_bladeW", "u_inst", "u_w", "u_eye", "u_debug", "i_xform", "i_tint"];
+function locs(p) { const o = {}; for (const n of NAMES) o[n] = gl.getUniformLocation(p, n); return o; }
+const uA = locs(progAttr), uL = locs(progLoop), uT = locs(progTex);
+const uG = { u_vp: gl.getUniformLocation(progGround, "u_vp"), u_eye: gl.getUniformLocation(progGround, "u_eye") };
+
+// ---------------------------------------------------------------- 一株草
+const SEG = 3;
+const bladePos = [], bladeIdx = [];
+for (let i = 0; i <= SEG; i++) {
+  const t = i / SEG, taper = 1 - 0.88 * t;
+  bladePos.push(-taper, t, taper, t);
+}
+for (let i = 0; i < SEG; i++) {
+  const a = i * 2, b = a + 1, c = a + 2, d = a + 3;
+  bladeIdx.push(a, b, c, b, d, c);
+}
+const IDX_COUNT = bladeIdx.length;        // 18
+const VERTS_PER_INST = bladePos.length / 2;
+
+const vaoInst = gl.createVertexArray();
+const vaoPlain = gl.createVertexArray();
+const bladeBuf = gl.createBuffer();
+const idxBuf = gl.createBuffer();
+const instBuf = gl.createBuffer();
+
+gl.bindBuffer(gl.ARRAY_BUFFER, bladeBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(bladePos), gl.STATIC_DRAW);
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(bladeIdx), gl.STATIC_DRAW);
+
+for (const vao of [vaoInst, vaoPlain]) {
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bladeBuf);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+}
+// 实例属性只装在 vaoInst 上（divisor 是 VAO 的一部分状态）
+gl.bindVertexArray(vaoInst);
+gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+gl.enableVertexAttribArray(1);
+gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 0);
+gl.vertexAttribDivisor(1, 1);
+gl.enableVertexAttribArray(2);
+gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 32, 16);
+gl.vertexAttribDivisor(2, 1);
+gl.bindVertexArray(null);
+
+// 地面：一个大四边形（注意：索引缓冲要单独一个，别覆盖草的）
+const groundVao = gl.createVertexArray();
+const groundBuf = gl.createBuffer();
+const groundIdxBuf = gl.createBuffer();
+gl.bindVertexArray(groundVao);
+gl.bindBuffer(gl.ARRAY_BUFFER, groundBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-40, -40, 40, -40, 40, 40, -40, 40]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, groundIdxBuf);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 0, 2, 3]), gl.STATIC_DRAW);
+gl.bindVertexArray(null);
+
+// ---------------------------------------------------------------- 实例数据
+const FIELD_R = 4.2;
+const TEX_W = 512;                        // 每行正好放 256 个实例（每实例 2 个 texel）
+const instTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, instTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+function hash1(n) {
+  let x = (n ^ 0x2545f491) >>> 0;
+  x = Math.imul(x ^ (x >>> 16), 0x7feb352d) >>> 0;
+  x = Math.imul(x ^ (x >>> 15), 0x846ca68b) >>> 0;
+  return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+}
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+let instData = null;      // 给 buffer / uniform 用：每实例 8 个 float
+let texData = null;       // 给数据纹理用（补到整行）
+let texH = 0, curCount = 0;
+
+function buildInstances(n) {
+  const rows = Math.ceil(Math.sqrt(n));
+  instData = new Float32Array(n * 8);
+  texH = Math.max(1, Math.ceil((n * 2) / TEX_W));
+  texData = new Float32Array(TEX_W * texH * 4);
+
+  for (let i = 0; i < n; i++) {
+    const col = i % rows, row = (i / rows) | 0;
+    const j1 = hash1(i * 5 + 1), j2 = hash1(i * 5 + 2), j3 = hash1(i * 5 + 3);
+    const j4 = hash1(i * 5 + 4), j5 = hash1(i * 5 + 5);
+
+    // 方盘 → 圆盘：四角不浪费，密度更均匀
+    let u = ((col + 0.5 + (j1 - 0.5) * 0.9) / rows) * 2 - 1;
+    let v = ((row + 0.5 + (j2 - 0.5) * 0.9) / rows) * 2 - 1;
+    const r = Math.hypot(u, v);
+    if (r > 1e-6) { const s = Math.min(r, 1) / r; u *= s; v *= s; }
+    const x = u * FIELD_R, z = v * FIELD_R;
+
+    const height = 0.30 + 0.36 * j3 * j3;                       // 大部分矮，少数高
+    const rot = j4 * Math.PI * 2;                                // 朝向随机
+    const phase = j5 * Math.PI * 2;                              // 摆动相位随机
+
+    // 颜色：大尺度斑块 + 每株抖动，比较像真草地
+    const patch = clamp01(0.5 + 0.30 * Math.sin(x * 0.55) * Math.cos(z * 0.48) + 0.22 * Math.sin((x + z) * 0.31));
+    const k = clamp01(0.30 + 0.55 * patch + 0.30 * (j5 - 0.5));
+    const bright = 0.78 + 0.44 * hash1(i * 7 + 11);      // 每株的明暗抖动，避免"一片死绿"
+    const cr = (0.14 + 0.16 * k) * bright, cg = (0.36 + 0.30 * k) * bright, cb = (0.05 + 0.07 * k) * bright;
+
+    const o = i * 8;
+    instData[o] = x; instData[o + 1] = z; instData[o + 2] = rot; instData[o + 3] = height;
+    instData[o + 4] = cr; instData[o + 5] = cg; instData[o + 6] = cb; instData[o + 7] = phase;
+    texData.set(instData.subarray(o, o + 8), i * 8);
+  }
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, instData, gl.DYNAMIC_DRAW);
+
+  gl.bindTexture(gl.TEXTURE_2D, instTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, TEX_W, texH, 0, gl.RGBA, gl.FLOAT, texData);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+  curCount = n;
+  return { bufBytes: n * 32, texBytes: TEX_W * texH * 16 };
+}
+let memBuf = 0, memTex = 0;
+
+// ---------------------------------------------------------------- 交互
+const el = (id) => document.getElementById(id);
+const modeEl = el("mode"), debugEl = el("debug"), countEl = el("count");
+const windEl = el("wind"), dirEl = el("windDir"), bwEl = el("bladeW");
+const cam = { yaw: 0.7, pitch: 0.30, dist: 7.6 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.006;
+  cam.pitch = Math.max(0.04, Math.min(1.15, cam.pitch - (e.clientY - lastY) * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+});
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  cam.dist = Math.max(2.2, Math.min(20, cam.dist * (1 + Math.sign(e.deltaY) * 0.08)));
+}, { passive: false });
+
+let cpuEMA = 0, frames = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  frames++;
+  const mode = Number(modeEl.value);
+  const debug = Number(debugEl.value);
+  const count = Number(countEl.value);
+  const wind = Number(windEl.value);
+  const windDir = Number(dirEl.value);
+  const bladeW = Number(bwEl.value);
+  const t = now / 1000;
+  el("countVal").textContent = count;
+  el("windVal").textContent = wind.toFixed(2);
+  el("windDirVal").textContent = windDir.toFixed(2);
+  el("bladeWVal").textContent = bladeW.toFixed(3);
+
+  if (count !== curCount) {
+    const m = buildInstances(count);
+    memBuf = m.bufBytes; memTex = m.texBytes;
+  }
+
+  const W = canvas.width, H = canvas.height;
+  const eye = [
+    Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    0.55 + Math.sin(cam.pitch) * cam.dist,
+    Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const vp = mul(perspective(Math.PI / 3.2, W / H, 0.05, 120), lookAt(eye, [0, 0.28, 0], [0, 1, 0]));
+
+  gl.viewport(0, 0, W, H);
+  gl.enable(gl.DEPTH_TEST);
+  gl.clearColor(0.578, 0.671, 0.808, 1.0);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  gl.useProgram(progGround);
+  gl.uniformMatrix4fv(uG.u_vp, false, vp);
+  gl.uniform3fv(uG.u_eye, eye);
+  gl.bindVertexArray(groundVao);
+  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+
+  const setShared = (u) => {
+    gl.uniformMatrix4fv(u.u_vp, false, vp);
+    gl.uniform1f(u.u_time, t);
+    gl.uniform1f(u.u_wind, wind);
+    gl.uniform1f(u.u_windDir, windDir);
+    gl.uniform1f(u.u_bladeW, bladeW);
+  };
+
+  const LOOP_CAP = 2000;
+  const t0 = performance.now();
+  let draws = 0, drawn = 0;
+  if (mode === 0) {
+    gl.useProgram(progLoop);
+    setShared(uL);
+    gl.bindVertexArray(vaoPlain);
+    const n = Math.min(count, LOOP_CAP);
+    for (let i = 0; i < n; i++) {
+      gl.uniform4fv(uL.i_xform, instData, i * 8, 4);
+      gl.uniform4fv(uL.i_tint, instData, i * 8 + 4, 4);
+      gl.drawElements(gl.TRIANGLES, IDX_COUNT, gl.UNSIGNED_SHORT, 0);
+    }
+    draws = n; drawn = n;
+  } else if (mode === 1) {
+    gl.useProgram(progAttr);
+    setShared(uA);
+    gl.uniform3fv(uA.u_eye, eye);
+    gl.uniform1i(uA.u_debug, debug);
+    gl.bindVertexArray(vaoInst);
+    gl.drawElementsInstanced(gl.TRIANGLES, IDX_COUNT, gl.UNSIGNED_SHORT, 0, count);
+    draws = 1; drawn = count;
+  } else {
+    gl.useProgram(progTex);
+    setShared(uT);
+    gl.uniform3fv(uT.u_eye, eye);
+    gl.uniform1i(uT.u_debug, debug);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, instTex);
+    gl.uniform1i(uT.u_inst, 0);
+    gl.uniform1i(uT.u_w, TEX_W);
+    gl.bindVertexArray(vaoPlain);
+    gl.drawElementsInstanced(gl.TRIANGLES, IDX_COUNT, gl.UNSIGNED_SHORT, 0, count);
+    draws = 1; drawn = count;
+  }
+  gl.bindVertexArray(null);
+  const cpu = performance.now() - t0;
+  cpuEMA = frames < 8 ? cpu : cpuEMA * 0.9 + cpu * 0.1;
+
+  el("sDraws").textContent = draws + " 次";
+  el("sInst").textContent = drawn + " 株" + (mode === 0 && count > LOOP_CAP ? "（上限 " + LOOP_CAP + "）" : "");
+  el("sTris").textContent = ((drawn * IDX_COUNT) / 3 / 1000).toFixed(0) + " K";
+  el("sVs").textContent = ((drawn * VERTS_PER_INST) / 1000).toFixed(0) + " K";
+  el("sMem").textContent = mode === 0 ? "uniform（还在 JS 里）"
+    : mode === 1 ? (memBuf / 1024).toFixed(0) + " KB（1 个实例缓冲）"
+      : (memTex / 1024).toFixed(0) + " KB（" + TEX_W + "×" + texH + " RGBA32F）";
+  el("sCpu").textContent = cpuEMA.toFixed(2) + " ms";
+
+  const wn = el("warn");
+  wn.textContent = mode === 0
+    ? "逐个 draw：每株一次 uniform 更新 + 一次 draw call。为了不把页面卡死，这个模式最高只跑 " + LOOP_CAP +
+      " 株 —— 而实例化模式可以跑满 " + count + " 株，CPU 时间反而更短。这就是 draw call 的固定开销。"
+    : mode === 1
+      ? "实例属性：一次 draw 提交，差异通过 divisor=1 的 attribute 按实例喂给 VS。这是 WebGL2 / 现代 API 的标准做法。"
+      : "数据纹理：一次 draw 提交，差异通过 texelFetch 按 gl_InstanceID 取。注意显存：纹理按行 512 texel 补齐，"
+        + "实例数不是 256 的整数倍时会浪费一点（这里 " + (memTex / 1024).toFixed(0) + " KB vs 缓冲 " + (memBuf / 1024).toFixed(0) + " KB）。";
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

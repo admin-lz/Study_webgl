@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · 骨骼蒙皮</title>
+  <style>
+    :root {
+      --bg: #0b0d14; --panel: #12151f; --line: #243044;
+      --text: #e8eef8; --muted: #8b97a8; --accent: #9fd4ff; --gold: #f3d27a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 980px; }
+    header b { color: var(--accent); }
+    .layout { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 20px; padding: 20px 24px 40px; align-items: start; }
+    @media (max-width: 1020px) { .layout { grid-template-columns: 1fr; } }
+    canvas { width: 100%; height: auto; display: block; background: #08090e; border: 1px solid var(--line); border-radius: 8px; cursor: grab; }
+    canvas:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+    .stage + .stage { margin-top: 16px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre { margin: 8px 0 0; background: #0a0c12; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #d5deea; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; align-items: center; color: var(--muted); font-size: 13px; }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls b { color: var(--text); font-variant-numeric: tabular-nums; min-width: 2.8em; display: inline-block; }
+    table.stats { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 10px; }
+    table.stats td { padding: 4px 6px; border-bottom: 1px solid #1b2434; }
+    table.stats td:first-child { color: var(--muted); }
+    table.stats td:last-child { text-align: right; font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .note b { color: var(--text); }
+    #err { display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212; border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>骨骼蒙皮：顶点是怎么"跟着骨头走"的</h1>
+    <p>
+      蒙皮的本质只有三步：<b>把顶点绑到骨头上</b>（bind）、<b>算出每根骨头的当前变换</b>（animation）、
+      <b>用权重把几根骨头的变换混起来</b>（skinning）。这一页把这三步拆开跑，并且对比
+      "每个顶点只跟一根骨头"（刚性绑定）和"跟多根骨头"（线性混合蒙皮 LBS）的差别。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <canvas id="c" width="900" height="620"></canvas>
+      <section class="stage" style="margin-top:16px">
+        <div class="controls">
+          <label><input type="checkbox" id="skinned" checked /> 开启蒙皮</label>
+          <label>权重
+            <select id="mode">
+              <option value="0" selected>线性混合（多骨骼）</option>
+              <option value="1">只取最大权重（刚性绑定）</option>
+            </select>
+          </label>
+          <label>骨骼数 <input type="range" id="bones" min="2" max="8" step="1" value="6" style="width:130px" /> <b id="bonesVal">6</b></label>
+          <label>摆幅 <input type="range" id="amp" min="0" max="60" step="1" value="26" style="width:140px" /> <b id="ampVal">26°</b></label>
+          <label>频率 <input type="range" id="freq" min="5" max="300" step="5" value="90" style="width:140px" /> <b id="freqVal">0.90</b></label>
+          <label>环数 <input type="range" id="rings" min="4" max="40" step="1" value="24" style="width:140px" /> <b id="ringsVal">24</b></label>
+          <label><input type="checkbox" id="showBones" checked /> 画骨骼</label>
+          <label><input type="checkbox" id="showWeights" /> 按权重上色</label>
+        </div>
+        <table class="stats">
+          <tr><td>顶点数 / 三角形数</td><td id="sGeom">-</td></tr>
+          <tr><td>骨骼数 / 每顶点最多影响</td><td id="sBones">-</td></tr>
+          <tr><td>关节角度（从根到梢）</td><td id="sAngles">-</td></tr>
+          <tr><td>每帧上传的骨骼矩阵</td><td id="sUpload">-</td></tr>
+        </table>
+        <div id="err"></div>
+      </section>
+    </div>
+
+    <div>
+      <section class="stage">
+        <h2>1. 三步：绑定 → 求变换 → 混合</h2>
+        <pre>// 1. 绑定（美术阶段一次性做）：把顶点从"模型空间"换算到"骨骼局部空间"
+inverseBind[i] = inverse( 绑定姿势下第 i 根骨头的世界矩阵 )
+
+// 2. 动画：自顶向下累乘出每根骨头的当前世界矩阵
+global[i] = global[parent] * local[i]
+
+// 3. 蒙皮矩阵（每帧、每根骨头一个）
+skin[i] = global[i] * inverseBind[i]
+
+// 4. 顶点：加权混合（4 根骨头足够，GPU 一次算完）
+p' = Σ  w_k * skin[index_k] * p          Σ w_k = 1</pre>
+        <ol class="steps">
+          <li><b>为什么要有 inverseBind：</b>顶点存的是模型空间坐标，而 skin 矩阵要作用在"骨骼空间"。
+            先乘 inverseBind 把顶点搬回骨骼的局部坐标系，再乘 global 搬到现在的位置。
+            绑定姿势一变（比如重新绑骨），inverseBind 就得重算。</li>
+          <li><b>每根骨头 4 个矩阵？</b>不是 —— 每根骨头一个 <code>mat4</code>，用 uniform 数组
+            （<code>uniform mat4 u_bones[N]</code>）或者纹理/UBO 传上去。
+            移动端骨头多了会撞 uniform 上限，所以常见做法是把骨骼矩阵打进一张浮点纹理。</li>
+          <li><b>索引和权重是顶点属性：</b>一般是 <code>uvec4</code>（或 float 转 int）+ <code>vec4</code> 权重，
+            权重在导出时就归一化好，运行时不用再除以总和。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>2. 为什么会有"糖纸"和关节塌陷</h2>
+        <ol class="steps">
+          <li><b>LBS 是线性混合矩阵：</b>把两个旋转矩阵按权重加起来，得到的一般<b>不再是旋转矩阵</b>
+            （会带缩放/切变）。这就是肘部旋转时体积塌陷、贴图扭成"糖纸"的来源。</li>
+          <li>想缓解就得用 <b>双四元数蒙皮（DQS）</b>：混合的是四元数而不是矩阵，能保住体积；
+            代价是每个顶点多几次乘法，且要处理符号（和 slerp 一样，需要先统一半球）。</li>
+          <li><b>只跟一根骨头（刚性绑定）</b>不会塌陷，但关节处会出现硬折角 —— 把上面的"权重"切过去就能看到区别。</li>
+          <li><b>法线也要蒙皮</b>：用同一个混合矩阵的 3×3 部分变换法线；如果骨骼带非均匀缩放，记得用逆转置。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>3. 面试要点</h2>
+        <ol class="steps">
+          <li>CPU 每帧只算 <b>N 根骨头的矩阵</b>（N 通常几十），顶点变换全在顶点着色器里做 —— 这是蒙皮便宜的原因。</li>
+          <li>顶点属性里骨头索引用整数类型（<code>vertexAttribIPointer</code>），别用浮点数做索引，会有精度和转换问题。</li>
+          <li>和四元数的关系：骨骼的 local 变换一般存成 (位置, 四元数, 缩放)，运行时再拼成矩阵；
+            插值在四元数域做，拼矩阵只在最后一刻做。</li>
+          <li>进阶名词：GPU skinning（顶点着色器里做，本页）、CPU skinning（老式，浪费带宽）、
+            morph target / blend shape（和蒙皮叠加使用）、compute shader skinning（把结果写进 VBO 给后面的 pass 用）。</li>
+        </ol>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => { errBox.style.display = "block"; errBox.textContent += (e.message || e.error) + "\n"; });
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let l = Math.hypot(zx, zy, zz); zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  l = Math.hypot(xx, xy, xz); xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]), 1,
+  ]);
+}
+function trans(x, y, z) { return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]); }
+function rotZ(a) { const c = Math.cos(a), s = Math.sin(a); return new Float32Array([c,s,0,0, -s,c,0,0, 0,0,1,0, 0,0,0,1]); }
+function rotX(a) { const c = Math.cos(a), s = Math.sin(a); return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]); }
+
+const MAX_BONES = 32;
+const VS = `#version 300 es
+in vec3 a_pos;
+in vec3 a_nrm;
+in vec4 a_bone;      // 骨骼索引（浮点存的整数）
+in vec4 a_weight;    // 权重，和为 1
+uniform mat4 u_mvp;
+uniform mat4 u_model;
+uniform mat4 u_bones[${MAX_BONES}];   // skin[i] = global[i] * inverseBind[i]
+uniform int u_rigid;                  // 1 = 只取最大权重
+uniform int u_colorByWeight;
+uniform vec3 u_lightDir;
+out vec3 v_nrm;
+out vec3 v_tint;
+void main() {
+  int i0 = int(a_bone.x + 0.5), i1 = int(a_bone.y + 0.5);
+  int i2 = int(a_bone.z + 0.5), i3 = int(a_bone.w + 0.5);
+  vec4 w = a_weight;
+  if (u_rigid == 1) {
+    // 只留权重最大的那根骨头：关节处会出现硬折角
+    float m = max(max(w.x, w.y), max(w.z, w.w));
+    w = vec4(equal(w, vec4(m)));
+    w /= max(w.x + w.y + w.z + w.w, 0.0001);
+  }
+  mat4 skin = w.x * u_bones[i0] + w.y * u_bones[i1] + w.z * u_bones[i2] + w.w * u_bones[i3];
+  vec4 world = u_model * skin * vec4(a_pos, 1.0);
+  vec3 nrm = mat3(u_model) * (mat3(skin) * a_nrm);
+  v_nrm = nrm;
+  // 按权重上色：看颜色沿管子的过渡就知道权重怎么分布的
+  float t = a_bone.x * w.x + a_bone.y * w.y + a_bone.z * w.z + a_bone.w * w.w;
+  float h = fract(t * 0.23);
+  v_tint = u_colorByWeight == 1
+    ? 0.5 + 0.5 * cos(6.2831 * (h + vec3(0.0, 0.33, 0.67)))
+    : vec3(0.72, 0.75, 0.8);
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+const FS = `#version 300 es
+precision highp float;
+in vec3 v_nrm;
+in vec3 v_tint;
+out vec4 outColor;
+void main() {
+  vec3 N = normalize(v_nrm);
+  if (!gl_FrontFacing) N = -N;
+  vec3 L1 = normalize(vec3(0.45, 0.6, 0.65));
+  vec3 L2 = normalize(vec3(-0.5, 0.3, -0.6));
+  float d = max(dot(N, L1), 0.0) * 0.85 + max(dot(N, L2), 0.0) * 0.3 + 0.2;
+  outColor = vec4(pow(v_tint * d, vec3(1.0 / 2.2)), 1.0);
+}`;
+// 顶点着色器里 gl_Position 用的是 u_mvp * a_pos（蒙皮后的位置由 skin 决定，
+// 所以 mvp 里只含 viewProj），这里重写一下避免误解
+const VS2 = VS.replace("gl_Position = u_mvp * vec4(a_pos, 1.0);", "gl_Position = u_mvp * world;");
+
+const prog = link(VS2, FS);
+
+const U = {};
+for (const n of ["u_mvp", "u_model", "u_rigid", "u_colorByWeight", "u_lightDir"]) U[n] = gl.getUniformLocation(prog, n);
+U.bones = gl.getUniformLocation(prog, "u_bones");
+const A = {
+  pos: gl.getAttribLocation(prog, "a_pos"),
+  nrm: gl.getAttribLocation(prog, "a_nrm"),
+  bone: gl.getAttribLocation(prog, "a_bone"),
+  weight: gl.getAttribLocation(prog, "a_weight"),
+};
+const LINE_VS = `#version 300 es
+in vec3 a_pos;
+uniform mat4 u_mvp;
+void main() { gl_Position = u_mvp * vec4(a_pos, 1.0); }`;
+const LINE_FS = `#version 300 es
+precision highp float;
+uniform vec3 u_color;
+out vec4 outColor;
+void main() { outColor = vec4(u_color, 1.0); }`;
+const lineProg = link(LINE_VS, LINE_FS);
+const LU = { mvp: gl.getUniformLocation(lineProg, "u_mvp"), color: gl.getUniformLocation(lineProg, "u_color") };
+const lineProgPos = gl.getAttribLocation(lineProg, "a_pos");
+
+const meshVao = gl.createVertexArray();
+gl.bindVertexArray(meshVao);
+const attrBuf = {};
+function putAttr(loc, name, arr, size) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, arr, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+  attrBuf[name] = b;
+}
+putAttr(A.pos, "pos", new Float32Array(0), 3);
+putAttr(A.nrm, "nrm", new Float32Array(0), 3);
+putAttr(A.bone, "bone", new Float32Array(0), 4);
+putAttr(A.weight, "weight", new Float32Array(0), 4);
+let indexBuf = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuf);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(0), gl.DYNAMIC_DRAW);
+
+const lineVao = gl.createVertexArray();
+gl.bindVertexArray(lineVao);
+const lineBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(MAX_BONES * 6), gl.DYNAMIC_DRAW);
+gl.enableVertexAttribArray(lineProgPos);
+gl.vertexAttribPointer(lineProgPos, 3, gl.FLOAT, false, 0, 0);
+
+const el = (id) => document.getElementById(id);
+const skinnedEl = el("skinned"), modeEl = el("mode"), bonesEl = el("bones"), ampEl = el("amp");
+const freqEl = el("freq"), ringsEl = el("rings"), showBonesEl = el("showBones"), showWeightsEl = el("showWeights");
+
+const cam = { yaw: 0.52, pitch: 0.16, dist: 11 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.006;
+  cam.pitch = Math.max(-0.5, Math.min(1.2, cam.pitch - (e.clientY - lastY) * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+const SEG_LEN = 1.2, RADIUS = 0.78;
+function buildTube(rings, nBones, rigid) {
+  const seg = 16;
+  const totalH = nBones * SEG_LEN;
+  const pos = [], nrm = [], bone = [], weight = [], idx = [];
+  const nRings = rings + 1;
+  for (let r = 0; r < nRings; r++) {
+    const v = r / rings;
+    const y = v * totalH;
+    const rad = RADIUS * (1.0 - 0.35 * v);
+    // 连续骨骼坐标 -> 两根相邻骨头的权重（smoothstep 做平滑过渡）
+    const tb = y / SEG_LEN;
+    let b0 = Math.min(Math.floor(tb), nBones - 1);
+    let f = tb - b0;
+    if (f < 0) f = 0;
+    const b1 = Math.min(b0 + 1, nBones - 1);
+    const s = f * f * (3 - 2 * f);
+    let w0 = 1 - s, w1 = s;
+    if (rigid) { if (s > 0.5) { w0 = 0; w1 = 1; } else { w0 = 1; w1 = 0; } }
+    for (let a = 0; a <= seg; a++) {
+      const th = a / seg * Math.PI * 2;
+      const cx = Math.cos(th), cz = Math.sin(th);
+      pos.push(cx * rad, y, cz * rad);
+      nrm.push(cx, 0, cz);
+      bone.push(b0, b1, 0, 0);
+      weight.push(w0, w1, 0, 0);
+    }
+  }
+  for (let r = 0; r < rings; r++) for (let a = 0; a < seg; a++) {
+    const i0 = r * (seg + 1) + a, i1 = i0 + seg + 1;
+    idx.push(i0, i1, i0 + 1, i0 + 1, i1, i1 + 1);
+  }
+  return {
+    pos: new Float32Array(pos), nrm: new Float32Array(nrm),
+    bone: new Float32Array(bone), weight: new Float32Array(weight),
+    idx: new Uint16Array(idx), verts: pos.length / 3, tris: idx.length / 3,
+  };
+}
+let mesh = null, meshKey = "";
+function ensureMesh(nBones, rings, rigid) {
+  const key = nBones + "/" + rings + "/" + rigid;
+  if (key === meshKey) return;
+  meshKey = key;
+  mesh = buildTube(rings, nBones, rigid);
+  gl.bindBuffer(gl.ARRAY_BUFFER, attrBuf.pos); gl.bufferData(gl.ARRAY_BUFFER, mesh.pos, gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, attrBuf.nrm); gl.bufferData(gl.ARRAY_BUFFER, mesh.nrm, gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, attrBuf.bone); gl.bufferData(gl.ARRAY_BUFFER, mesh.bone, gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, attrBuf.weight); gl.bufferData(gl.ARRAY_BUFFER, mesh.weight, gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuf);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.idx, gl.DYNAMIC_DRAW);
+  el("sGeom").textContent = mesh.verts + " / " + mesh.tris;
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const W = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const H = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+
+  const nBones = Number(bonesEl.value);
+  const amp = Number(ampEl.value) * Math.PI / 180;
+  const freq = Number(freqEl.value) / 100;
+  const rings = Number(ringsEl.value);
+  const rigid = modeEl.value === "1" ? 1 : 0;
+  const skinned = skinnedEl.checked;
+  el("bonesVal").textContent = nBones;
+  el("ampVal").textContent = ampEl.value + "°";
+  el("freqVal").textContent = freq.toFixed(2);
+  el("ringsVal").textContent = rings;
+  el("sBones").textContent = nBones + " / 2";
+  ensureMesh(nBones, rings, rigid);
+  el("sUpload").textContent = (nBones * 16 * 4 / 1024).toFixed(2) + " KB（uniform 数组）";
+
+  const t = (now || 0) / 1000;
+  // 1) 自顶向下累乘出每根骨头的世界矩阵；同时记下逆绑定矩阵
+  const global = [], skin = [];
+  const angles = [];
+  // 每根骨头的角度按骨骼数缩放：不然骨头一多，累加起来能卷出画面
+  const perBone = amp * Math.min(1, 3.5 / nBones);
+  for (let i = 0; i < nBones; i++) {
+    const a = perBone * Math.sin(t * Math.PI * freq + i * 0.55) * (1 - i / nBones * 0.3);
+    angles.push(a);
+    const local = mul(i === 0 ? trans(0, 0, 0) : trans(0, SEG_LEN, 0), mul(rotZ(a), rotX(a * 0.35)));
+    const g = i === 0 ? local : mul(global[i - 1], local);
+    global.push(g);
+    // 逆绑定：绑定姿势下第 i 根骨头在 world = trans(0, i*SEG_LEN, 0)
+    const invBind = trans(0, -i * SEG_LEN, 0);
+    skin.push(mul(g, invBind));
+  }
+  el("sAngles").textContent = angles.map((a) => (a * 180 / Math.PI).toFixed(1) + "°").join("  ");
+
+  const eye = [
+    Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    Math.sin(cam.pitch) * cam.dist + nBones * SEG_LEN * 0.5,
+    Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const view = lookAt(eye, [0, nBones * SEG_LEN * 0.5, 0], [0, 1, 0]);
+  const proj = perspective(Math.PI / 4.4, W / H, 0.2, 120);
+  const vp = mul(proj, view);
+  const model = trans(0, -nBones * SEG_LEN * 0.5, 0);
+
+  gl.viewport(0, 0, W, H);
+  gl.clearColor(0.02, 0.023, 0.035, 1);
+  gl.enable(gl.DEPTH_TEST);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  gl.useProgram(prog);
+  gl.uniformMatrix4fv(U.u_mvp, false, vp);
+  gl.uniformMatrix4fv(U.u_model, false, model);
+  gl.uniform1i(U.u_rigid, rigid);
+  gl.uniform1i(U.u_colorByWeight, showWeightsEl.checked ? 1 : 0);
+
+  // 绑定姿势的骨头矩阵（不蒙皮时直接用）
+  const flat = new Float32Array(MAX_BONES * 16);
+  for (let i = 0; i < nBones; i++) {
+    // 关掉蒙皮 = 全部用单位矩阵，顶点就停在绑定姿势（不是 global，别把两者搞混）
+    const m = skinned ? skin[i] : trans(0, 0, 0);
+    flat.set(m, i * 16);
+  }
+  gl.uniformMatrix4fv(U.bones, false, flat);
+
+  gl.bindVertexArray(meshVao);
+  gl.drawElements(gl.TRIANGLES, mesh.idx.length, gl.UNSIGNED_SHORT, 0);
+
+  // 骨骼线
+  if (showBonesEl.checked) {
+    gl.useProgram(lineProg);
+    gl.uniformMatrix4fv(LU.mvp, false, mul(vp, model));
+    gl.uniform3fv(LU.color, new Float32Array([1.0, 0.78, 0.35]));
+    const pts = [];
+    for (let i = 0; i < nBones; i++) {
+      const a = mul(global[i], trans(0, 0, 0));
+      const b = mul(global[i], trans(0, SEG_LEN, 0));
+      pts.push(a[12], a[13], a[14], b[12], b[13], b[14]);
+    }
+    gl.bindVertexArray(lineVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pts), gl.DYNAMIC_DRAW);
+    gl.drawArrays(gl.LINES, 0, pts.length / 3);
+  }
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

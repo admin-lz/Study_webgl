@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · PBR：从 Blinn-Phong 到 Cook-Torrance</title>
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --panel: #12151f;
+      --line: #243044;
+      --text: #e8eef8;
+      --muted: #8b97a8;
+      --accent: #9fd4ff;
+      --gold: #f3d27a;
+      --ok: #7dcea0;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 940px; }
+    header b { color: var(--accent); }
+    .layout {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 20px;
+      padding: 20px 24px 40px;
+      align-items: start;
+    }
+    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
+    canvas {
+      width: 100%; height: auto; display: block;
+      background: #08090e; border: 1px solid var(--line);
+      border-radius: 8px; cursor: grab;
+    }
+    canvas:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre {
+      margin: 10px 0 0; background: #0a0c12; border: 1px solid var(--line);
+      border-radius: 6px; padding: 12px 14px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #d5deea; white-space: pre;
+    }
+    .note { color: var(--muted); font-size: 13px; margin-top: 10px; }
+    .note b { color: var(--text); }
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 10px 16px;
+      margin-top: 12px; align-items: center;
+      color: var(--muted); font-size: 13px;
+    }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .stats {
+      margin-top: 12px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px 16px; font-size: 12.5px; color: var(--muted);
+    }
+    .stats b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .stats .hl { color: var(--gold); }
+    .hint {
+      margin: 10px 0 0; padding: 10px 12px; border-radius: 6px;
+      background: #1a2230; border: 1px solid #2c3b52; color: var(--text);
+      font-size: 13px; min-height: 4.2em;
+    }
+    #err {
+      display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212;
+      border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>PBR：把"高光"拆成 D、G、F 三项</h1>
+    <p>
+      Blinn-Phong 的 <code>pow(N·H, n)</code> 只是个长得像高光的函数，参数没有物理含义、也不守恒能量。
+      PBR 换成 <b>Cook-Torrance</b>：微表面分布 <b>D</b>、几何遮蔽 <b>G</b>、菲涅尔 <b>F</b>，
+      再用 <b>metalness / roughness</b> 两个参数描述材质。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <section class="stage">
+        <h2>1. 公式的每一块在干什么</h2>
+        <pre>f_spec = D · G · F / (4 · (N·L) · (N·V))
+L_o = (k_d · albedo / π + f_spec) · L_i · (N·L)
+
+D  GGX：ndf = a² / (π ((N·H)²(a²-1)+1)²)     ← 微表面朝向 H 的比例，a = roughness²
+G  Smith：遮蔽（微表面互相挡住），roughness 越大衰减越多
+F  Schlick：F0 + (1-F0)(1 - V·H)⁵              ← 掠射角反射率必然趋近 1
+k_d = (1 - F)(1 - metalness)                  ← 剩下的能量才轮到漫反射</pre>
+        <ol class="steps">
+          <li><b>F0</b> 是垂直入射的反射率：绝缘体约 <b>0.04</b>（水 0.02、钻石 0.17），金属则用<b>基础色</b>当 F0。</li>
+          <li><b>metalness</b> 不是"有多亮"，而是"这是不是金属"：金属没有漫反射，能量全走镜面。</li>
+          <li><b>roughness</b> 只影响 D 的尖锐程度，也就是高光多大、多糊。注意 <code>a = roughness²</code> 是约定俗成的重映射。</li>
+          <li>分母的 <code>4(N·L)(N·V)</code> 来自微表面模型的立体角变换 —— 少了它，掠射角会出现能量爆掉的白边。</li>
+        </ol>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>2. 为什么必须做色调映射</h2>
+        <ol class="steps">
+          <li>PBR 计算的是<b>线性 HDR 辐射度</b>，可以远大于 1。直接写进 8 位缓冲区会被粗暴截断成一片死白。</li>
+          <li><b>Reinhard</b>：<code>x/(1+x)</code>，便宜但高光发灰。<b>ACES</b> 曲线更接近胶片，是目前的主流默认。</li>
+          <li>色调映射之后还要做 <b>sRGB 编码</b>（<code>pow(c, 1/2.2)</code>），否则暗部会糊成一团。</li>
+          <li>顺序不能反：<b>线性光照 → 色调映射 → gamma 编码</b>。贴图进来的时候则要先去 gamma。</li>
+        </ol>
+        <p class="note">
+          这一页故意把三个开关都露出来：关掉色调映射能看到高光直接"撞顶"，关掉 gamma 能看到整体发暗、对比过硬。
+        </p>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>3. 环境光：IBL 在替我们算什么</h2>
+        <ol class="steps">
+          <li>点光源只能照亮"正好朝着光源"的方向。真实环境里光从四面八方来，这部分由 IBL 提供。</li>
+          <li>漫反射环境光 = 对半球做积分（irradiance）→ 结果非常低频，可以用一张很糊的立方体贴图代替。</li>
+          <li>镜面环境光 = 按 roughness 做预过滤（PMREM），roughness 越大用越糊的一层。</li>
+          <li>本页为了不依赖贴图，用一个解析的"天空 + 地面 + 太阳"函数来近似，太阳的高光指数随 roughness 变钝。</li>
+        </ol>
+        <p class="note">
+          面试常问：<b>"为什么 IBL 的漫反射和镜面反射要用不同的预计算？"</b>
+          因为漫反射的积分核是 <code>cosθ</code>，镜面反射的积分核是随 roughness 变化的 NDF —— 卷积核不同，结果就不能共用一张图。
+        </p>
+      </section>
+    </div>
+
+    <div>
+      <canvas id="c" width="900" height="560"></canvas>
+
+      <section class="stage" style="margin-top:16px">
+        <div class="controls">
+          <label>光照模型
+            <select id="model">
+              <option value="0" selected>PBR（Cook-Torrance）</option>
+              <option value="1">Blinn-Phong（对比）</option>
+            </select>
+          </label>
+          <label>输出
+            <select id="outMode">
+              <option value="0" selected>完整</option>
+              <option value="1">只看漫反射</option>
+              <option value="2">只看镜面反射</option>
+              <option value="3">只看 F / D / G</option>
+            </select>
+          </label>
+          <label>色调映射
+            <select id="tonemap">
+              <option value="0">无</option>
+              <option value="1">Reinhard</option>
+              <option value="2" selected>ACES</option>
+            </select>
+          </label>
+          <label><input type="checkbox" id="gamma" checked /> sRGB 编码</label>
+          <label><input type="checkbox" id="override" /> 统一材质</label>
+          <label>粗糙度 <input type="range" id="rough" min="4" max="100" step="1" value="30" style="width:96px" /> <b id="roughVal">0.30</b></label>
+          <label>金属度 <input type="range" id="metal" min="0" max="100" step="1" value="0" style="width:96px" /> <b id="metalVal">0.00</b></label>
+          <label>光源数
+            <select id="lights">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3" selected>3</option>
+            </select>
+          </label>
+          <label>环境强度 <input type="range" id="env" min="0" max="200" step="1" value="100" style="width:96px" /> <b id="envVal">1.00</b></label>
+        </div>
+        <div class="stats">
+          <div>材质球：<b id="sBalls">-</b></div>
+          <div>球面三角形：<b id="sTri">-</b></div>
+          <div>F0（绝缘体）：<b class="hl">0.04</b></div>
+          <div>α = roughness²：<b id="sAlpha">-</b></div>
+        </div>
+        <p class="hint" id="hint"></p>
+        <div id="err"></div>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => {
+  errBox.style.display = "block";
+  errBox.textContent += (e.message || e.error) + "\n";
+});
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+      a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  }
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let len = Math.hypot(zx, zy, zz); zx /= len; zy /= len; zz /= len;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  len = Math.hypot(xx, xy, xz); xx /= len; xy /= len; xz /= len;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+    1,
+  ]);
+}
+
+function makeSphere(seg, ring) {
+  const pos = [], nrm = [], idx = [];
+  for (let y = 0; y <= ring; y++) {
+    const phi = (y / ring) * Math.PI;
+    for (let x = 0; x <= seg; x++) {
+      const th = (x / seg) * Math.PI * 2;
+      const nx = Math.sin(phi) * Math.cos(th), ny = Math.cos(phi), nz = Math.sin(phi) * Math.sin(th);
+      pos.push(nx, ny, nz); nrm.push(nx, ny, nz);
+    }
+  }
+  for (let y = 0; y < ring; y++) for (let x = 0; x < seg; x++) {
+    const a = y * (seg + 1) + x, b = a + seg + 1;
+    idx.push(a, b, a + 1, a + 1, b, b + 1);
+  }
+  return { pos: new Float32Array(pos), nrm: new Float32Array(nrm), idx: new Uint16Array(idx) };
+}
+const sphere = makeSphere(40, 20);
+
+const VS = `#version 300 es
+in vec3 a_pos;
+in vec3 a_nrm;
+uniform mat4 u_mvp;
+uniform mat4 u_model;
+out vec3 v_world;
+out vec3 v_nrm;
+void main() {
+  vec4 wp = u_model * vec4(a_pos, 1.0);
+  v_world = wp.xyz;
+  v_nrm = mat3(u_model) * a_nrm;
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec3 v_world;
+in vec3 v_nrm;
+uniform vec3 u_camPos;
+uniform vec3 u_albedo;
+uniform float u_rough;
+uniform float u_metal;
+uniform float u_envStrength;
+uniform int u_shadeModel; // 0 PBR 1 Blinn-Phong（不能叫 u_model，顶点着色器里那个是 mat4）
+uniform int u_outMode;    // 0 完整 1 漫反射 2 镜面 3 F/D/G
+uniform int u_tonemap;  // 0 无 1 Reinhard 2 ACES
+uniform int u_gamma;
+uniform int u_lightCount;
+out vec4 outColor;
+
+const float PI = 3.14159265359;
+
+vec3 skyColor(vec3 d) {
+  // 解析的"环境"：上半球天光 + 下半球地面 + 一个太阳
+  float up = d.y * 0.5 + 0.5;
+  vec3 c = mix(vec3(0.16, 0.15, 0.14), vec3(0.42, 0.58, 0.85), up);
+  c += vec3(1.0, 0.92, 0.75) * 3.0 * pow(max(dot(d, normalize(vec3(0.45, 0.62, 0.64))), 0.0), 900.0);
+  return c;
+}
+
+float distributionGGX(vec3 N, vec3 H, float a) {
+  float a2 = a * a;
+  float NH = max(dot(N, H), 0.0);
+  float d = NH * NH * (a2 - 1.0) + 1.0;
+  return a2 / max(PI * d * d, 1e-7);
+}
+float geometrySchlick(float NV, float k) { return NV / (NV * (1.0 - k) + k); }
+float geometrySmith(vec3 N, vec3 V, vec3 L, float a) {
+  float k = (a + 1.0) * (a + 1.0) / 8.0;
+  return geometrySchlick(max(dot(N, V), 0.0), k) * geometrySchlick(max(dot(N, L), 0.0), k);
+}
+vec3 fresnelSchlick(float cosT, vec3 F0) {
+  return F0 + (1.0 - F0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
+}
+vec3 aces(vec3 x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+vec3 tonemap(vec3 c) {
+  if (u_tonemap == 1) return c / (1.0 + c);
+  if (u_tonemap == 2) return aces(c);
+  return c;
+}
+
+void main() {
+  vec3 N = normalize(v_nrm);
+  vec3 V = normalize(u_camPos - v_world);
+  if (!gl_FrontFacing) N = -N;
+
+  vec3 F0 = mix(vec3(0.04), u_albedo, u_metal);   // 金属：基础色当 F0
+  float a = max(u_rough * u_rough, 1e-3);         // GGX 的 α 用 roughness²
+
+  vec3 lo = vec3(0.0);
+  vec3 debugTerm = vec3(0.0);
+  vec3 Ldirs[3];
+  Ldirs[0] = normalize(vec3(-0.55, 0.72, 0.42));
+  Ldirs[1] = normalize(vec3(0.68, 0.42, 0.60));
+  Ldirs[2] = normalize(vec3(0.05, -0.35, -1.0));
+  vec3 Lcols[3];
+  Lcols[0] = vec3(9.0, 8.6, 8.0);
+  Lcols[1] = vec3(2.4, 3.2, 5.4);
+  Lcols[2] = vec3(1.6, 1.3, 1.1);
+
+  for (int i = 0; i < 3; i++) {
+    if (i >= u_lightCount) break;
+    vec3 L = Ldirs[i];
+    vec3 H = normalize(V + L);
+    float NL = max(dot(N, L), 0.0);
+    float NV = max(dot(N, V), 0.0);
+    float NH = max(dot(N, H), 0.0);
+    float VH = max(dot(V, H), 0.0);
+    vec3 F = fresnelSchlick(VH, F0);
+    vec3 spec, kd;
+    if (u_shadeModel == 0) {
+      float D = distributionGGX(N, H, a);
+      float G = geometrySmith(N, V, L, a);
+      spec = D * G * F / max(4.0 * NL * NV, 1e-4);
+      kd = (vec3(1.0) - F) * (1.0 - u_metal);
+    } else {
+      // Blinn-Phong：高光强度是拍出来的，没有守恒概念
+      float s = pow(NH, mix(256.0, 4.0, u_rough));
+      spec = vec3(s * 1.2);
+      kd = vec3(1.0 - 0.35);
+    }
+    vec3 diff = kd * u_albedo / PI;
+    if (u_outMode == 3 && u_shadeModel == 0) { debugTerm += vec3(dot(F, vec3(0.333)) * 0.6, distributionGGX(N, H, a) * 0.02, geometrySmith(N, V, L, a) * 0.5); }
+    if (u_outMode == 2) diff = vec3(0.0);
+    if (u_outMode == 1) spec = vec3(0.0);
+    lo += (diff + spec) * Lcols[i] * NL;
+  }
+
+  // 环境光：漫反射取半球近似，镜面按 roughness 收缩太阳高光
+  vec3 R = reflect(-V, N);
+  vec3 irr = mix(vec3(0.16, 0.15, 0.14), vec3(0.42, 0.58, 0.85), N.y * 0.5 + 0.5);
+  vec3 envDiff = irr * u_albedo * (1.0 - u_metal) * 0.55;
+  vec3 envSpec = skyColor(R) * mix(F0, vec3(1.0), 0.15);
+  envSpec *= 1.0 - u_rough * 0.55;
+  vec3 env = (envDiff + envSpec) * u_envStrength;
+  if (u_outMode == 1) env = envDiff * u_envStrength;
+  if (u_outMode == 2 || u_outMode == 3) env = vec3(0.0);
+  lo += env;
+
+  if (u_outMode == 3 && u_shadeModel == 0) lo = debugTerm * 2.0;
+
+  vec3 col = tonemap(lo);
+  if (u_gamma == 1) col = pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2));
+  outColor = vec4(col, 1.0);
+}`;
+
+const prog = link(VS, FS);
+gl.useProgram(prog);
+const uMVP = gl.getUniformLocation(prog, "u_mvp");
+const uModel = gl.getUniformLocation(prog, "u_model");
+const uCamPos = gl.getUniformLocation(prog, "u_camPos");
+const uAlbedo = gl.getUniformLocation(prog, "u_albedo");
+const uRough = gl.getUniformLocation(prog, "u_rough");
+const uMetal = gl.getUniformLocation(prog, "u_metal");
+const uEnvStrength = gl.getUniformLocation(prog, "u_envStrength");
+const uOutMode = gl.getUniformLocation(prog, "u_outMode");
+const uTonemap = gl.getUniformLocation(prog, "u_tonemap");
+const uGamma = gl.getUniformLocation(prog, "u_gamma");
+const uLightCount = gl.getUniformLocation(prog, "u_lightCount");
+const uModelSel = gl.getUniformLocation(prog, "u_shadeModel");
+
+const aPos = gl.getAttribLocation(prog, "a_pos");
+const aNrm = gl.getAttribLocation(prog, "a_nrm");
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+{
+  const put = (loc, data, size) => {
+    const b = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+  };
+  put(aPos, sphere.pos, 3);
+  put(aNrm, sphere.nrm, 3);
+  const ib = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, sphere.idx, gl.STATIC_DRAW);
+}
+
+// 4 列（粗糙度）× 3 行（金属度）
+const BALLS = [];
+for (let row = 0; row < 3; row++) {
+  for (let col = 0; col < 4; col++) {
+    BALLS.push({
+      x: (col - 1.5) * 2.5,
+      z: (row - 1) * 2.5,
+      rough: [0.05, 0.28, 0.55, 0.95][col],
+      metal: [0.0, 0.5, 1.0][row],
+    });
+  }
+}
+document.getElementById("sBalls").textContent = "4 列粗糙度 × 3 行金属度";
+document.getElementById("sTri").textContent = (sphere.idx.length / 3) + " × " + BALLS.length + " = " + (sphere.idx.length / 3 * BALLS.length);
+
+function modelMatrix(x, y, z, s) {
+  return new Float32Array([s, 0, 0, 0, 0, s, 0, 0, 0, 0, s, 0, x, y, z, 1]);
+}
+
+const el = (id) => document.getElementById(id);
+const modelEl = el("model"), outModeEl = el("outMode"), tonemapEl = el("tonemap"), gammaEl = el("gamma");
+const overrideEl = el("override"), roughEl = el("rough"), metalEl = el("metal");
+const lightsEl = el("lights"), envEl = el("env");
+const roughVal = el("roughVal"), metalVal = el("metalVal"), envVal = el("envVal");
+const hintEl = el("hint"), sAlpha = el("sAlpha");
+
+const cam = { yaw: 0.0, pitch: 0.42, dist: 11 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.006;
+  cam.pitch = Math.max(0.06, Math.min(1.3, cam.pitch - (e.clientY - lastY) * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+let hintKey = "";
+function refreshHint() {
+  const key = [modelEl.value, outModeEl.value, tonemapEl.value, gammaEl.checked, overrideEl.checked].join(",");
+  roughVal.textContent = (Number(roughEl.value) / 100).toFixed(2);
+  metalVal.textContent = (Number(metalEl.value) / 100).toFixed(2);
+  envVal.textContent = (Number(envEl.value) / 100).toFixed(2);
+  sAlpha.textContent = (Number(roughEl.value) / 100) ** 2 === 0 ? "-" : ((Number(roughEl.value) / 100) ** 2).toFixed(3);
+  if (key === hintKey) return;
+  hintKey = key;
+  const m = Number(modelEl.value), o = Number(outModeEl.value);
+  if (m === 1) hintEl.textContent = "Blinn-Phong：高光是一个 pow(N·H, n)。注意它不守恒能量 —— roughness 只是把指数从 256 挪到 4，亮度和面积都不受控。";
+  else if (o === 1) hintEl.textContent = "只剩漫反射。注意金属球几乎全黑：metalness = 1 时 kd = 0，金属没有漫反射。";
+  else if (o === 2) hintEl.textContent = "只剩镜面反射。粗糙度沿列递增：左边锐利、右边铺开，但总能量大致守恒（这是 D 归一化的作用）。";
+  else if (o === 3) hintEl.textContent = "三项调试：偏红的是 F，偏绿的是 D（已缩放），偏蓝的是 G。调试 BRDF 时把它们分开画是最快的定位办法。";
+  else if (!gammaEl.checked) hintEl.textContent = "关掉 sRGB 编码：线性值被直接当成 sRGB 写进 8 位缓冲，整体发暗、暗部细节糊掉。";
+  else if (Number(tonemapEl.value) === 0) hintEl.textContent = "关掉色调映射：超过 1 的高光被截断成死白，镜面高光的形状丢失。";
+  else hintEl.textContent = "打开「统一材质」后可以单独拖粗糙度/金属度，一次只看一个变量；关掉则回到 4×3 的材质矩阵。";
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  refreshHint();
+
+  const eye = [
+    Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    Math.sin(cam.pitch) * cam.dist,
+    Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const proj = perspective(Math.PI / 4.4, canvas.width / canvas.height, 0.1, 200);
+  const viewM = lookAt(eye, [0, 0, 0], [0, 1, 0]);
+  const viewProj = mul(proj, viewM);
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.03, 0.033, 0.05, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+
+  gl.useProgram(prog);
+  gl.uniform3fv(uCamPos, new Float32Array(eye));
+  gl.uniform3fv(uAlbedo, new Float32Array([0.94, 0.68, 0.30]));
+  gl.uniform1i(uOutMode, Number(outModeEl.value));
+  gl.uniform1i(uTonemap, Number(tonemapEl.value));
+  gl.uniform1i(uGamma, gammaEl.checked ? 1 : 0);
+  gl.uniform1i(uLightCount, Number(lightsEl.value));
+  gl.uniform1f(uEnvStrength, Number(envEl.value) / 100);
+  gl.uniform1i(uModelSel, Number(modelEl.value));
+  gl.bindVertexArray(vao);
+
+  const ov = overrideEl.checked;
+  for (const b of BALLS) {
+    gl.uniformMatrix4fv(uMVP, false, mul(viewProj, modelMatrix(b.x, 0, b.z, 1)));
+    gl.uniformMatrix4fv(uModel, false, modelMatrix(b.x, 0, b.z, 1));
+    gl.uniform1f(uRough, ov ? Number(roughEl.value) / 100 : b.rough);
+    gl.uniform1f(uMetal, ov ? Number(metalEl.value) / 100 : b.metal);
+    gl.drawElements(gl.TRIANGLES, sphere.idx.length, gl.UNSIGNED_SHORT, 0);
+  }
+}
+
+refreshHint();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

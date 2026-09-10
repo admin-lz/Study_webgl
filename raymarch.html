@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SDF 光线步进（Raymarching）</title>
+  <style>
+    :root {
+      --bg: #0b0d14; --panel: #12151f; --line: #243044;
+      --text: #e8eef8; --muted: #8b97a8; --accent: #9fd4ff; --gold: #f3d27a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 980px; }
+    header b { color: var(--accent); }
+    .layout { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 20px; padding: 20px 24px 40px; align-items: start; }
+    @media (max-width: 1020px) { .layout { grid-template-columns: 1fr; } }
+    canvas#c { width: 100%; height: auto; display: block; background: #05060a; border: 1px solid var(--line); border-radius: 8px; cursor: grab; image-rendering: auto; }
+    canvas#c:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+    .stage + .stage { margin-top: 16px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre { margin: 8px 0 0; background: #0a0c12; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #d5deea; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; align-items: center; color: var(--muted); font-size: 13px; }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls b { color: var(--text); font-variant-numeric: tabular-nums; min-width: 3em; display: inline-block; }
+    table.stats { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 10px; }
+    table.stats td { padding: 4px 6px; border-bottom: 1px solid #1b2434; }
+    table.stats td:first-child { color: var(--muted); }
+    table.stats td:last-child { text-align: right; font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .note b { color: var(--text); }
+    .warn { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: #1a2230; border: 1px solid #2c3b52; font-size: 13px; }
+    #err { display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212; border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Raymarching：不写一个三角形，用"距离场 + 步进"画东西</h1>
+    <p>
+      光栅化是"把三角形投影到屏幕"；raymarching 反过来 —— 对每个像素发一条射线，反复问同一个问题：
+      <b>离最近的表面还有多远？</b> 如果场景能回答这个问题（SDF，符号距离场），就能一路"安全地"跳过去。
+      曲面求交、软阴影、环境光遮蔽、描边，全都是同一条射线上的副产品。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <canvas id="c" width="640" height="320"></canvas>
+      <section class="stage" style="margin-top:16px">
+        <div class="controls">
+          <label>显示
+            <select id="debug">
+              <option value="0" selected>着色</option>
+              <option value="1">步进次数热力图</option>
+              <option value="2">法线（SDF 梯度）</option>
+              <option value="3">距离场切片</option>
+            </select>
+          </label>
+          <label>形状
+            <select id="shape">
+              <option value="0">球</option>
+              <option value="1">圆角盒</option>
+              <option value="2">圆环</option>
+              <option value="3" selected>smooth-min 混合</option>
+            </select>
+          </label>
+          <label>混合系数 k <input type="range" id="k" min="0.01" max="1.2" step="0.01" value="0.35" style="width:120px" /> <b id="kVal">0.35</b></label>
+          <label>最大步数 <input type="range" id="steps" min="16" max="160" step="8" value="80" style="width:120px" /> <b id="stepsVal">80</b></label>
+          <label>eps <input type="range" id="eps" min="0.0005" max="0.02" step="0.0005" value="0.002" style="width:120px" /> <b id="epsVal">0.0020</b></label>
+          <label>雾 <input type="range" id="fog" min="0" max="0.12" step="0.005" value="0.03" style="width:120px" /> <b id="fogVal">0.030</b></label>
+          <label>相位 <input type="range" id="phase" min="0" max="6.28" step="0.02" value="0.9" style="width:120px" /> <b id="phaseVal">0.90</b></label>
+          <label><input type="checkbox" id="softShadow" checked /> 软阴影</label>
+          <label><input type="checkbox" id="ao" checked /> 环境光遮蔽</label>
+          <label><input type="checkbox" id="floor" checked /> 地面</label>
+        </div>
+        <table class="stats">
+          <tr><td>每像素最多 map() 调用</td><td id="sCalls">-</td></tr>
+          <tr><td>屏幕像素</td><td id="sPix">-</td></tr>
+          <tr><td>本帧 map() 总量（上限）</td><td id="sTotal">-</td></tr>
+          <tr><td>场景图元数（每次 map 都要算）</td><td id="sPrims">-</td></tr>
+        </table>
+        <div class="warn" id="warn">-</div>
+        <div id="err"></div>
+      </section>
+    </div>
+
+    <div>
+      <section class="stage">
+        <h2>1. 核心循环只有 6 行</h2>
+        <pre>float t = 0.0;                     // 沿射线已经走了多远
+for (int i = 0; i < STEPS; i++) {
+  vec3 p = ro + rd * t;
+  float d = map(p);                // 到最近表面的距离
+  if (d < EPS) { hit = true; break; }   // 撞上了
+  t += d;                          // ← 走了 d 一定不会穿过任何表面
+  if (t > FAR) break;              // 跑出场景
+}</pre>
+        <ol class="steps">
+          <li><b>为什么可以"跳"？</b> SDF 的定义保证：以 p 为中心、半径 d 的球内一定没有表面。
+            所以沿射线推进 d 是绝对安全的 —— 这也是它比"固定小步长"快得多的原因。</li>
+          <li><b>它会慢在哪？</b> 射线贴着表面掠过时（掠射角），d 会变得极小，被迫用很多步一点点挪。
+            热力图模式下能看到：轮廓边缘和地面远处全是"深色/高步数"。</li>
+          <li><b>EPS 与 FAR 的取舍：</b> EPS 太大 → 表面出现"缺口"和气泡；太小 → 步数暴涨。
+            这是 raymarching 最典型的调参体验。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>2. 法线、软阴影、AO 都是副产品</h2>
+        <pre>// 法线：对 SDF 做中心差分（不用求导公式）
+vec3 n = normalize(vec3(
+  map(p + vec3(e,0,0)) - map(p - vec3(e,0,0)),
+  map(p + vec3(0,e,0)) - map(p - vec3(0,e,0)),
+  map(p + vec3(0,0,e)) - map(p - vec3(0,0,e))));
+
+// 软阴影：往光源方向再走一遍，记录"擦过表面"的最小程度
+float res = 1.0;
+for (...) { float h = map(ro + rd*t); res = min(res, k*h/t); t += h; }
+
+// AO：沿法线抬升采样，看 SDF 涨得多快（涨得慢 = 周围有遮挡）
+occ += (h - map(p + n*h)) * sca;</pre>
+        <p class="note">
+          注意这三件事都<b>复用了同一个 map()</b>，不需要阴影贴图、不需要法线贴图、不需要额外的几何 pass。
+          代价是像素级的重复计算：本页每像素最多 <b>几百次</b> map() —— 这也是为什么 raymarching 只适合中小场景。
+        </p>
+      </section>
+
+      <section class="stage">
+        <h2>3. 什么时候值得用</h2>
+        <ol class="steps">
+          <li><b>体积 / 程序化场景</b>：云、雾、火焰、噪波地形 —— 本来就没有三角面，SDF 是天然表示。</li>
+          <li><b>超远距离 / 无限细节</b>：分形（Mandelbulb）、无限重复的走廊。三角形数量会爆炸，SDF 不会。</li>
+          <li><b>光滑融合</b>：<code>smooth-min</code> 让两个物体的接缝自然过渡，用多边形做要重新拓扑。</li>
+          <li><b>不适合</b>：角色、大量独立物体、需要真实材质贴图和动画（骨骼）的场景。
+            工业界更常见的是混合方案：光栅化 + 局部 raymarching（比如屏幕空间反射、体积光）。</li>
+        </ol>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => { errBox.style.display = "block"; errBox.textContent += (e.message || e.error) + "\n"; });
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let l = Math.hypot(zx, zy, zz); zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  l = Math.hypot(xx, xy, xz); xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]), 1,
+  ]);
+}
+function invert4(m) {
+  const o = new Float32Array(16);
+  const a00=m[0],a01=m[1],a02=m[2],a03=m[3], a10=m[4],a11=m[5],a12=m[6],a13=m[7];
+  const a20=m[8],a21=m[9],a22=m[10],a23=m[11], a30=m[12],a31=m[13],a32=m[14],a33=m[15];
+  const b00=a00*a11-a01*a10, b01=a00*a12-a02*a10, b02=a00*a13-a03*a10, b03=a01*a12-a02*a11;
+  const b04=a01*a13-a03*a11, b05=a02*a13-a03*a12, b06=a20*a31-a21*a30, b07=a20*a32-a22*a30;
+  const b08=a20*a33-a23*a30, b09=a21*a32-a22*a31, b10=a21*a33-a23*a31, b11=a22*a33-a23*a32;
+  let det = b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06;
+  if (!det) return o;
+  det = 1 / det;
+  o[0]=(a11*b11-a12*b10+a13*b09)*det;  o[1]=(a02*b10-a01*b11-a03*b09)*det;
+  o[2]=(a31*b05-a32*b04+a33*b03)*det;  o[3]=(a22*b04-a21*b05-a23*b03)*det;
+  o[4]=(a12*b08-a10*b11-a13*b07)*det;  o[5]=(a00*b11-a02*b08+a03*b07)*det;
+  o[6]=(a32*b02-a30*b05-a33*b01)*det;  o[7]=(a20*b05-a22*b02+a23*b01)*det;
+  o[8]=(a10*b10-a11*b08+a13*b06)*det;  o[9]=(a01*b08-a00*b10-a03*b06)*det;
+  o[10]=(a30*b04-a31*b02+a33*b00)*det; o[11]=(a21*b02-a20*b04-a23*b00)*det;
+  o[12]=(a11*b07-a10*b09-a12*b06)*det; o[13]=(a00*b09-a01*b07+a02*b06)*det;
+  o[14]=(a31*b01-a30*b03-a32*b00)*det; o[15]=(a20*b03-a21*b01+a22*b00)*det;
+  return o;
+}
+
+const VS = `#version 300 es
+out vec2 v_uv;
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  v_uv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform mat4 u_invVP;
+uniform vec3 u_eye;
+uniform float u_time;
+uniform int u_steps;
+uniform int u_debug;
+uniform int u_shape;
+uniform float u_k;
+uniform float u_eps;
+uniform float u_fog;
+uniform int u_soft;
+uniform int u_ao;
+uniform int u_floor;
+out vec4 outColor;
+
+vec2 rot(vec2 p, float a) {
+  float c = cos(a), s = sin(a);
+  return vec2(c * p.x - s * p.y, s * p.x + c * p.y);
+}
+float sdSphere(vec3 p, float r) { return length(p) - r; }
+float sdBox(vec3 p, vec3 b) {
+  vec3 q = abs(p) - b;
+  return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+float sdTorus(vec3 p, vec2 t) {
+  vec2 q = vec2(length(p.xz) - t.x, p.y);
+  return length(q) - t.y;
+}
+float smin(float a, float b, float k) {
+  float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+  return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+float map(vec3 p) {
+  float t = u_time;
+  vec3 c1 = vec3(cos(t) * 1.15, 0.85 + 0.22 * sin(t * 1.3), sin(t) * 1.15);
+  float s = sdSphere(p - c1, 0.80);
+
+  vec3 bp = p - vec3(-cos(t * 0.7) * 1.45, 0.60, -sin(t * 0.7) * 1.45);
+  bp.xz = rot(bp.xz, t * 0.6);
+  float bx = sdBox(bp, vec3(0.50)) - 0.15;          // 圆角盒 = 缩小后的盒再减半径
+
+  vec3 tp = p - vec3(0.0, 1.02 + 0.18 * cos(t * 1.7), 0.0);
+  float to = sdTorus(tp, vec2(1.00, 0.28));
+
+  float m;
+  if (u_shape == 0) m = s;
+  else if (u_shape == 1) m = bx;
+  else if (u_shape == 2) m = to;
+  else m = smin(smin(s, bx, u_k), to, u_k);
+
+  if (u_floor == 1) m = min(m, p.y);
+  return m;
+}
+
+vec3 calcNormal(vec3 p) {
+  vec2 e = vec2(max(u_eps, 0.0008), 0.0);
+  return normalize(vec3(
+    map(p + e.xyy) - map(p - e.xyy),
+    map(p + e.yxy) - map(p - e.yxy),
+    map(p + e.yyx) - map(p - e.yyx)));
+}
+
+float trace(vec3 ro, vec3 rd, out float steps, out float tHit) {
+  float t = 0.0;
+  steps = 0.0;
+  tHit = -1.0;
+  for (int i = 0; i < 160; i++) {
+    if (i >= u_steps) break;
+    steps += 1.0;
+    float d = map(ro + rd * t);
+    if (d < u_eps) { tHit = t; return 1.0; }
+    t += d * 0.95;
+    if (t > 30.0) break;
+  }
+  return 0.0;
+}
+
+float softShadow(vec3 ro, vec3 rd) {
+  float res = 1.0, t = 0.06;
+  for (int i = 0; i < 16; i++) {
+    float h = map(ro + rd * t);
+    res = min(res, 8.0 * h / t);
+    t += clamp(h, 0.05, 0.5);
+    if (res < 0.01 || t > 12.0) break;
+  }
+  return clamp(res, 0.0, 1.0);
+}
+
+float calcAO(vec3 p, vec3 n) {
+  float occ = 0.0, sca = 1.0;
+  for (int i = 0; i < 4; i++) {
+    float h = 0.03 + 0.18 * float(i) / 3.0;
+    occ += (h - map(p + n * h)) * sca;
+    sca *= 0.8;
+  }
+  return clamp(1.0 - 1.5 * occ, 0.0, 1.0);
+}
+
+vec3 skyColor(vec3 rd) {
+  return mix(vec3(0.30, 0.42, 0.62), vec3(0.025, 0.04, 0.09), clamp(rd.y * 1.8 + 0.25, 0.0, 1.0));
+}
+
+void main() {
+  vec2 ndc = v_uv * 2.0 - 1.0;
+  vec4 far = u_invVP * vec4(ndc, 1.0, 1.0);
+  vec3 rd = normalize(far.xyz / far.w - u_eye);
+  vec3 ro = u_eye;
+
+  float steps, t;
+  float hit = trace(ro, rd, steps, t);
+
+  if (u_debug == 1) {
+    float g = clamp(steps / float(u_steps) * 4.0, 0.0, 1.0);
+    vec3 c = vec3(g * 1.6, g * g * 0.9, 0.15 + 0.5 * (1.0 - g));
+    if (hit > 0.5) c += vec3(0.0, 0.25, 0.0);
+    outColor = vec4(c, 1.0);
+    return;
+  }
+
+  vec3 col;
+  if (hit < 0.5) {
+    col = skyColor(rd);
+  } else {
+    vec3 p = ro + rd * t;
+    vec3 n = calcNormal(p);
+    if (u_debug == 2) { outColor = vec4(n * 0.5 + 0.5, 1.0); return; }
+
+    vec3 L = normalize(vec3(0.6, 0.75, 0.35));
+    float dif = clamp(dot(n, L), 0.0, 1.0);
+    float sh = u_soft == 1 ? softShadow(p + n * 0.02, L) : (dif > 0.0 ? 1.0 : 0.0);
+    float occ = u_ao == 1 ? calcAO(p, n) : 1.0;
+    float sky = clamp(0.4 + 0.6 * n.y, 0.0, 1.0);
+
+    // 地面用棋盘格区分，方便看清阴影和台阶
+    float checker = mod(floor(p.x) + floor(p.z), 2.0);
+    bool isFloor = (u_floor == 1 && p.y < 0.002 && abs(n.y - 1.0) < 0.02);
+    vec3 base = isFloor
+      ? mix(vec3(0.30, 0.32, 0.36), vec3(0.17, 0.19, 0.23), checker)
+      : mix(vec3(0.85, 0.42, 0.28), vec3(0.32, 0.6, 0.85), clamp(p.y * 0.6, 0.0, 1.0));
+
+    col = base * (0.30 * sky + 1.05 * dif * sh) * (0.35 + 0.65 * occ);
+    col += vec3(0.9, 0.95, 1.0) * pow(clamp(dot(n, normalize(L - rd)), 0.0, 1.0), 32.0) * sh * 0.5;
+    float dist = length(p - ro);
+    col = mix(col, skyColor(rd), clamp(1.0 - exp(-dist * u_fog), 0.0, 1.0));
+  }
+  if (u_debug == 3) {
+    float d = map(ro + rd * t * 0.5);
+    outColor = vec4(vec3(clamp(d * 2.0 + 0.5, 0.0, 1.0)), 1.0);
+    return;
+  }
+  col = pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2));
+  outColor = vec4(col, 1.0);
+}`;
+
+const prog = link(VS, FS);
+const u = {};
+for (const n of ["u_invVP", "u_eye", "u_time", "u_steps", "u_debug", "u_shape", "u_k", "u_eps",
+  "u_fog", "u_soft", "u_ao", "u_floor"]) u[n] = gl.getUniformLocation(prog, n);
+const vao = gl.createVertexArray();
+
+const el = (id) => document.getElementById(id);
+const debugEl = el("debug"), shapeEl = el("shape"), kEl = el("k"), stepsEl = el("steps");
+const epsEl = el("eps"), fogEl = el("fog"), phaseEl = el("phase");
+const softEl = el("softShadow"), aoEl = el("ao"), floorEl = el("floor");
+const cam = { yaw: 0.9, pitch: 0.22, dist: 3.9 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.006;
+  cam.pitch = Math.max(0.05, Math.min(1.2, cam.pitch - (e.clientY - lastY) * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+let frames = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  frames++;
+  const steps = Number(stepsEl.value);
+  const debug = Number(debugEl.value);
+  const shape = Number(shapeEl.value);
+  const k = Number(kEl.value);
+  const eps = Number(epsEl.value);
+  const fog = Number(fogEl.value);
+  const phase = Number(phaseEl.value);
+  el("kVal").textContent = k.toFixed(2);
+  el("stepsVal").textContent = steps;
+  el("epsVal").textContent = eps.toFixed(4);
+  el("fogVal").textContent = fog.toFixed(3);
+  el("phaseVal").textContent = phase.toFixed(2);
+
+  const W = canvas.width, H = canvas.height;
+  const eye = [
+    Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    1.5 + Math.sin(cam.pitch) * cam.dist,
+    Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const vp = mul(perspective(Math.PI / 3.4, W / H, 0.1, 100), lookAt(eye, [0, 1.0, 0], [0, 1, 0]));
+  const inv = invert4(vp);
+
+  gl.viewport(0, 0, W, H);
+  gl.disable(gl.DEPTH_TEST);
+  gl.useProgram(prog);
+  gl.uniformMatrix4fv(u.u_invVP, false, inv);
+  gl.uniform3fv(u.u_eye, eye);
+  gl.uniform1f(u.u_time, phase);
+  gl.uniform1i(u.u_steps, steps);
+  gl.uniform1i(u.u_debug, debug);
+  gl.uniform1i(u.u_shape, shape);
+  gl.uniform1f(u.u_k, k);
+  gl.uniform1f(u.u_eps, eps);
+  gl.uniform1f(u.u_fog, fog);
+  gl.uniform1i(u.u_soft, softEl.checked ? 1 : 0);
+  gl.uniform1i(u.u_ao, aoEl.checked ? 1 : 0);
+  gl.uniform1i(u.u_floor, floorEl.checked ? 1 : 0);
+  gl.bindVertexArray(vao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  const perPixel = steps + (softEl.checked ? 16 : 0) + (aoEl.checked ? 4 : 0) + 6;
+  const pix = W * H;
+  el("sCalls").textContent = perPixel + " 次";
+  el("sPix").textContent = (pix / 1000).toFixed(0) + " K";
+  el("sTotal").textContent = (perPixel * pix / 1e6).toFixed(1) + " M 次";
+  el("sPrims").textContent = (floorEl.checked ? 4 : 3) + " 个";
+  const wn = el("warn");
+  wn.textContent = debug === 1
+    ? "热力图：越亮 = 这一步用掉的步数越多。注意轮廓边缘（掠射）和远处地面 —— 那里的 SDF 值非常小，只能一点点蹭过去，这是 raymarching 最贵的区域。"
+    : "把「最大步数」调到 24 以下会看到表面出现缺口和「气泡」：射线还没走到表面就耗尽了步数。把 eps 调大（0.01 以上）也会出现同样的洞 —— 这两者就是 raymarching 的精度预算。";
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

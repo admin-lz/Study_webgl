@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · Uniform Buffer Object</title>
+  <style>
+    :root {
+      --bg: #0b0d14; --panel: #12151f; --line: #243044;
+      --text: #e8eef8; --muted: #8b97a8; --accent: #9fd4ff; --gold: #f3d27a; --bad: #ff9c9c;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 980px; }
+    header b { color: var(--accent); }
+    .layout { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 20px; padding: 20px 24px 40px; align-items: start; }
+    @media (max-width: 1020px) { .layout { grid-template-columns: 1fr; } }
+    canvas { width: 100%; height: auto; display: block; background: #08090e; border: 1px solid var(--line); border-radius: 8px; cursor: grab; }
+    canvas:active { cursor: grabbing; }
+    #layout2d { cursor: default; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+    .stage + .stage { margin-top: 16px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre { margin: 8px 0 0; background: #0a0c12; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #d5deea; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; align-items: center; color: var(--muted); font-size: 13px; }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls b { color: var(--text); font-variant-numeric: tabular-nums; min-width: 2.8em; display: inline-block; }
+    table.stats { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 10px; }
+    table.stats td { padding: 4px 6px; border-bottom: 1px solid #1b2434; }
+    table.stats td:first-child { color: var(--muted); }
+    table.stats td:last-child { text-align: right; font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .note b { color: var(--text); }
+    .warn { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: #1a2230; border: 1px solid #2c3b52; font-size: 13px; }
+    .warn.bad { background: #2a1212; border-color: #5a2424; color: #ffb4b4; }
+    #err { display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212; border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>UBO：把 uniform 打包成一块显存，一次上传多次复用</h1>
+    <p>
+      uniform 的问题是"每个 program 一组、每次 draw 都可能要传一遍"。UBO 把一组 uniform 变成<b>一块可以共享的缓冲</b>：
+      传一次，多个 draw call、多个 program 都能读。代价是你要接受 <b>std140 的排版规则</b> —— 结构体不是紧凑排列的。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <canvas id="c" width="900" height="440"></canvas>
+      <section class="stage" style="margin-top:16px">
+        <h2>std140 的实际内存布局（每个格子 = 4 字节）</h2>
+        <canvas id="layout2d" width="820" height="210" style="height:auto;background:#0a0c12"></canvas>
+        <div class="controls">
+          <label>上传布局
+            <select id="layout">
+              <option value="0" selected>std140（正确，stride 48）</option>
+              <option value="1">省字节但着色器没改（stride 32，必崩）</option>
+              <option value="2">真打包 32 字节（着色器同步改，正确）</option>
+            </select>
+          </label>
+          <label><input type="checkbox" id="shared" checked /> 相机块用 UBO 共享给两个 program</label>
+          <label><input type="checkbox" id="outline" checked /> 画第二个 program（描边）</label>
+          <label>对象数 <input type="range" id="count" min="1" max="64" step="1" value="48" style="width:150px" /> <b id="countVal">48</b></label>
+          <label>色相 <input type="range" id="hue" min="0" max="360" step="1" value="200" style="width:150px" /> <b id="hueVal">200°</b></label>
+          <label>块偏移 <input type="range" id="shift" min="0" max="16" step="1" value="0" style="width:150px" /> <b id="shiftVal">0</b></label>
+        </div>
+        <table class="stats">
+          <tr><td>std140 下 struct Obj 的大小</td><td id="sSize">-</td></tr>
+          <tr><td>实际上传的 stride</td><td id="sStride">-</td></tr>
+          <tr><td>每帧上传字节</td><td id="sBytes">-</td></tr>
+          <tr><td>读这个块的 program 数</td><td id="sProgs">-</td></tr>
+        </table>
+        <div class="warn" id="warn">-</div>
+        <div id="err"></div>
+      </section>
+    </div>
+
+    <div>
+      <section class="stage">
+        <h2>1. 为什么 uniform 不够用</h2>
+        <ol class="steps">
+          <li>普通 <code>uniform</code> 是<b>挂在 program 上</b>的：换 program 要重传，同一个值给两个 program 要传两次。
+            场景里几百个 draw call 都用到同一个相机矩阵时，这就是白白的 API 开销。</li>
+          <li>UBO 是<b>一块缓冲</b>，绑到某个 binding point，program 通过 block 索引去读。
+            一次 <code>bufferSubData</code>，所有读这块的 program 同时看到新值。</li>
+          <li>还有"每一批 draw 之间只改变量"的场景：把 per-draw 数据放进一个 UBO 数组，
+            <code>bindBufferRange</code> 换个偏移就能切换 —— 比逐个 <code>uniform*</code> 快得多。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>2. std140 的坑（本页重点）</h2>
+        <pre>struct Obj {
+  vec4  color;   // byte 0   （vec4 对齐 16）
+  vec3  offset;  // byte 16  （vec3 也对齐 16！所以不能塞在 12）
+  float scale;   // byte 28  （float 对齐 4，可以紧跟 vec3 后面）
+  vec2  uvOff;   // byte 32  （vec2 对齐 8）
+  // → 结构体自身对齐 = 16，所以 size 会被向上补齐到 48
+};</pre>
+        <ol class="steps">
+          <li><b>这不是可选项。</b>std140 规定：vec3 / vec4 按 16 字节对齐，数组元素的 stride 也要按 16 取整 ——
+            所以 <code>vec3</code> 后面永远有 4 字节空洞。</li>
+          <li>CPU 端写数据时<b>必须按同样的规则排</b>。搞错了不会报错，只会读到错位的值（比如颜色里混进了 scale）——
+            本页第一个下拉框就是干这个的，切到"紧凑 32 字节"能立刻看到画面崩掉。</li>
+          <li><b>省字节的两个办法：</b>把 <code>vec3 + float</code> 打包成 <code>vec4</code>（本页第三个选项），
+            或者用 <code>std430</code>（只在 SSBO / compute 里能用，规则更宽松）。</li>
+          <li>查询 <code>gl.getActiveUniformBlockParameter(..., UNIFORM_BLOCK_DATA_SIZE)</code> 可以拿到驱动算出的真实大小，
+            别硬编码 —— 但布局规则还是得自己守。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>3. API 三句话</h2>
+        <pre>const ubo = gl.createBuffer();
+gl.bindBuffer(gl.UNIFORM_BUFFER, ubo);
+gl.bufferData(gl.UNIFORM_BUFFER, bytes, gl.DYNAMIC_DRAW);
+
+const idx = gl.getUniformBlockIndex(prog, "Camera");
+gl.uniformBlockBinding(prog, idx, 0);            // program 侧：这块绑到 0 号槽
+gl.bindBufferBase(gl.UNIFORM_BUFFER, 0, ubo);    // 全局侧：0 号槽 = 这块缓冲</pre>
+        <p class="note">
+          每个 program 都要做一次 <code>uniformBlockBinding</code>（告诉它"你的第几号块读第几个槽"），
+          之后只要绑槽位就行。槽位数量有上限（<code>MAX_UNIFORM_BUFFER_BINDINGS</code>，一般 12~36 个），
+          所以是"槽位复用"而不是"每块一个槽"。
+        </p>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const layout2d = document.getElementById("layout2d");
+const ctx2d = layout2d.getContext("2d");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => { errBox.style.display = "block"; errBox.textContent += (e.message || e.error) + "\n"; });
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let l = Math.hypot(zx, zy, zz); zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  l = Math.hypot(xx, xy, xz); xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]), 1,
+  ]);
+}
+
+// ---- 两个 program，共用同一个 Camera 块 ----
+const BLOCK_CAM = `layout(std140) uniform Camera {
+  mat4 u_viewProj;
+  vec3 u_eye; float u_time;
+  vec4 u_fog;      // rgb = 雾色, a = 密度
+};
+uniform int u_useUniformCam;   // 1 = 走普通 uniform（模拟"忘了绑块"）
+uniform mat4 u_vp2;            // 只在上面为 1 时用；值可以是过期的`;
+const BLOCK_OBJ = `layout(std140) uniform ObjBlock {
+  // 和 CPU 端一一对应：vec4 color / vec3 offset / float scale / vec2 uvOff / vec2 pad
+  vec4 u_obj[64 * 3];   // 按 vec4 粒度读，避开逐字段对齐的歧义
+};`;
+const VS = `#version 300 es
+in vec3 a_pos;
+in vec3 a_nrm;
+uniform int u_index;      // 第几个对象（正常应该用 gl_InstanceID / 顶点属性）
+uniform int u_packMode;   // 1 = 打包模式：scale 改从 color.w 取
+uniform float u_expand;   // 第二个 program 用它把物体放大一圈做描边
+${BLOCK_CAM}
+${BLOCK_OBJ}
+out vec3 v_nrm;
+out vec3 v_world;
+out vec4 v_color;
+void main() {
+  int base = u_index * 3;
+  vec4 color = u_obj[base + 0];
+  vec3 offset = u_obj[base + 1].xyz;
+  float scale = (u_packMode == 1) ? color.w : u_obj[base + 1].w;
+  vec2 uvOff = u_obj[base + 2].xy;
+  v_color = color;
+  vec3 p = a_pos * (scale * u_expand) + offset;
+  v_world = p;
+  v_nrm = a_nrm;
+  mat4 VP = u_viewProj;
+  if (u_useUniformCam == 1) VP = u_vp2;
+  gl_Position = VP * vec4(p, 1.0);
+}`;
+const FS = `#version 300 es
+precision highp float;
+in vec3 v_nrm;
+in vec3 v_world;
+in vec4 v_color;
+${BLOCK_CAM}
+uniform int u_flat;
+out vec4 outColor;
+void main() {
+  if (u_flat == 1) { outColor = vec4(v_color.rgb * 1.8, 1.0); return; }
+  vec3 N = normalize(v_nrm);
+  if (!gl_FrontFacing) N = -N;
+  vec3 L = normalize(vec3(0.4, 0.85, 0.5));
+  float d = max(dot(N, L), 0.0) * 0.75 + 0.3;
+  vec3 col = v_color.rgb * d;
+  float dist = length(u_eye - v_world);
+  col = mix(col, u_fog.rgb, clamp(1.0 - exp(-dist * u_fog.a), 0.0, 1.0));
+  outColor = vec4(pow(col, vec3(1.0 / 2.2)), 1.0);
+}`;
+const prog = link(VS, FS);
+const FS2 = FS.replace("outColor = vec4(pow(col, vec3(1.0 / 2.2)), 1.0);", "outColor = vec4(1.0, 0.85, 0.4, 1.0);");
+const prog2 = link(VS, FS2);
+
+const buf = (target, data, usage) => {
+  const b = gl.createBuffer();
+  gl.bindBuffer(target, b);
+  gl.bufferData(target, data, usage);
+  return b;
+};
+// 球：直接用一个圆盘朝向相机的球面近似不够；这里用 icosphere 太麻烦，改用立方体+法线
+const CUBE = (() => {
+  const p = [], n = [];
+  const faces = [[0,0,1],[0,0,-1],[1,0,0],[-1,0,0],[0,1,0],[0,-1,0]];
+  for (const nn of faces) {
+    const t = Math.abs(nn[1]) > 0.5 ? [1,0,0] : [0,1,0];
+    const u = [t[1]*nn[2]-t[2]*nn[1], t[2]*nn[0]-t[0]*nn[2], t[0]*nn[1]-t[1]*nn[0]];
+    const v = [nn[1]*u[2]-nn[2]*u[1], nn[2]*u[0]-nn[0]*u[2], nn[0]*u[1]-nn[1]*u[0]];
+    for (const c of [[-1,-1],[1,-1],[1,1],[-1,1]]) {
+      p.push(nn[0] + u[0]*c[0] + v[0]*c[1], nn[1] + u[1]*c[0] + v[1]*c[1], nn[2] + u[2]*c[0] + v[2]*c[1]);
+      n.push(nn[0], nn[1], nn[2]);
+    }
+  }
+  const idx = [];
+  for (let i = 0; i < 6; i++) { const b = i * 4; idx.push(b, b+1, b+2, b, b+2, b+3); }
+  return { pos: new Float32Array(p), nrm: new Float32Array(n), idx: new Uint16Array(idx) };
+})();
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+const aPos = gl.getAttribLocation(prog, "a_pos");
+const aNrm = gl.getAttribLocation(prog, "a_nrm");
+const putAttr = (loc, data) => {
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW));
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 3, gl.FLOAT, false, 0, 0);
+};
+putAttr(aPos, CUBE.pos);
+putAttr(aNrm, CUBE.nrm);
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buf(gl.ELEMENT_ARRAY_BUFFER, CUBE.idx, gl.STATIC_DRAW));
+
+// ---- UBO ----
+const MAXOBJ = 64, STRIDE_FLOATS = 12, CAM_FLOATS = 24;
+const objUbo = gl.createBuffer();
+gl.bindBuffer(gl.UNIFORM_BUFFER, objUbo);
+gl.bufferData(gl.UNIFORM_BUFFER, MAXOBJ * STRIDE_FLOATS * 4 * 2, gl.DYNAMIC_DRAW);
+const camUbo = gl.createBuffer();
+gl.bindBuffer(gl.UNIFORM_BUFFER, camUbo);
+gl.bufferData(gl.UNIFORM_BUFFER, CAM_FLOATS * 4 * 2, gl.DYNAMIC_DRAW);
+
+function bindBlocks(p) {
+  const ci = gl.getUniformBlockIndex(p, "Camera");
+  const oi = gl.getUniformBlockIndex(p, "ObjBlock");
+  gl.uniformBlockBinding(p, ci, 0);
+  gl.uniformBlockBinding(p, oi, 1);
+}
+bindBlocks(prog);
+bindBlocks(prog2);
+gl.bindBufferBase(gl.UNIFORM_BUFFER, 0, camUbo);
+gl.bindBufferBase(gl.UNIFORM_BUFFER, 1, objUbo);
+
+const U = {};
+for (const n of ["u_index", "u_flat", "u_useUniformCam", "u_vp2", "u_packMode", "u_expand"]) U[n] = gl.getUniformLocation(prog, n);
+for (const n of ["u_index", "u_flat", "u_useUniformCam", "u_vp2", "u_packMode", "u_expand"]) U[n + "2"] = gl.getUniformLocation(prog2, n);
+
+const el = (id) => document.getElementById(id);
+const layoutEl = el("layout"), sharedEl = el("shared"), outlineEl = el("outline");
+const countEl = el("count"), hueEl = el("hue"), shiftEl = el("shift");
+
+const cam = { yaw: 0.62, pitch: 0.5, dist: 16 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.005;
+  cam.pitch = Math.max(0.06, Math.min(1.4, cam.pitch - (e.clientY - lastY) * 0.004));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+const uploadBuf = new Float32Array(MAXOBJ * STRIDE_FLOATS * 2);
+const camData = new Float32Array(CAM_FLOATS);
+// 一个刻意"过期"的 VP：用来演示没绑块时第二个 program 会怎么错
+const staleVP = new Float32Array(16);
+staleVP.set([1.6, 0, 0, 0, 0, 1.6, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1]);
+
+function buildLayout() {
+  const mode = Number(layoutEl.value);
+  const shift = Number(shiftEl.value);
+  const hue = Number(hueEl.value);
+  // mode 0: std140 语义（12 float / 48 字节）
+  // mode 1: 想省字节，只传 8 float —— 但着色器没改 → 错位
+  // mode 2: 真的改成 8 float，同时着色器也从 color.w 取 scale → 正确
+  const per = mode === 0 ? 12 : 8;
+  const expect = mode === 2 ? 8 : 12;
+  for (let i = 0; i < MAXOBJ; i++) {
+    const base = i * per + shift;
+    const h = (hue + i * 11) % 360 / 360;
+    const r = 0.5 + 0.5 * Math.cos(h * 6.2831);
+    const g = 0.5 + 0.5 * Math.cos((h + 0.33) * 6.2831);
+    const b = 0.5 + 0.5 * Math.cos((h + 0.67) * 6.2831);
+    const row = i % 8, col = (i / 8) | 0;
+    const ox = (col - 3.5) * 2.7, oz = (row - 3.5) * 2.7;
+    const scale = 0.52 + 0.14 * Math.sin(i * 1.7);
+    if (mode === 2) {
+      // 打包：scale 进 color.w，offset 用 vec4 装
+      uploadBuf[base + 0] = r; uploadBuf[base + 1] = g; uploadBuf[base + 2] = b; uploadBuf[base + 3] = scale;
+      uploadBuf[base + 4] = ox; uploadBuf[base + 5] = 0; uploadBuf[base + 6] = oz; uploadBuf[base + 7] = 0;
+    } else {
+      uploadBuf[base + 0] = r; uploadBuf[base + 1] = g; uploadBuf[base + 2] = b; uploadBuf[base + 3] = 1;
+      uploadBuf[base + 4] = ox; uploadBuf[base + 5] = 0; uploadBuf[base + 6] = oz; uploadBuf[base + 7] = scale;
+      if (per === 12) {
+        uploadBuf[base + 8] = 0; uploadBuf[base + 9] = 0; uploadBuf[base + 10] = 0; uploadBuf[base + 11] = 0;
+      }
+    }
+  }
+  const upload = new Float32Array(uploadBuf.subarray(0, MAXOBJ * per + 16));
+  gl.bindBuffer(gl.UNIFORM_BUFFER, objUbo);
+  gl.bufferSubData(gl.UNIFORM_BUFFER, 0, upload);
+  return { per, expect, bytes: upload.byteLength };
+}
+
+function drawLayout(per, expect) {
+  const W = layout2d.width, H = layout2d.height;
+  ctx2d.fillStyle = "#0a0c12"; ctx2d.fillRect(0, 0, W, H);
+  const names = ["color.r", "color.g", "color.b", "color.a", "offset.x", "offset.y", "offset.z", "scale", "uv.x", "uv.y", "pad", "pad"];
+  const cellW = (W - 20) / 12, cellH = 46;
+  const y0 = 30;
+  const ok = per === expect;
+  ctx2d.font = "10px monospace";
+  for (let i = 0; i < 12; i++) {
+    const x = 10 + i * cellW;
+    const inUpload = i < per;
+    ctx2d.fillStyle = !inUpload ? "#151b26" : (ok ? "#2b5f7a" : "#7a2b2b");
+    ctx2d.fillRect(x + 1, y0, cellW - 2, cellH);
+    ctx2d.strokeStyle = "#243044";
+    ctx2d.strokeRect(x + 1, y0, cellW - 2, cellH);
+    ctx2d.fillStyle = "#d5deea";
+    ctx2d.save();
+    ctx2d.translate(x + cellW / 2 + 4, y0 + cellH - 6);
+    ctx2d.rotate(-Math.PI / 2);
+    ctx2d.fillText(names[i], 0, 0);
+    ctx2d.restore();
+    ctx2d.fillStyle = "#8b97a8";
+    ctx2d.fillText(String(i * 4), x + 3, y0 - 6);
+  }
+  ctx2d.fillStyle = ok ? "#9fd4ff" : "#ff9c9c";
+  ctx2d.font = "12px monospace";
+  ctx2d.fillText(ok
+    ? "每对象 " + per * 4 + " 字节，两边一致 —— 阴影格是真正没用上的空洞"
+    : "上传 " + per * 4 + " 字节/对象，着色器仍按 48 字节读 → 从第二个对象起全部错位（红色 = 读到上一对象的尾巴）",
+    10, 16);
+  ctx2d.fillStyle = "#8b97a8";
+  ctx2d.font = "11px monospace";
+  ctx2d.fillText("uploaded stride = " + per * 4 + " bytes   |   shader expects " + expect * 4 + " bytes", 10, H - 12);
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const W = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const H = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+
+  const count = Number(countEl.value);
+  el("countVal").textContent = count;
+  el("hueVal").textContent = hueEl.value + "°";
+  el("shiftVal").textContent = shiftEl.value;
+  const r = buildLayout();
+  const mode = Number(layoutEl.value);
+
+  const eye = [
+    Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    Math.sin(cam.pitch) * cam.dist,
+    Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const view = lookAt(eye, [0, 0, 0], [0, 1, 0]);
+  const proj = perspective(Math.PI / 4.2, W / H, 0.2, 200);
+  const vp = mul(proj, view);
+  camData.set(vp, 0);
+  camData[16] = eye[0]; camData[17] = eye[1]; camData[18] = eye[2]; camData[19] = 0;
+  camData[20] = 0.02; camData[21] = 0.023; camData[22] = 0.035; camData[23] = 0.012;
+  gl.bindBuffer(gl.UNIFORM_BUFFER, camUbo);
+  gl.bufferSubData(gl.UNIFORM_BUFFER, 0, camData);
+
+  gl.viewport(0, 0, W, H);
+  gl.enable(gl.DEPTH_TEST);
+  gl.clearColor(0.02, 0.023, 0.035, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.bindVertexArray(vao);
+
+  // 主 program
+  gl.useProgram(prog);
+  gl.uniform1i(U.u_flat, 0);
+  gl.uniform1i(U.u_useUniformCam, 0);
+  gl.uniform1i(U.u_packMode, mode === 2 ? 1 : 0);
+  gl.uniform1f(U.u_expand, 1.0);
+  for (let i = 0; i < count; i++) {
+    gl.uniform1i(U.u_index, i);
+    gl.drawElements(gl.TRIANGLES, CUBE.idx.length, gl.UNSIGNED_SHORT, 0);
+  }
+  // 第二个 program：正常情况直接读同一块 Camera，不用再传相机
+  const shared = sharedEl.checked;
+  if (outlineEl.checked) {
+    gl.useProgram(prog2);
+    gl.uniform1i(U.u_flat2, 1);
+    gl.uniform1i(U.u_packMode2, mode === 2 ? 1 : 0);
+    // 描边做法：同一个 VS，把物体放大一点 + 只画背面；深度测试开着，
+    // 原物体挡住的部分自然被剔除，只剩外面一圈 —— 这就是 inverted hull。
+    gl.uniform1f(U.u_expand2, 1.16);
+    // shared = false：模拟"忘了给第二个 program 绑块"，只能靠一个过期的普通 uniform
+    gl.uniform1i(U.u_useUniformCam2, shared ? 0 : 1);
+    if (!shared) gl.uniformMatrix4fv(U.u_vp22, false, staleVP);
+    gl.enable(gl.CULL_FACE);
+    gl.cullFace(gl.FRONT);
+    for (let i = 0; i < count; i++) {
+      gl.uniform1i(U.u_index2, i);
+      gl.drawElements(gl.TRIANGLES, CUBE.idx.length, gl.UNSIGNED_SHORT, 0);
+    }
+    gl.disable(gl.CULL_FACE);
+  }
+
+  el("sSize").textContent = "48 字节";
+  el("sStride").textContent = r.per * 4 + " 字节" + (r.per === r.expect ? "（两边一致 ✓）" : "（着色器按 " + r.expect * 4 + " 读，对不上）");
+  el("sBytes").textContent = r.bytes + " B（" + count + " 个对象）";
+  el("sProgs").textContent = outlineEl.checked ? "2 个（共用同一块）" : "1 个";
+  const wn = el("warn");
+  wn.className = "warn" + (mode === 1 ? " bad" : "");
+  wn.textContent = mode === 0
+    ? "std140 下 vec3 后面必须补 4 字节，struct 整体对齐到 16 —— 所以 48 字节里有 4 字节是空洞。CPU 端按同一规则排，读出来才对。"
+    : mode === 1
+      ? "现在每个对象只传 32 字节，但着色器仍按 48 字节的 stride 读：第 2 个对象读到的其实是第 1 个对象的尾部。画面越靠后错得越离谱 —— 这就是 std140 没对齐时的典型症状（不报错，只是数据乱了）。"
+      : "真的做了打包：scale 塞进 color.w、offset 用 vec4 装，每对象 32 字节，同时着色器也改成从 color.w 取 scale —— 两边一致，所以画面是对的。省了 1/3 带宽，代价是 CPU / GPU 两边要成对维护。";
+  drawLayout(r.per, r.expect);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

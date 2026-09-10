@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · 裁剪空间与透视除法</title>
+  <style>
+    :root {
+      --bg: #0b0d14; --panel: #12151f; --line: #243044;
+      --text: #e8eef8; --muted: #8b97a8; --accent: #9fd4ff; --gold: #f3d27a; --ok: #7dcea0; --bad: #ff9c9c;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 980px; }
+    header b { color: var(--accent); }
+    .layout { display: grid; grid-template-columns: 1.15fr 0.85fr; gap: 20px; padding: 20px 24px 40px; align-items: start; }
+    @media (max-width: 1020px) { .layout { grid-template-columns: 1fr; } }
+    canvas { width: 100%; height: auto; display: block; background: #08090e; border: 1px solid var(--line); border-radius: 8px; }
+    #c { cursor: grab; }
+    #c:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+    .stage + .stage { margin-top: 16px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre { margin: 8px 0 0; background: #0a0c12; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #d5deea; }
+    table.chain { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    table.chain td { padding: 4px 6px; border-bottom: 1px solid #1b2434; vertical-align: top; }
+    table.chain td:first-child { color: var(--muted); width: 42%; white-space: nowrap; }
+    table.chain td:last-child { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--text); }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; align-items: center; color: var(--muted); font-size: 13px; }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls b { color: var(--text); font-variant-numeric: tabular-nums; min-width: 2.6em; display: inline-block; }
+    .verdict { margin-top: 10px; font-size: 13px; padding: 8px 10px; border-radius: 6px; background: #1a2230; border: 1px solid #2c3b52; }
+    .verdict.out { background: #2a1212; border-color: #5a2424; color: #ffb4b4; }
+    #err { display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212; border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; }
+    .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .note b { color: var(--text); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>裁剪空间与透视除法：w 到底存了什么</h1>
+    <p>
+      <code>gl_Position</code> 输出的不是屏幕坐标，而是<b>裁剪空间</b>坐标。
+      这一步的 x/y/z 都还没除以 w —— 真正的"近大远小"发生在 GPU 拿到你的顶点之后，那个除法里。
+      这一页把 local → 世界 → 观察 → 裁剪 → NDC → 像素 整条链路拆开看。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <canvas id="c" width="900" height="560"></canvas>
+      <section class="stage" style="margin-top:16px">
+        <h2>深度精度：为什么 near 调小一点点，远处的深度就废了</h2>
+        <canvas id="chart" width="820" height="240" style="height:auto"></canvas>
+        <div class="controls">
+          <label>曲线
+            <select id="chartMode">
+              <option value="0" selected>深度 depth ~ 距离</option>
+              <option value="1">精度（每级深度≈多少世界单位）</option>
+            </select>
+          </label>
+          <label>near <input type="range" id="near" min="1" max="100" step="1" value="10" style="width:130px" /> <b id="nearVal">1.0</b></label>
+          <label>far <input type="range" id="far" min="200" max="2000" step="10" value="600" style="width:130px" /> <b id="farVal">60</b></label>
+          <label>fov <input type="range" id="fov" min="20" max="110" step="1" value="55" style="width:130px" /> <b id="fovVal">55°</b></label>
+          <label><input type="checkbox" id="showFrustum" checked /> 画视锥</label>
+          <label><input type="checkbox" id="colorByTest" checked /> 按裁剪结果上色</label>
+        </div>
+        <p class="note" id="depthNote"></p>
+      </section>
+    </div>
+
+    <div>
+      <section class="stage">
+        <h2>1. 一次变换的完整链路</h2>
+        <pre>vec4 clip = P * V * M * vec4(local, 1.0);   // gl_Position
+vec3 ndc  = clip.xyz / clip.w;              // 透视除法（GPU 自动做）
+vec2 px   = (ndc.xy * 0.5 + 0.5) * viewportSize;
+depth     = ndc.z * 0.5 + 0.5;              // 写进深度缓冲的值</pre>
+        <ol class="steps">
+          <li><b>w 就是"眼睛到点的距离"的替身。</b>透视投影矩阵把观察空间的 <code>z_view</code> 塞进了 clip.w，
+            所以除以 w 就等于"按距离缩小" —— 近大远小不是单独一步，它就是这次除法。</li>
+          <li><b>正交投影的 w 恒为 1</b>，除法等于没除。这就是正交"没有透视感"的根本原因。</li>
+          <li><b>裁剪发生在除法之前。</b>GPU 拿 clip 坐标去和 <code>-w ≤ x,y,z ≤ w</code> 这个立方体求交。
+            为什么不在 NDC 里裁？因为 w 可能是 0 或负数（点在相机背后），除法会得到翻转的坐标，
+            得到的"多边形"完全是错的。先裁掉，再除，就不会遇到 w ≤ 0。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>2. 探头点的坐标（拖滑块）</h2>
+        <table class="chain">
+          <tr><td>局部 local</td><td id="cLocal">-</td></tr>
+          <tr><td>世界 world</td><td id="cWorld">-</td></tr>
+          <tr><td>观察 view（相机在原点，看 -Z）</td><td id="cView">-</td></tr>
+          <tr><td>裁剪 clip（gl_Position）</td><td id="cClip">-</td></tr>
+          <tr><td>NDC = clip.xyz / clip.w</td><td id="cNdc">-</td></tr>
+          <tr><td>窗口像素 window</td><td id="cWin">-</td></tr>
+          <tr><td>深度 depth [0,1]</td><td id="cDepth">-</td></tr>
+        </table>
+        <div class="controls">
+          <label>x <input type="range" id="px" min="-120" max="120" step="1" value="0" style="width:110px" /> <b id="pxVal">0.0</b></label>
+          <label>y <input type="range" id="py" min="-40" max="120" step="1" value="0" style="width:110px" /> <b id="pyVal">0.0</b></label>
+          <label>z <input type="range" id="pz" min="-300" max="60" step="1" value="-80" style="width:110px" /> <b id="pzVal">-8.0</b></label>
+        </div>
+        <div class="verdict" id="verdict">-</div>
+      </section>
+
+      <section class="stage">
+        <h2>3. 看图</h2>
+        <p class="note">
+          主视图是<b>旁观视角</b>：黄色线框是虚拟相机的视锥，绿色物体在视锥内，红色在视锥外。
+          右下角小窗是<b>那台虚拟相机自己看到的画面</b> —— 把 near 拉大，看物体是怎么被近平面切掉的：
+          它不是"淡出"，而是被多边形裁剪直接切掉一块。
+        </p>
+        <p class="note">
+          拖动主视图可以绕场景转。改动 near 时看第二个图：深度值在近处变化极快、远处几乎不变，
+          这就是 <b>z-fighting 总出现在远处</b>的原因，也是深度缓冲不能线性分配精度的原因。
+        </p>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => { errBox.style.display = "block"; errBox.textContent += (e.message || e.error) + "\n"; });
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let l = Math.hypot(zx, zy, zz); zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  l = Math.hypot(xx, xy, xz); xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]), 1,
+  ]);
+}
+function xform(m, v) {
+  return [
+    m[0] * v[0] + m[4] * v[1] + m[8] * v[2] + m[12] * v[3],
+    m[1] * v[0] + m[5] * v[1] + m[9] * v[2] + m[13] * v[3],
+    m[2] * v[0] + m[6] * v[1] + m[10] * v[2] + m[14] * v[3],
+    m[3] * v[0] + m[7] * v[1] + m[11] * v[2] + m[15] * v[3],
+  ];
+}
+
+const VS = `#version 300 es
+in vec3 a_pos;
+in vec3 a_nrm;
+uniform mat4 u_mvp;
+uniform mat4 u_model;
+out vec3 v_nrm;
+out vec3 v_world;
+void main() {
+  v_nrm = mat3(u_model) * a_nrm;
+  v_world = (u_model * vec4(a_pos, 1.0)).xyz;
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+const FS = `#version 300 es
+precision highp float;
+in vec3 v_nrm;
+in vec3 v_world;
+uniform vec3 u_color;
+uniform int u_unlit;
+out vec4 outColor;
+void main() {
+  if (u_unlit == 1) { outColor = vec4(u_color, 1.0); return; }
+  vec3 N = normalize(v_nrm);
+  if (!gl_FrontFacing) N = -N;
+  vec3 L = normalize(vec3(0.45, 0.8, 0.4));
+  float d = max(dot(N, L), 0.0) * 0.8 + 0.25;
+  outColor = vec4(pow(u_color * d, vec3(1.0 / 2.2)), 1.0);
+}`;
+const prog = link(VS, FS);
+gl.useProgram(prog);
+const U = {};
+for (const n of ["u_mvp", "u_model", "u_color", "u_unlit"]) U[n] = gl.getUniformLocation(prog, n);
+const A = { pos: gl.getAttribLocation(prog, "a_pos"), nrm: gl.getAttribLocation(prog, "a_nrm") };
+
+const VAO_BUFS = new Map();
+function makeVao(pos, nrm, idx) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const bufs = [];
+  const put = (loc, data, size) => {
+    const b = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+    bufs.push(b);
+  };
+  put(A.pos, pos, 3);
+  put(A.nrm, nrm, 3);
+  if (idx) {
+    const ib = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  }
+  VAO_BUFS.set(vao, bufs);
+  return vao;
+}
+function updateStream(vao, attrIndex, data) {
+  const b = VAO_BUFS.get(vao)[attrIndex];
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+}
+// 立方体：三角形 + 边线两套索引
+function cubeData() {
+  const p = [], n = [], f = [[0,0,1],[0,0,-1],[1,0,0],[-1,0,0],[0,1,0],[0,-1,0]];
+  const ax = [[0,0,1],[0,0,-1],[1,0,0],[-1,0,0],[0,1,0],[0,-1,0]];
+  for (let i = 0; i < 6; i++) {
+    const nn = ax[i];
+    const t = Math.abs(nn[1]) > 0.5 ? [1,0,0] : [0,1,0];
+    const u = [t[1]*nn[2]-t[2]*nn[1], t[2]*nn[0]-t[0]*nn[2], t[0]*nn[1]-t[1]*nn[0]];
+    const v = [nn[1]*u[2]-nn[2]*u[1], nn[2]*u[0]-nn[0]*u[2], nn[0]*u[1]-nn[1]*u[0]];
+    const corners = [[-1,-1],[1,-1],[1,1],[-1,1]];
+    for (const c of corners) {
+      p.push(nn[0] + u[0]*c[0] + v[0]*c[1], nn[1] + u[1]*c[0] + v[1]*c[1], nn[2] + u[2]*c[0] + v[2]*c[1]);
+      n.push(nn[0], nn[1], nn[2]);
+    }
+  }
+  const tri = [];
+  for (let i = 0; i < 6; i++) { const b = i * 4; tri.push(b, b+1, b+2, b, b+2, b+3); }
+  return { pos: new Float32Array(p), nrm: new Float32Array(n), tri: new Uint16Array(tri) };
+}
+const CUBE = cubeData();
+const cubeVao = makeVao(CUBE.pos, CUBE.nrm, CUBE.tri);
+const EDGE_IDX = new Uint16Array([0,1,1,2,2,3,3,0, 4,5,5,6,6,7,7,4, 0,4,1,5,2,6,3,7]);
+const cubeEdge = [];
+for (let i = 0; i < 6; i++) for (const e of EDGE_IDX) cubeEdge.push(i * 4 + e);
+const cubeEdgeVao = makeVao(CUBE.pos, CUBE.nrm, new Uint16Array(cubeEdge));
+const sphereVao = makeVao(
+  (() => { const a = []; for (let y = 0; y <= 12; y++) for (let x = 0; x <= 24; x++) { const ph = y/12*Math.PI, th = x/24*Math.PI*2; a.push(Math.sin(ph)*Math.cos(th), Math.cos(ph), Math.sin(ph)*Math.sin(th)); } return new Float32Array(a); })(),
+  (() => { const a = []; for (let y = 0; y <= 12; y++) for (let x = 0; x <= 24; x++) { const ph = y/12*Math.PI, th = x/24*Math.PI*2; a.push(Math.sin(ph)*Math.cos(th), Math.cos(ph), Math.sin(ph)*Math.sin(th)); } return new Float32Array(a); })(),
+  (() => { const a = []; for (let y = 0; y < 12; y++) for (let x = 0; x < 24; x++) { const i0 = y*25+x, i1 = i0+25; a.push(i0,i1,i0+1, i0+1,i1,i1+1); } return new Uint16Array(a); })()
+);
+const frustumVao = makeVao(new Float32Array(24 * 3), new Float32Array(24 * 3), null);
+
+const el = (id) => document.getElementById(id);
+const nearEl = el("near"), farEl = el("far"), fovEl = el("fov"), chartModeEl = el("chartMode");
+const showFrustumEl = el("showFrustum"), colorByTestEl = el("colorByTest");
+const pxEl = el("px"), pyEl = el("py"), pzEl = el("pz");
+const chart = el("chart"), ctx2d = chart.getContext("2d");
+
+const cam = { yaw: 0.30, pitch: 0.34, dist: 32 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.005;
+  cam.pitch = Math.max(0.03, Math.min(1.4, cam.pitch - (e.clientY - lastY) * 0.004));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+const EYE = [0, 1.6, 0];            // 虚拟相机：在原点上方，看向 -Z
+const CUBES = [
+  { p: [0, 0, -0.4], s: 0.45, c: [0.95, 0.72, 0.35] },
+  { p: [-2.6, 0, -3.2], s: 0.6, c: [0.5, 0.8, 0.95] },
+  { p: [2.8, 0, -5.0], s: 0.7, c: [0.6, 0.9, 0.6] },
+  { p: [0, 0, -11], s: 0.9, c: [0.85, 0.65, 0.9] },
+  { p: [-9, 0, -4], s: 0.8, c: [0.9, 0.55, 0.5] },
+  { p: [7.5, 0, -26], s: 1.1, c: [0.55, 0.75, 0.95] },
+  { p: [0, 0, -46], s: 1.2, c: [0.9, 0.9, 0.6] },
+];
+function modelM(p, s) { return new Float32Array([s,0,0,0, 0,s,0,0, 0,0,s,0, p[0], p[1], p[2], 1]); }
+
+// 从 viewProj 提取 6 个裁剪平面（Gribb-Hartmann）
+const ROWS = (m) => [[m[0],m[4],m[8],m[12]], [m[1],m[5],m[9],m[13]], [m[2],m[6],m[10],m[14]], [m[3],m[7],m[11],m[15]]];
+function extractPlanes(m) {
+  const r = ROWS(m);
+  const add = (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2], a[3]+b[3]];
+  const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2], a[3]-b[3]];
+  const pl = [add(r[3], r[0]), sub(r[3], r[0]), add(r[3], r[1]), sub(r[3], r[1]), add(r[3], r[2]), sub(r[3], r[2])];
+  return pl.map((p) => {
+    const l = Math.hypot(p[0], p[1], p[2]) || 1;
+    return [p[0]/l, p[1]/l, p[2]/l, p[3]/l];
+  });
+}
+function sphereOutside(planes, c, r) {
+  for (const p of planes) if (p[0]*c[0] + p[1]*c[1] + p[2]*c[2] + p[3] < -r) return true;
+  return false;
+}
+
+let near = 1, far = 60, fovDeg = 55, aspect = 1.6;
+let vpVirtual = null, planes = [];
+let curProj = null, insetRect = { x: 0, y: 0, w: 300, h: 190 };
+const probe = [0, 0, -8];
+
+function refreshReadout(chartOnly) {
+  near = Number(nearEl.value) / 10;
+  far = Number(farEl.value) / 10;
+  if (near > far - 2) { near = far - 2; }
+  fovDeg = Number(fovEl.value);
+  el("nearVal").textContent = near.toFixed(1);
+  el("farVal").textContent = far.toFixed(0);
+  el("fovVal").textContent = fovDeg + "°";
+  probe[0] = Number(pxEl.value) / 10;
+  probe[1] = Number(pyEl.value) / 10;
+  probe[2] = Number(pzEl.value) / 10;
+  el("pxVal").textContent = probe[0].toFixed(1);
+  el("pyVal").textContent = probe[1].toFixed(1);
+  el("pzVal").textContent = probe[2].toFixed(1);
+  aspect = insetRect.w / insetRect.h;
+  if (chartOnly) { drawChart(); return; }
+
+  const proj = perspective(fovDeg * Math.PI / 180, aspect, near, far);
+  curProj = proj;
+  const view = lookAt(EYE, [EYE[0], EYE[1], EYE[2] - 1], [0, 1, 0]);
+  const vp = mul(proj, view);
+  const clip = xform(vp, [probe[0], probe[1], probe[2], 1]);
+  const v = xform(view, [probe[0], probe[1], probe[2], 1]);
+  const f3 = (a) => "(" + a.map((x) => (Math.abs(x) < 1e-4 ? 0 : x).toFixed(3)).join(", ") + ")";
+  el("cLocal").textContent = f3(probe);
+  el("cWorld").textContent = f3(probe);
+  el("cView").textContent = f3(v.slice(0, 3));
+  el("cClip").textContent = f3(clip);
+  const behind = clip[3] <= 0;
+  if (behind) {
+    el("cNdc").textContent = "—（w ≤ 0，不能除）";
+    el("cWin").textContent = "—";
+    el("cDepth").textContent = "—";
+  } else {
+    const ndc = [clip[0]/clip[3], clip[1]/clip[3], clip[2]/clip[3]];
+    el("cNdc").textContent = f3(ndc);
+    el("cWin").textContent = "(" + ((ndc[0]*0.5+0.5)*insetRect.w).toFixed(1) + ", " + ((1-(ndc[1]*0.5+0.5))*insetRect.h).toFixed(1) + ") px（小窗内）";
+    el("cDepth").textContent = (ndc[2]*0.5+0.5).toFixed(6);
+  }
+  const vd = el("verdict");
+  const outside = Math.abs(clip[0]) > clip[3] || Math.abs(clip[1]) > clip[3] || Math.abs(clip[2]) > clip[3];
+  if (behind) {
+    vd.className = "verdict out";
+    vd.textContent = "w = " + clip[3].toFixed(3) + " ≤ 0：点在相机平面之后。透视除法在这里没有意义，所以 GPU 先在裁剪空间把它切掉。";
+  } else if (outside) {
+    vd.className = "verdict out";
+    vd.textContent = "|-w ≤ x,y,z ≤ w| 不成立：这个点会被裁掉（对应的图元会被切成新的多边形）。";
+  } else {
+    vd.className = "verdict";
+    vd.textContent = "在裁剪体内：裁剪保留，透视除法后落在 NDC 立方体 [-1,1]³ 里，最终画到屏幕。";
+  }
+  drawChart();
+}
+
+function depthAt(zv) {
+  const c = xform(curProj, [0, 0, zv, 1]);
+  return c[2] / c[3] * 0.5 + 0.5;
+}
+function precisionAt(zv) {
+  const d = 0.01;
+  const dd = Math.abs(depthAt(zv + d) - depthAt(zv));
+  const steps = 16777215;
+  return dd < 1e-12 ? Infinity : d / (dd * steps);
+}
+let chartKey = "";
+function drawChart() {
+  const key = [near, far, probe[2], chartModeEl.value, chart.width].join(",");
+  if (key === chartKey) return;
+  chartKey = key;
+  const W = chart.width, H = chart.height;
+  const pad = { l: 64, r: 14, t: 16, b: 30 };
+  ctx2d.fillStyle = "#0a0c12"; ctx2d.fillRect(0, 0, W, H);
+  ctx2d.strokeStyle = "#243044"; ctx2d.lineWidth = 1;
+  ctx2d.strokeRect(pad.l, pad.t, W - pad.l - pad.r, H - pad.t - pad.b);
+  const mode = Number(chartModeEl.value);
+  const N = 320;
+  const vals = [];
+  for (let i = 0; i <= N; i++) {
+    const t = i / N;
+    const zv = -(near + (far - near) * t);
+    vals.push(mode === 0 ? depthAt(zv) : Math.log10(Math.max(precisionAt(zv), 1e-9)));
+  }
+  let lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+  if (mode === 0) { lo = 0; hi = 1; }
+  if (hi - lo < 1e-6) hi = lo + 1;
+  const X = (t) => pad.l + t * (W - pad.l - pad.r);
+  const Y = (val) => pad.t + (1 - (val - lo) / (hi - lo)) * (H - pad.t - pad.b);
+  ctx2d.strokeStyle = "#2b3a52";
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + (i / 4) * (H - pad.t - pad.b);
+    ctx2d.beginPath(); ctx2d.moveTo(pad.l, y); ctx2d.lineTo(W - pad.r, y); ctx2d.stroke();
+  }
+  ctx2d.strokeStyle = "#9fd4ff"; ctx2d.lineWidth = 2;
+  ctx2d.beginPath();
+  for (let i = 0; i <= N; i++) {
+    const px2 = X(i / N), py2 = Y(vals[i]);
+    if (i === 0) ctx2d.moveTo(px2, py2); else ctx2d.lineTo(px2, py2);
+  }
+  ctx2d.stroke();
+  // 探头点竖线
+  const zAbs = Math.abs(probe[2]);
+  if (zAbs >= near && zAbs <= far) {
+    const t = (zAbs - near) / (far - near);
+    ctx2d.strokeStyle = "#f3d27a"; ctx2d.lineWidth = 1.5;
+    ctx2d.beginPath(); ctx2d.moveTo(X(t), pad.t); ctx2d.lineTo(X(t), H - pad.b); ctx2d.stroke();
+    const val = mode === 0 ? depthAt(-zAbs) : Math.log10(Math.max(precisionAt(-zAbs), 1e-9));
+    ctx2d.fillStyle = "#f3d27a";
+    ctx2d.beginPath(); ctx2d.arc(X(t), Y(val), 4, 0, Math.PI * 2); ctx2d.fill();
+  }
+  ctx2d.fillStyle = "#8b97a8"; ctx2d.font = "11px monospace";
+  ctx2d.fillText(mode === 0 ? "depth（0 = 近平面, 1 = 远平面）" : "log10(世界单位 / 每一级深度)", pad.l - 4, pad.t - 4);
+  ctx2d.fillText("near " + near.toFixed(1), pad.l, H - 10);
+  ctx2d.fillText("far " + far.toFixed(0), W - pad.r - 52, H - 10);
+  const p1 = precisionAt(-near - 0.001), p2 = precisionAt(-far);
+  el("depthNote").textContent = "near=" + near.toFixed(1) + "：近平面附近 1 级深度 ≈ " + p1.toFixed(6) +
+    " 世界单位；到 far=" + far.toFixed(0) + " 处 1 级深度 ≈ " + p2.toFixed(2) +
+    " 世界单位。精度比是 " + Math.round(p2 / p1).toLocaleString() + " 倍 —— 深度值不是均匀分配距离的，它分配的是 1/z。";
+}
+
+function drawScene(prog2, vp, model, color, unlit, vao, count, mode, depthTest) {
+  gl.uniformMatrix4fv(U.u_mvp, false, mul(vp, model));
+  gl.uniformMatrix4fv(U.u_model, false, model);
+  gl.uniform3fv(U.u_color, new Float32Array(color));
+  gl.uniform1i(U.u_unlit, unlit);
+  gl.bindVertexArray(vao);
+  gl.drawElements(mode, count, gl.UNSIGNED_SHORT, 0);
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const W = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const H = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+  // 先定小窗位置：虚拟相机的宽高比就是小窗的宽高比，读数和画面才对得上
+  insetRect = { w: Math.floor(W * 0.34), h: Math.floor(H * 0.34), x: 0, y: 0 };
+  insetRect.x = W - insetRect.w - 12;
+  insetRect.y = H - insetRect.h - 12;
+  refreshReadout(false);
+
+  const aspectV = insetRect.w / insetRect.h;
+  const projV = perspective(fovDeg * Math.PI / 180, aspectV, near, far);
+  const viewV = lookAt(EYE, [EYE[0], EYE[1], EYE[2] - 1], [0, 1, 0]);
+  vpVirtual = mul(projV, viewV);
+  planes = extractPlanes(vpVirtual);
+  const vpInset = vpVirtual;
+  const inset = insetRect;
+
+  const target = [0, 0, -(near + far) / 2];
+  const eye = [
+    target[0] + Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    target[1] + Math.sin(cam.pitch) * cam.dist,
+    target[2] + Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const projMain = perspective(Math.PI / 4.2, W / H, 0.3, 400);
+  const vpMain = mul(projMain, lookAt(eye, target, [0, 1, 0]));
+
+  gl.useProgram(prog);
+  gl.enable(gl.DEPTH_TEST);
+  gl.disable(gl.SCISSOR_TEST);
+  gl.viewport(0, 0, W, H);
+  gl.clearColor(0.02, 0.023, 0.035, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  // 视锥线框
+  if (showFrustumEl.checked) {
+    const th = Math.tan(fovDeg * Math.PI / 180 / 2);
+    const hx = (z, a) => th * z * a, hy = (z) => th * z;
+    const nz = -near, fz = -far;
+    const aMain = aspectV;
+    const c = [
+      [-hx(near, aMain), -hy(near), nz], [hx(near, aMain), -hy(near), nz], [hx(near, aMain), hy(near), nz], [-hx(near, aMain), hy(near), nz],
+      [-hx(far, aMain), -hy(far), fz], [hx(far, aMain), -hy(far), fz], [hx(far, aMain), hy(far), fz], [-hx(far, aMain), hy(far), fz],
+    ];
+    const E = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+    const verts = [];
+    for (const e of E) { verts.push(c[e[0]][0], c[e[0]][1] + EYE[1], c[e[0]][2], c[e[1]][0], c[e[1]][1] + EYE[1], c[e[1]][2]); }
+    gl.bindVertexArray(frustumVao);
+    updateStream(frustumVao, 0, new Float32Array(verts));
+    gl.uniformMatrix4fv(U.u_mvp, false, vpMain);
+    gl.uniformMatrix4fv(U.u_model, false, new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]));
+    gl.uniform3fv(U.u_color, new Float32Array([0.95, 0.85, 0.35]));
+    gl.uniform1i(U.u_unlit, 1);
+    gl.drawArrays(gl.LINES, 0, verts.length / 3);
+  }
+
+  // 物体（旁观视角）
+  for (const cu of CUBES) {
+    const m = modelM(cu.p, cu.s);
+    const out = sphereOutside(planes, cu.p, cu.s * 1.74);
+    let col = cu.c;
+    if (colorByTestEl.checked) col = out ? [0.85, 0.28, 0.28] : [0.35, 0.85, 0.5];
+    if (out && colorByTestEl.checked) drawScene(prog, vpMain, m, col, 1, cubeEdgeVao, cubeEdge.length, gl.LINES, true);
+    else drawScene(prog, vpMain, m, col, 0, cubeVao, 36, gl.TRIANGLES, true);
+  }
+  // 探头点
+  const pm = modelM(probe, 0.16);
+  drawScene(prog, vpMain, pm, [1.0, 0.85, 0.3], 1, sphereVao, 12 * 24 * 6, gl.TRIANGLES, true);
+
+  // 内嵌：虚拟相机自己看到的东西
+  gl.enable(gl.SCISSOR_TEST);
+  gl.scissor(inset.x, inset.y, inset.w, inset.h);
+  gl.viewport(inset.x, inset.y, inset.w, inset.h);
+  gl.clearColor(0.05, 0.06, 0.09, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  for (const cu of CUBES) {
+    const m = modelM(cu.p, cu.s);
+    const out = sphereOutside(planes, cu.p, cu.s * 1.74);
+    let col = cu.c;
+    if (colorByTestEl.checked) col = out ? [0.85, 0.28, 0.28] : [0.35, 0.85, 0.5];
+    drawScene(prog, vpInset, m, col, 0, cubeVao, 36, gl.TRIANGLES, true);
+  }
+  const pmi = modelM(probe, 0.16);
+  drawScene(prog, vpInset, pmi, [1.0, 0.85, 0.3], 1, sphereVao, 12 * 24 * 6, gl.TRIANGLES, true);
+  gl.disable(gl.SCISSOR_TEST);
+}
+
+// aspect 依赖小窗尺寸，第一次 refreshReadout 前先估一个
+insetRect = { w: 306, h: 190, x: 0, y: 0 };
+refreshReadout(false);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

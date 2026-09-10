@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · 纹理过滤与 mipmap</title>
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --panel: #12151f;
+      --line: #243044;
+      --text: #e8eef8;
+      --muted: #8b97a8;
+      --accent: #9fd4ff;
+      --gold: #f3d27a;
+      --ok: #7dcea0;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 940px; }
+    header b { color: var(--accent); }
+    .layout {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 20px;
+      padding: 20px 24px 40px;
+      align-items: start;
+    }
+    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
+    canvas {
+      width: 100%; height: auto; display: block;
+      background: #08090e; border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre {
+      margin: 10px 0 0; background: #0a0c12; border: 1px solid var(--line);
+      border-radius: 6px; padding: 12px 14px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #d5deea; white-space: pre;
+    }
+    .note { color: var(--muted); font-size: 13px; margin-top: 10px; }
+    .note b { color: var(--text); }
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 10px 16px;
+      margin-top: 12px; align-items: center;
+      color: var(--muted); font-size: 13px;
+    }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .stats {
+      margin-top: 12px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px 16px; font-size: 12.5px; color: var(--muted);
+    }
+    .stats b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .stats .hl { color: var(--gold); }
+    .hint {
+      margin: 10px 0 0; padding: 10px 12px; border-radius: 6px;
+      background: #1a2230; border: 1px solid #2c3b52; color: var(--text);
+      font-size: 13px; min-height: 4.2em;
+    }
+    .hint.bad { background: #2a1212; border-color: #5a2424; color: #ffb4b4; }
+    .hint.ok { background: #102018; border-color: #2a4a38; color: var(--ok); }
+    .ramp { height: 10px; border-radius: 3px; margin-top: 8px;
+      background: linear-gradient(90deg, #1e2e80, #2fa6c8, #6fd06a, #f0c04a, #e2603a); }
+    .ramp-lab { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
+    #err {
+      display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212;
+      border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>纹理过滤与 mipmap：一个像素到底该取哪个纹素</h1>
+    <p>
+      纹理不是「把图贴上去」那么简单：屏幕一个像素可能只覆盖半个纹素（放大），也可能盖住几十个纹素（缩小）。
+      放大用 <b>magFilter</b> 插值，缩小靠 <b>minFilter + mipmap</b> 先选层再插值。
+      这页把两组过滤器和 mip 链都摊开给你看。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <section class="stage">
+        <h2>1. 同一张贴图，为什么远处会"沸腾"</h2>
+        <ol class="steps">
+          <li>地面铺的是一张 <b>256×256 的棋盘格</b>，格子里还画了 2 像素宽的细边 —— 高频内容。</li>
+          <li>UV 按世界坐标每 <b>8 个单位</b>重复一次，所以 1 个纹素只有 <b>0.031 个世界单位</b>宽。</li>
+          <li>近处：一个像素盖不到 1 个纹素 → <b>放大</b>，取最近点会看到方块（锯齿）。</li>
+          <li>远处：一个像素盖住 <b>几十个纹素</b> → <b>缩小</b>。如果只从第 0 层取 4 个样，就会把高频内容混叠成随相机移动而闪动的噪声。</li>
+        </ol>
+        <p class="note">
+          mipmap 就是<b>预先算好的一串逐级缩小一半的图</b>，一共 N+1 层，总显存只多约 <b>1/3</b>。
+          缩小的时候先在链上选一层（或两层混合），再从那一层里取 4 个样。
+        </p>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>2. 两组过滤器，管的是两件不同的事</h2>
+        <pre>minFilter: NEAREST | LINEAR                      ← 缩小、且只用第 0 层
+           NEAREST_MIPMAP_NEAREST | LINEAR_MIPMAP_NEAREST   ← 选一层，层内 NEAREST/LINEAR
+           NEAREST_MIPMAP_LINEAR  | LINEAR_MIPMAP_LINEAR    ← 选两层再线性混合（三线性）
+magFilter: NEAREST | LINEAR                      ← 放大，只作用在第 0 层</pre>
+        <p class="note">
+          <b>缩小一共三种组合方式：</b>不跨层（可能闪烁）、跨层但不混合（层与层交界处会有可见的"台阶"）、
+          跨层且混合（<code>LINEAR_MIPMAP_LINEAR</code>，代价是 8 次取样，质量最好）。
+        </p>
+        <p class="note">
+          <b>各向异性过滤</b>（<code>EXT_texture_filter_anisotropic</code>）解决的是另一种情况：
+          地面被压得很扁时，一个像素在 UV 上的形状是<b>细长条</b>而不是正方形，
+          各向同性 mipmap 只能按长边降分辨率 → 结果糊。这个扩展在浏览器里要主动查，不是核心特性，本页不依赖它。
+        </p>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>3. 最容易踩的坑：纹理"不完整"</h2>
+        <ol class="steps">
+          <li>WebGL2 里 <code>MIN_FILTER</code> 的<b>默认值是 <code>NEAREST_MIPMAP_LINEAR</code></b>，也就是「需要 mipmap」。</li>
+          <li>如果你上传完贴图<b>没有</b> <code>generateMipmap</code>，这条 mip 链就是空的。</li>
+          <li>此时纹理被判为 <b>incomplete</b>，采样不会报错，而是<b>静默返回黑色</b>（准确说是 (0,0,0,1)）。</li>
+          <li>顺带一提：<b>非 2 的幂</b>尺寸在 WebGL2 里完全合法，照样能生成 mipmap —— WebGL1 的限制已经取消了。</li>
+        </ol>
+        <p class="note">
+          把下面的「生成 mipmap」关掉、同时 <code>minFilter</code> 保持带 mipmap 的那种，就能看到整块地面变黑。
+          这就是为什么现实中大部分「贴图是黑的」都跟这一条有关。
+        </p>
+        <p class="note">
+          <b>顺带一个更隐蔽的坑：</b>「不调用 <code>generateMipmap</code>」并不会把已经生成的 mip 层删掉 ——
+          它们还留在纹理对象里，纹理依然是完整的，画面不会有任何变化。
+          要真正复现「漏了 generateMipmap」，必须<b>重新上传 level 0</b>（或换一个纹理对象）。
+          所以这个页面在切换开关时是<b>重建纹理</b>的，而不是「这次跳过那一行」。
+        </p>
+      </section>
+    </div>
+
+    <div>
+      <canvas id="c" width="900" height="560"></canvas>
+
+      <section class="stage" style="margin-top:16px">
+        <div class="controls">
+          <label>缩小过滤
+            <select id="minFilter"></select>
+          </label>
+          <label>放大过滤
+            <select id="magFilter">
+              <option value="9728">NEAREST</option>
+              <option value="9729" selected>LINEAR</option>
+            </select>
+          </label>
+          <label>环绕方式
+            <select id="wrap">
+              <option value="10497" selected>REPEAT</option>
+              <option value="33071">CLAMP_TO_EDGE</option>
+              <option value="33648">MIRRORED_REPEAT</option>
+            </select>
+          </label>
+          <label><input type="checkbox" id="genMip" checked /> 上传后 generateMipmap</label>
+          <label><input type="checkbox" id="mipDebug" /> 显示 mip 选择</label>
+          <label>固定 mip 级别 <input type="range" id="forceLod" min="-1" max="8" step="1" value="-1" style="width:110px" /> <b id="lodVal">自动</b></label>
+        </div>
+        <div class="stats">
+          <div>当前 minFilter：<b id="sMin" class="hl">-</b></div>
+          <div>当前 magFilter：<b id="sMag">-</b></div>
+          <div>纹理尺寸：<b id="sSize">-</b></div>
+          <div>可用 mip 级别：<b id="sLevels">-</b></div>
+          <div>纹素密度：<b id="sTexel">-</b> 世界单位 / 纹素</div>
+          <div>纹理完整性：<b id="sComplete">-</b></div>
+        </div>
+        <div class="ramp"></div>
+        <div class="ramp-lab"><span>mip 0（最清晰）</span><span>mip N（最糊）</span></div>
+        <p class="hint" id="hint"></p>
+        <div id="err"></div>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => {
+  errBox.style.display = "block";
+  errBox.textContent += (e.message || e.error) + "\n";
+});
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  }
+  return sh;
+}
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+      a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  }
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let len = Math.hypot(zx, zy, zz); zx /= len; zy /= len; zz /= len;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  len = Math.hypot(xx, xy, xz); xx /= len; xy /= len; xz /= len;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+    1,
+  ]);
+}
+
+const VS = `#version 300 es
+in vec3 a_pos;
+in vec2 a_uv;
+uniform mat4 u_mvp;
+out vec2 v_uv;
+void main() {
+  v_uv = a_uv;
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_tex;
+uniform vec2 u_texSize;
+uniform int u_mipDebug;   // 1 = 用屏幕导数把"该选哪层 mip"上色
+uniform float u_forceLod; // >=0 时固定取这一层，-1 表示交给硬件
+uniform float u_maxLod;
+out vec4 outColor;
+
+vec3 ramp(float t) {
+  t = clamp(t, 0.0, 1.0);
+  if (t < 0.5) return mix(vec3(0.12, 0.18, 0.50), vec3(0.43, 0.82, 0.42), t * 2.0);
+  return mix(vec3(0.43, 0.82, 0.42), vec3(0.89, 0.38, 0.23), (t - 0.5) * 2.0);
+}
+
+void main() {
+  // uv 乘上纹理尺寸 → 得到"纹素坐标"，它的屏幕导数就是
+  // "一个像素在纹理上跨了多少个纹素"，取 log2 就是理想的 mip 级别。
+  vec2 ddx = dFdx(v_uv * u_texSize);
+  vec2 ddy = dFdy(v_uv * u_texSize);
+  float texelsPerPixel = max(length(ddx), length(ddy));
+  float autoLod = log2(max(texelsPerPixel, 1e-6));
+
+  if (u_forceLod >= 0.0) {
+    // textureLod 直接跳过导数计算，硬取某一层：用来一格一格看 mip 链
+    outColor = vec4(textureLod(u_tex, v_uv, u_forceLod).rgb, 1.0);
+    return;
+  }
+  if (u_mipDebug == 1) {
+    outColor = vec4(ramp(autoLod / max(u_maxLod, 1.0)), 1.0);
+    return;
+  }
+  // texture() 会自动算导数、选层、按 minFilter 过滤
+  outColor = vec4(texture(u_tex, v_uv).rgb, 1.0);
+}`;
+
+const prog = link(VS, FS);
+gl.useProgram(prog);
+const uMvp = gl.getUniformLocation(prog, "u_mvp");
+const uTexSize = gl.getUniformLocation(prog, "u_texSize");
+const uMipDebug = gl.getUniformLocation(prog, "u_mipDebug");
+const uForceLod = gl.getUniformLocation(prog, "u_forceLod");
+const uMaxLod = gl.getUniformLocation(prog, "u_maxLod");
+const aPos = gl.getAttribLocation(prog, "a_pos");
+const aUv = gl.getAttribLocation(prog, "a_uv");
+
+function makeMesh(verts, uvs) {
+  // 注意：new Float32Array([[1,2],[3,4]]) 不会展平，而是得到两个 NaN。
+  // 顶点全是 NaN 时 GPU 一个像素都不画，而且不报任何错，非常难查。
+  const flat = (a) => Float32Array.from(Array.isArray(a[0]) ? a.flat() : a);
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+  gl.bufferData(gl.ARRAY_BUFFER, flat(verts), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+  const ub = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, ub);
+  gl.bufferData(gl.ARRAY_BUFFER, flat(uvs), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(aUv);
+  gl.vertexAttribPointer(aUv, 2, gl.FLOAT, false, 0, 0);
+  return vao;
+}
+
+// 地面：x ∈ [-220, 220]，z ∈ [-420, 26]，UV 每 8 个单位重复一次
+const TILE = 8;
+const GP = [[-220, 0, 26], [220, 0, 26], [220, 0, -420], [-220, 0, 26], [220, 0, -420], [-220, 0, -420]];
+const groundVao = makeMesh(GP, GP.map((v) => [v[0] / TILE, v[2] / TILE]));
+
+// "放大镜"小板：正对相机，UV 只截取贴图的 1/4（64 个纹素），
+// 铺到几百个像素上 → 每个纹素放大到好几个像素，NEAREST 的方块一眼可见
+const MQ = [[-2.2, 0.9, 14.5], [2.2, 0.9, 14.5], [2.2, 3.3, 14.5], [-2.2, 0.9, 14.5], [2.2, 3.3, 14.5], [-2.2, 3.3, 14.5]];
+const magVao = makeMesh(MQ, [[0, 0], [0.25, 0], [0.25, 0.25], [0, 0], [0.25, 0.25], [0, 0.25]]);
+
+// ---------- 程序化棋盘格贴图 ----------
+const TEX_SIZE = 256, CELL = 16;
+const texData = new Uint8Array(TEX_SIZE * TEX_SIZE * 4);
+for (let y = 0; y < TEX_SIZE; y++) {
+  for (let x = 0; x < TEX_SIZE; x++) {
+    const cx = Math.floor(x / CELL), cy = Math.floor(y / CELL);
+    const on = ((cx + cy) & 1) === 0;
+    let r = on ? 226 : 52, g = on ? 228 : 56, b = on ? 216 : 68;
+    // 格子里再套一层高频细边：这是最容易产生混叠的内容
+    const inCellX = x % CELL, inCellY = y % CELL;
+    if (inCellX < 2 || inCellY < 2) { r = on ? 150 : 30; g = on ? 152 : 32; b = on ? 148 : 40; }
+    // 每 8 格一条彩色参考线，用来看远处到底混成了什么
+    if (cx % 8 === 0) { r = 236; g = 112; b = 84; }
+    if (cy % 8 === 0) { r = 96; g = 176; b = 248; }
+    const i = (y * TEX_SIZE + x) * 4;
+    texData[i] = r; texData[i + 1] = g; texData[i + 2] = b; texData[i + 3] = 255;
+  }
+}
+
+const MAX_LOD = Math.log2(TEX_SIZE) | 0; // 256 → 8
+gl.uniform2f(uTexSize, TEX_SIZE, TEX_SIZE);
+gl.uniform1f(uMaxLod, MAX_LOD);
+gl.uniform1i(gl.getUniformLocation(prog, "u_tex"), 0);
+
+const MIN_FILTERS = [
+  ["NEAREST（不跨层）", gl.NEAREST],
+  ["LINEAR（不跨层）", gl.LINEAR],
+  ["NEAREST_MIPMAP_NEAREST", gl.NEAREST_MIPMAP_NEAREST],
+  ["LINEAR_MIPMAP_NEAREST", gl.LINEAR_MIPMAP_NEAREST],
+  ["NEAREST_MIPMAP_LINEAR", gl.NEAREST_MIPMAP_LINEAR],
+  ["LINEAR_MIPMAP_LINEAR（三线性）", gl.LINEAR_MIPMAP_LINEAR],
+];
+const minSel = document.getElementById("minFilter");
+for (const [name, v] of MIN_FILTERS) {
+  const o = document.createElement("option");
+  o.value = String(v);
+  o.textContent = name;
+  minSel.appendChild(o);
+}
+minSel.value = String(gl.LINEAR_MIPMAP_LINEAR);
+const magSel = document.getElementById("magFilter");
+const wrapSel = document.getElementById("wrap");
+const genMipEl = document.getElementById("genMip");
+const mipDebugEl = document.getElementById("mipDebug");
+const forceLodEl = document.getElementById("forceLod");
+const lodVal = document.getElementById("lodVal");
+const hintEl = document.getElementById("hint");
+
+const NAME_BY_VALUE = {};
+for (const [name, v] of MIN_FILTERS) NAME_BY_VALUE[v] = name.split("（")[0];
+NAME_BY_VALUE[gl.NEAREST] = "NEAREST";
+NAME_BY_VALUE[gl.LINEAR] = "LINEAR";
+const WRAP_NAME = { 10497: "REPEAT", 33071: "CLAMP_TO_EDGE", 33648: "MIRRORED_REPEAT" };
+
+function needsMips(f) {
+  return f === gl.NEAREST_MIPMAP_NEAREST || f === gl.LINEAR_MIPMAP_NEAREST ||
+    f === gl.NEAREST_MIPMAP_LINEAR || f === gl.LINEAR_MIPMAP_LINEAR;
+}
+let tex = null;
+function applyTexture() {
+  const min = Number(minSel.value), mag = Number(magSel.value), wrap = Number(wrapSel.value);
+  const gen = genMipEl.checked;
+  const key = [min, mag, wrap, gen].join(",");
+  if (key === texKey) return;   // 每帧都会调，参数没变就什么都不做
+  texKey = key;
+  // 注意这里必须"重建"纹理，而不是"这次不调用 generateMipmap"：
+  // 已经生成过的 mip 层会一直留在纹理对象里，不重新上传 level 0 就删不掉，
+  // 纹理依旧是完整的，画面不会有任何变化。
+  if (tex) gl.deleteTexture(tex);
+  tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, min);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, mag);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, TEX_SIZE, TEX_SIZE, 0, gl.RGBA, gl.UNSIGNED_BYTE, texData);
+  if (gen) gl.generateMipmap(gl.TEXTURE_2D);
+  refreshReadout();
+}
+let texKey = "";
+
+function refreshReadout() {
+  const min = Number(minSel.value), mag = Number(magSel.value);
+  const complete = !needsMips(min) || genMipEl.checked;
+  document.getElementById("sMin").textContent = NAME_BY_VALUE[min] || min;
+  document.getElementById("sMag").textContent = mag === gl.NEAREST ? "NEAREST" : "LINEAR";
+  document.getElementById("sSize").textContent = TEX_SIZE + " × " + TEX_SIZE;
+  document.getElementById("sLevels").textContent = genMipEl.checked ? ("0 – " + MAX_LOD + "（共 " + (MAX_LOD + 1) + " 层）") : "只有 0 层";
+  document.getElementById("sTexel").textContent = (TILE / TEX_SIZE).toFixed(4);
+  const sc = document.getElementById("sComplete");
+  sc.textContent = complete ? "完整" : "不完整（采样返回黑色）";
+  sc.className = complete ? "" : "hl";
+  lodKey = "";
+  refreshLodHint();
+}
+
+// 这两个值每帧都可能被拖动，和纹理参数分开更新
+let lodKey = "";
+function refreshLodHint() {
+  const min = Number(minSel.value);
+  const complete = !needsMips(min) || genMipEl.checked;
+  const lod = Number(forceLodEl.value);
+  const key = [complete, lod, mipDebugEl.checked].join(",");
+  if (key === lodKey) return;
+  lodKey = key;
+  lodVal.textContent = lod < 0 ? "自动" : String(lod);
+  hintEl.className = "hint" + (complete ? "" : " bad");
+  hintEl.textContent = !complete
+    ? "「不完整」的典型场景：minFilter 需要 mipmap，但你没有 generateMipmap。驱动不会报错，只是所有采样都返回黑色。"
+    : lod >= 0
+      ? "固定在第 " + lod + " 层：整张图都用这一层，不再按距离自动选。" +
+        (lod > MAX_LOD ? " 注意这已经超出 mip 链（最多 " + MAX_LOD + " 层），同样会被判为不完整 → 黑色。" : "")
+      : mipDebugEl.checked
+        ? "按片元上色：近处是蓝色（mip 0），越远越偏绿、红（mip 越大）。这就是硬件自动选择的那一层。"
+        : "拖动左侧列表，对比带 mipmap 与不带 mipmap 时远处地面的差别。";
+}
+
+const view = { yaw: 0.0, tilt: 0.15 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  view.yaw -= (e.clientX - lastX) * 0.004;
+  view.tilt = Math.max(-0.15, Math.min(2.4, view.tilt - (e.clientY - lastY) * 0.004));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+function frame() {
+  requestAnimationFrame(frame);
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+
+  applyTexture();    // 每帧读一次控件：不用给每个控件挂事件，也不怕漏
+  refreshLodHint();
+  // 相机压得很低（y = 1.5）沿着地面往前看：近处是放大，远处逼近地平线时剧烈缩小
+  const eye = [Math.sin(view.yaw) * 4, 1.5, 21];
+  const proj = perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 900);
+  const view4 = lookAt(eye, [0, view.tilt, -8], [0, 1, 0]);
+  const mvp = mul(proj, view4);
+
+  gl.uniform1i(uMipDebug, mipDebugEl.checked ? 1 : 0);
+  gl.uniform1f(uForceLod, Number(forceLodEl.value));
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+  gl.clearColor(0.03, 0.035, 0.06, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniformMatrix4fv(uMvp, false, mvp);
+  gl.bindVertexArray(groundVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  gl.bindVertexArray(magVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+
+applyTexture();
+refreshReadout();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

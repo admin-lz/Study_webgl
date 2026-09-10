@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>后处理链：SSAO + Bloom</title>
+  <style>
+    :root {
+      --bg: #0b0d14; --panel: #12151f; --line: #243044;
+      --text: #e8eef8; --muted: #8b97a8; --accent: #9fd4ff; --gold: #f3d27a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 980px; }
+    header b { color: var(--accent); }
+    .layout { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 20px; padding: 20px 24px 40px; align-items: start; }
+    @media (max-width: 1020px) { .layout { grid-template-columns: 1fr; } }
+    canvas#c { width: 100%; height: auto; display: block; background: #05060a; border: 1px solid var(--line); border-radius: 8px; cursor: grab; }
+    canvas#c:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+    .stage + .stage { margin-top: 16px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre { margin: 8px 0 0; background: #0a0c12; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #d5deea; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; align-items: center; color: var(--muted); font-size: 13px; }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls b { color: var(--text); font-variant-numeric: tabular-nums; min-width: 3.2em; display: inline-block; }
+    table.stats { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 10px; }
+    table.stats td { padding: 4px 6px; border-bottom: 1px solid #1b2434; }
+    table.stats td:first-child { color: var(--muted); }
+    table.stats td:last-child { text-align: right; font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .note b { color: var(--text); }
+    .warn { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: #1a2230; border: 1px solid #2c3b52; font-size: 13px; }
+    #err { display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212; border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>后处理链：几何只画一遍，剩下的全靠一串全屏 pass</h1>
+    <p>
+      环境光遮蔽（SSAO）和泛光（Bloom）都是<b>屏幕空间</b>的：不去改几何、不去加灯光，
+      只拿已经渲染好的深度 / 法线 / 颜色，再"过一遍"。本页把整条链的<b>中间缓冲</b>全部摊开给你看 ——
+      深度、噪点 AO、模糊后的 AO、亮部、各级 Bloom，切一下下拉框就能看到每一级长什么样。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <canvas id="c" width="760" height="420"></canvas>
+      <section class="stage" style="margin-top:16px">
+        <div class="controls">
+          <label>显示
+            <select id="view">
+              <option value="0" selected>合成结果</option>
+              <option value="1">几何 pass：颜色</option>
+              <option value="2">几何 pass：视图法线</option>
+              <option value="3">深度</option>
+              <option value="4">SSAO 原始（带噪点）</option>
+              <option value="5">SSAO 模糊后</option>
+              <option value="6">亮部提取（threshold 后）</option>
+              <option value="7">Bloom（多级叠加）</option>
+              <option value="8">只开 AO（无 Bloom）</option>
+            </select>
+          </label>
+          <label><input type="checkbox" id="ssao" checked /> SSAO</label>
+          <label>采样数 <input type="range" id="samples" min="4" max="16" step="1" value="12" style="width:100px" /> <b id="samplesVal">12</b></label>
+          <label>半径 <input type="range" id="radius" min="0.1" max="2" step="0.05" value="1" style="width:100px" /> <b id="radiusVal">1.00</b></label>
+          <label>AO 强度 <input type="range" id="aoPow" min="0.2" max="3" step="0.05" value="1.5" style="width:100px" /> <b id="aoPowVal">1.50</b></label>
+          <label><input type="checkbox" id="bloom" checked /> Bloom</label>
+          <label>阈值 <input type="range" id="thresh" min="0.1" max="1.4" step="0.02" value="0.72" style="width:100px" /> <b id="threshVal">0.72</b></label>
+          <label>强度 <input type="range" id="bstr" min="0" max="2" step="0.05" value="0.85" style="width:100px" /> <b id="bstrVal">0.85</b></label>
+        </div>
+        <table class="stats">
+          <tr><td>几何 pass 输出（MRT）</td><td id="sGeo">-</td></tr>
+          <tr><td>全屏 pass 次数 / 本帧</td><td id="sPass">-</td></tr>
+          <tr><td>SSAO 每像素采样（含范围检测）</td><td id="sTaps">-</td></tr>
+          <tr><td>离屏纹理总显存</td><td id="sMem">-</td></tr>
+          <tr><td>颜色附件格式</td><td id="sFmt">-</td></tr>
+        </table>
+        <div class="warn" id="warn">-</div>
+        <div id="err"></div>
+      </section>
+    </div>
+
+    <div>
+      <section class="stage">
+        <h2>1. 整条链：几何只画一遍，剩下全是全屏 pass</h2>
+        <pre>几何 pass   → 颜色(RT0) + 视图法线(RT1) + 深度纹理      ← 只画一遍
+SSAO        → 深度 + 法线 → 半球采样 → 噪点 AO          ┐
+AO 模糊     → 4×4 box（噪点必须糊掉，否则一动就沙沙响）  │
+亮部提取    → 颜色 → 阈值 → 半分辨率                     │
+模糊 H / V  → 可分离高斯，窄半径一轮                     │ 共 10 趟
+模糊 H / V  → 再叠一轮宽半径（"多级"就是这么来的）        │ 全屏
+降采样 1/4  → 再模糊 H / V → 大范围晕                    │
+合成        → 颜色 × AO + Bloom × 强度 → ACES → gamma    ┘</pre>
+        <p class="note">
+          后处理没有几何，只有"纹理进、纹理出"。所以现代管线里 <b>RT 的格式和数量</b>（带宽）比 shader 里那几行算术更值钱：
+          这 10 趟全屏 pass，每趟都要把整屏读一遍写一遍。半分辨率做 Bloom 就是因为这一步最容易被带宽卡住。
+          切"显示"挨个看中间缓冲，比盯着最终画面猜有用得多。
+        </p>
+      </section>
+
+      <section class="stage">
+        <h2>2. SSAO：用手边的深度和法线凑出"角落变暗"</h2>
+        <pre>vec3 P = viewPosFromDepth(uv);            // 反投影：拿深度还原视图空间位置
+vec3 N = viewNormalFromRT1(uv);           // 法线不重算，几何 pass 顺手写进 RT1
+mat3 TBN = randomBasis(N, gl_FragCoord);  // 每像素随机转一下，噪点变成白噪声才能被糊掉
+for (int i = 0; i &lt; 16; i++) {
+  if (i &gt;= u_samples) break;
+  vec3 sp = P + TBN * u_kernel[i] * u_radius;
+  vec2 suv = project(sp);
+  float sceneZ = viewZ(texture(u_depth, suv).r);
+  float range = smoothstep(0.0, 1.0, u_radius / abs(P.z - sceneZ));  // 挡住"远处的高墙"误判
+  occ += (sceneZ &gt;= sp.z + bias ? 1.0 : 0.0) * range;
+}
+ao = pow(clamp(1.0 - occ / float(u_samples), 0.0, 1.0), u_pow);</pre>
+        <ol class="steps">
+          <li><b>它是"假"的遮蔽。</b> 屏幕外的东西一概不知道，物体边缘会把背景算成遮挡（halo）。
+            所以工程上都会限制半径、做范围检测、或者干脆把 AO 只用在近处。</li>
+          <li><b>为什么要随机旋转？</b> 固定 12 个方向会在每个像素上留下同样的条纹；随机转一下变成白噪声，4×4 模糊就能抹掉。
+            代价是"噪点 → 模糊"必然糊掉细节，所以半径不能太大。</li>
+          <li><b>法线从哪来。</b> 本页是几何 pass 用 MRT 顺手写出来的。也可以省掉它、用 <code>dFdx/dFdy</code> 对位置求导算法线，
+            省一张 RT，但物体轮廓处法线是错的 —— 这就是经典取舍。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>3. Bloom：亮的地方"漏"到周围</h2>
+        <ol class="steps">
+          <li><b>阈值提取</b>：只保留超过阈值的部分（<code>max(c - threshold, 0)</code>，软的用 smoothstep）。
+            阈值太低 → 整个画面发灰；太高 → 只有最强的光源发光。</li>
+          <li><b>可分离高斯</b>：二维高斯 = 先横着卷一遍、再竖着卷一遍，N² 变 2N。这是后处理里最常用的一招。</li>
+          <li><b>多级叠加</b>：小半径 + 大半径叠在一起才像真的泛光。做法就是降采样到 1/4 再来一轮 ——
+            降采样本身就是"放大 kernel"，还顺带省了一大截带宽。</li>
+          <li><b>顺序</b>：先 AO 再 Bloom。AO 是"减光"、Bloom 是"加光"，先减后加才能让暗角里的高光也正常发光；
+            反过来的话，AO 会把 Bloom 的辉光一起压暗。</li>
+        </ol>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => { errBox.style.display = "block"; errBox.textContent += (e.message || e.error) + "\n"; });
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let l = Math.hypot(zx, zy, zz); zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  l = Math.hypot(xx, xy, xz); xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]), 1,
+  ]);
+}
+function invert4(m) {
+  const o = new Float32Array(16);
+  const a00=m[0],a01=m[1],a02=m[2],a03=m[3], a10=m[4],a11=m[5],a12=m[6],a13=m[7];
+  const a20=m[8],a21=m[9],a22=m[10],a23=m[11], a30=m[12],a31=m[13],a32=m[14],a33=m[15];
+  const b00=a00*a11-a01*a10, b01=a00*a12-a02*a10, b02=a00*a13-a03*a10, b03=a01*a12-a02*a11;
+  const b04=a01*a13-a03*a11, b05=a02*a13-a03*a12, b06=a20*a31-a21*a30, b07=a20*a32-a22*a30;
+  const b08=a20*a33-a23*a30, b09=a21*a32-a22*a31, b10=a21*a33-a23*a31, b11=a22*a33-a23*a32;
+  let det = b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06;
+  if (!det) return o;
+  det = 1 / det;
+  o[0]=(a11*b11-a12*b10+a13*b09)*det;  o[1]=(a02*b10-a01*b11-a03*b09)*det;
+  o[2]=(a31*b05-a32*b04+a33*b03)*det;  o[3]=(a22*b04-a21*b05-a23*b03)*det;
+  o[4]=(a12*b08-a10*b11-a13*b07)*det;  o[5]=(a00*b11-a02*b08+a03*b07)*det;
+  o[6]=(a32*b02-a30*b05-a33*b01)*det;  o[7]=(a20*b05-a22*b02+a23*b01)*det;
+  o[8]=(a10*b10-a11*b08+a13*b06)*det;  o[9]=(a01*b08-a00*b10-a03*b06)*det;
+  o[10]=(a30*b04-a31*b02+a33*b00)*det; o[11]=(a21*b02-a20*b04-a23*b00)*det;
+  o[12]=(a11*b07-a10*b09-a12*b06)*det; o[13]=(a00*b09-a01*b07+a02*b06)*det;
+  o[14]=(a31*b01-a30*b03-a32*b00)*det; o[15]=(a20*b03-a21*b01+a22*b00)*det;
+  return o;
+}
+
+const W = canvas.width, H = canvas.height;
+const NEAR = 0.2, FAR = 60;
+const HDR = !!gl.getExtension("EXT_color_buffer_float");
+const COLFMT = HDR ? gl.RGBA16F : gl.RGBA8;
+const COLTYPE = HDR ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
+
+// ---------------------------------------------------------------- RT 工具
+const allRT = [];
+function makeRT(w, h, fmt, type, linear) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, fmt, w, h, 0, gl.RGBA, type, null);
+  const f = linear ? gl.LINEAR : gl.NEAREST;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, f);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  allRT.push({ w: w, h: h, bpp: (fmt === gl.RGBA16F ? 8 : 4) });
+  return t;
+}
+function makeDepth(w, h) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, w, h, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  allRT.push({ w: w, h: h, bpp: 4 });
+  return t;
+}
+function makeFbo(textures, depth, drawAll) {
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  textures.forEach((t, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t, 0));
+  if (depth) gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depth, 0);
+  if (drawAll) gl.drawBuffers(textures.map((_, i) => gl.COLOR_ATTACHMENT0 + i));
+  const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (st !== gl.FRAMEBUFFER_COMPLETE) throw new Error("FBO incomplete 0x" + st.toString(16));
+  return f;
+}
+
+const sceneCol = makeRT(W, H, COLFMT, COLTYPE, false);
+const sceneNrm = makeRT(W, H, gl.RGBA8, gl.UNSIGNED_BYTE, false);
+const depthTex = makeDepth(W, H);
+const sceneFbo = makeFbo([sceneCol, sceneNrm], depthTex, true);
+
+const hw = Math.floor(W / 2), hh = Math.floor(H / 2);
+const qw = Math.floor(W / 4), qh = Math.floor(H / 4);
+const aoRaw = makeRT(W, H, gl.RGBA8, gl.UNSIGNED_BYTE, false);
+const aoBlur = makeRT(W, H, gl.RGBA8, gl.UNSIGNED_BYTE, true);
+const t1 = makeRT(hw, hh, COLFMT, COLTYPE, true);
+const t2 = makeRT(hw, hh, COLFMT, COLTYPE, true);
+const t3 = makeRT(qw, qh, COLFMT, COLTYPE, true);
+const t4 = makeRT(qw, qh, COLFMT, COLTYPE, true);
+const aoFbo = makeFbo([aoRaw], null, false);
+const aoBlurFbo = makeFbo([aoBlur], null, false);
+const t1Fbo = makeFbo([t1], null, false);
+const t2Fbo = makeFbo([t2], null, false);
+const t3Fbo = makeFbo([t3], null, false);
+const t4Fbo = makeFbo([t4], null, false);
+
+// ---------------------------------------------------------------- 几何
+function pushBox(out, cx, cy, cz, sx, sy, sz, col) {
+  const F = [
+    [[1, 0, 0], [[1, -1, 1], [1, -1, -1], [1, 1, -1], [1, 1, 1]]],
+    [[-1, 0, 0], [[-1, -1, -1], [-1, -1, 1], [-1, 1, 1], [-1, 1, -1]]],
+    [[0, 1, 0], [[-1, 1, 1], [1, 1, 1], [1, 1, -1], [-1, 1, -1]]],
+    [[0, -1, 0], [[-1, -1, -1], [1, -1, -1], [1, -1, 1], [-1, -1, 1]]],
+    [[0, 0, 1], [[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]]],
+    [[0, 0, -1], [[1, -1, -1], [-1, -1, -1], [-1, 1, -1], [1, 1, -1]]],
+  ];
+  const tri = (n, a, b, c) => {
+    for (const v of [a, b, c]) out.push(cx + v[0] * sx, cy + v[1] * sy, cz + v[2] * sz, n[0], n[1], n[2], col[0], col[1], col[2]);
+  };
+  for (let f = 0; f < 6; f++) {
+    const q = F[f][1];
+    tri(F[f][0], q[0], q[1], q[2]); tri(F[f][0], q[0], q[2], q[3]);
+  }
+}
+const staticData = [];
+pushBox(staticData, 0, -0.5, 0, 16, 0.5, 16, [0.30, 0.31, 0.34]);         // 地面
+pushBox(staticData, -2.7, 0.8, -1.6, 0.55, 0.8, 0.55, [0.42, 0.44, 0.50]);
+pushBox(staticData, 2.6, 0.55, -2.1, 0.5, 0.55, 0.5, [0.36, 0.40, 0.48]);
+pushBox(staticData, 0.2, 0.4, -3.0, 0.7, 0.4, 1.6, [0.44, 0.42, 0.44]);
+pushBox(staticData, -1.1, 1.5, 1.5, 0.35, 1.5, 0.35, [0.40, 0.46, 0.52]);
+pushBox(staticData, 2.9, 0.5, 1.9, 1.4, 0.5, 0.5, [0.38, 0.40, 0.46]);
+
+const unitBox = [];
+pushBox(unitBox, 0, 0, 0, 0.5, 0.5, 0.5, [1, 1, 1]);
+
+function makeMesh(data) {
+  const vao = gl.createVertexArray();
+  const buf = gl.createBuffer();
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 36, 0);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 36, 12);
+  gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 36, 24);
+  gl.bindVertexArray(null);
+  return { vao: vao, count: data.length / 9 };
+}
+const staticMesh = makeMesh(staticData);
+const boxMesh = makeMesh(unitBox);
+const fullVao = gl.createVertexArray();
+
+// ---------------------------------------------------------------- 着色器
+const FULL_VS = `#version 300 es
+precision highp float;
+out vec2 v_uv;
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  v_uv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const GEO_VS = `#version 300 es
+precision highp float;
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec3 a_nrm;
+layout(location = 2) in vec3 a_col;
+uniform mat4 u_vp, u_model;
+out vec3 v_nrm; out vec3 v_col; out vec3 v_world;
+void main() {
+  vec4 wp = u_model * vec4(a_pos, 1.0);
+  v_world = wp.xyz;
+  v_nrm = mat3(u_model) * a_nrm;
+  v_col = a_col;
+  gl_Position = u_vp * wp;
+}`;
+
+// 一趟几何写两个附件：颜色 + 视图空间法线
+const GEO_FS = `#version 300 es
+precision highp float;
+in vec3 v_nrm; in vec3 v_col; in vec3 v_world;
+uniform mat4 u_view;
+uniform vec3 u_eye;
+uniform vec3 u_colorMul;
+uniform int u_emissive;
+layout(location = 0) out vec4 oColor;
+layout(location = 1) out vec4 oNormal;
+void main() {
+  vec3 n = normalize(v_nrm);
+  if (u_emissive == 1) {
+    oColor = vec4(v_col * u_colorMul * 2.4, 1.0);   // 自发光：故意超过 1，给 Bloom 当素材
+  } else {
+    vec3 L = normalize(vec3(0.5, 0.85, 0.35));
+    float dif = max(dot(n, L), 0.0);
+    float sky = 0.45 + 0.35 * n.y;
+    float checker = mod(floor(v_world.x * 1.5) + floor(v_world.z * 1.5), 2.0);
+    vec3 base = v_col;
+    if (abs(n.y - 1.0) < 0.01 && v_world.y < -0.4) base = mix(v_col * 0.85, v_col * 1.15, checker);
+    vec3 col = base * (sky * 0.45 + dif * 0.85);
+    float d = length(v_world - u_eye);
+    col = mix(col, vec3(0.035, 0.045, 0.06), clamp(1.0 - exp(-d * 0.035), 0.0, 1.0));
+    oColor = vec4(col, 1.0);
+  }
+  vec3 vn = normalize(mat3(u_view) * n);
+  oNormal = vec4(vn * 0.5 + 0.5, 1.0);
+}`;
+
+const SSAO_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_depth, u_normal;
+uniform mat4 u_proj, u_invProj;
+uniform vec3 u_kernel[16];
+uniform float u_radius, u_pow, u_bias;
+uniform int u_samples;
+out vec4 outColor;
+
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+vec3 viewPos(vec2 uv) {
+  float d = texture(u_depth, uv).r;
+  vec4 clip = vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+  vec4 v = u_invProj * clip;
+  return v.xyz / v.w;
+}
+void main() {
+  float d = texture(u_depth, v_uv).r;
+  if (d >= 1.0) { outColor = vec4(1.0); return; }      // 天空不遮蔽
+
+  vec3 P = viewPos(v_uv);
+  vec3 N = normalize(texture(u_normal, v_uv).xyz * 2.0 - 1.0);
+
+  // 每像素随机旋转切空间，把固定方向的"条纹"打散成白噪声
+  vec3 rnd = normalize(vec3(hash12(gl_FragCoord.xy) * 2.0 - 1.0,
+                            hash12(gl_FragCoord.yx + 7.0) * 2.0 - 1.0, 0.0));
+  vec3 T = normalize(rnd - N * dot(rnd, N));
+  vec3 B = cross(N, T);
+  mat3 TBN = mat3(T, B, N);
+
+  float occ = 0.0;
+  for (int i = 0; i < 16; i++) {
+    if (i >= u_samples) break;
+    vec3 sp = P + TBN * u_kernel[i] * u_radius;
+    vec4 off = u_proj * vec4(sp, 1.0);
+    vec2 suv = (off.xy / off.w) * 0.5 + 0.5;
+    if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) continue;
+    float sceneZ = viewPos(suv).z;
+    float range = smoothstep(0.0, 1.0, u_radius / max(abs(P.z - sceneZ), 1e-4));
+    occ += (sceneZ >= sp.z + u_bias ? 1.0 : 0.0) * range;
+  }
+  float ao = pow(clamp(1.0 - occ / float(u_samples), 0.0, 1.0), u_pow);
+  outColor = vec4(ao, ao, ao, 1.0);
+}`;
+
+const AO_BLUR_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_tex;
+uniform vec2 u_texel;
+out vec4 outColor;
+void main() {
+  float s = 0.0;
+  for (int y = -2; y < 2; y++)
+    for (int x = -2; x < 2; x++)
+      s += texture(u_tex, v_uv + vec2(float(x) + 0.5, float(y) + 0.5) * u_texel).r;
+  outColor = vec4(vec3(s / 16.0), 1.0);
+}`;
+
+const BRIGHT_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_tex;
+uniform float u_thresh;
+out vec4 outColor;
+void main() {
+  vec3 c = texture(u_tex, v_uv).rgb;
+  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  // 软阈值：阈值附近过渡，避免硬边
+  float k = smoothstep(u_thresh, u_thresh + 0.35, l);
+  outColor = vec4(c * k, 1.0);
+}`;
+
+const BLUR_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_tex;
+uniform vec2 u_texel;
+uniform vec2 u_dir;
+uniform float u_radius;
+out vec4 outColor;
+void main() {
+  // 9 抽可分离高斯，u_radius 控制跨度
+  float w[5] = float[5](0.227027, 0.194594, 0.121622, 0.054054, 0.016216);
+  vec3 s = texture(u_tex, v_uv).rgb * w[0];
+  for (int i = 1; i < 5; i++) {
+    vec2 o = u_dir * u_texel * float(i) * u_radius;
+    s += texture(u_tex, v_uv + o).rgb * w[i];
+    s += texture(u_tex, v_uv - o).rgb * w[i];
+  }
+  outColor = vec4(s, 1.0);
+}`;
+
+const COMP_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_scene, u_normal, u_depth, u_aoRaw, u_aoBlur, u_bloomA, u_bloomB;
+uniform int u_view, u_useAO, u_useBloom;
+uniform float u_bstr, u_near, u_far;
+out vec4 outColor;
+
+vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+float linZ(float zw) {
+  float ndc = zw * 2.0 - 1.0;
+  return (2.0 * u_near * u_far) / (u_far + u_near - ndc * (u_far - u_near));
+}
+void main() {
+  vec3 scene = texture(u_scene, v_uv).rgb;
+  float aoB = texture(u_aoBlur, v_uv).r;
+  float aoR = texture(u_aoRaw, v_uv).r;
+  vec3 bloom = texture(u_bloomA, v_uv).rgb + texture(u_bloomB, v_uv).rgb * 1.5;
+  vec3 nrm = texture(u_normal, v_uv).rgb;
+  float z = linZ(texture(u_depth, v_uv).r);
+
+  vec3 col;
+  if (u_view == 1) col = scene;
+  else if (u_view == 2) col = nrm;
+  else if (u_view == 3) col = vec3(pow(clamp(1.0 - z / 30.0, 0.0, 1.0), 0.7));
+  else if (u_view == 4) col = vec3(aoR);
+  else if (u_view == 5) col = vec3(aoB);
+  else if (u_view == 6) col = texture(u_bloomA, v_uv).rgb + texture(u_bloomB, v_uv).rgb * 1.5;
+  else if (u_view == 7) col = bloom * u_bstr;
+  else if (u_view == 8) col = scene * mix(1.0, aoB, float(u_useAO));
+  else {
+    col = scene * mix(1.0, aoB, float(u_useAO));
+    col += bloom * u_bstr * float(u_useBloom);
+  }
+  if (u_view <= 3) { outColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0); return; }
+  outColor = vec4(pow(aces(col), vec3(1.0 / 2.2)), 1.0);
+}`;
+
+const progGeo = link(GEO_VS, GEO_FS);
+const progSSAO = link(FULL_VS, SSAO_FS);
+const progAoBlur = link(FULL_VS, AO_BLUR_FS);
+const progBright = link(FULL_VS, BRIGHT_FS);
+const progBlur = link(FULL_VS, BLUR_FS);
+const progComp = link(FULL_VS, COMP_FS);
+const uni = (p, names) => { const o = {}; for (const n of names) o[n] = gl.getUniformLocation(p, n); return o; };
+const uG = uni(progGeo, ["u_vp", "u_model", "u_view", "u_eye", "u_colorMul", "u_emissive"]);
+const uA = uni(progSSAO, ["u_depth", "u_normal", "u_proj", "u_invProj", "u_kernel[0]", "u_radius", "u_pow", "u_bias", "u_samples"]);
+const uAB = uni(progAoBlur, ["u_tex", "u_texel"]);
+const uBr = uni(progBright, ["u_tex", "u_thresh"]);
+const uBl = uni(progBlur, ["u_tex", "u_texel", "u_dir", "u_radius"]);
+const uCo = uni(progComp, ["u_scene", "u_normal", "u_depth", "u_aoRaw", "u_aoBlur", "u_bloomA", "u_bloomB",
+  "u_view", "u_useAO", "u_useBloom", "u_bstr", "u_near", "u_far"]);
+
+// SSAO 半球采样核（靠近原点更密，避免近处采样全落在物体外）
+const kernel = new Float32Array(16 * 3);
+for (let i = 0; i < 16; i++) {
+  let x, y, z, l;
+  do {
+    x = Math.random() * 2 - 1; y = Math.random() * 2 - 1; z = Math.random();
+    l = Math.hypot(x, y, z);
+  } while (l > 1 || l < 0.1);
+  x /= l; y /= l; z /= l;
+  let s = 0.15 + 0.85 * Math.pow(i / 16, 2);
+  kernel[i * 3] = x * s; kernel[i * 3 + 1] = y * s; kernel[i * 3 + 2] = z * s;
+}
+
+function bindTex(unit, tex, loc) {
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniform1i(loc, unit);
+}
+function pass(fbo, prog) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.useProgram(prog);
+  gl.bindVertexArray(fullVao);
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.BLEND);
+}
+
+// ---------------------------------------------------------------- 交互
+const el = (id) => document.getElementById(id);
+const viewEl = el("view"), ssaoEl = el("ssao"), samplesEl = el("samples");
+const radiusEl = el("radius"), aoPowEl = el("aoPow");
+const bloomEl = el("bloom"), threshEl = el("thresh"), bstrEl = el("bstr");
+const cam = { yaw: 0.75, pitch: 0.28, dist: 9.5 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.006;
+  cam.pitch = Math.max(0.05, Math.min(1.2, cam.pitch - (e.clientY - lastY) * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+});
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  cam.dist = Math.max(3, Math.min(24, cam.dist * (1 + Math.sign(e.deltaY) * 0.08)));
+}, { passive: false });
+
+const EMIT = [
+  { r: 2.6, y: 1.1, sp: 0.5, s: 0.22, c: [1.0, 0.42, 0.22], ph: 0.0 },
+  { r: 3.1, y: 1.9, sp: -0.36, s: 0.18, c: [0.35, 0.75, 1.0], ph: 2.1 },
+  { r: 1.7, y: 0.6, sp: 0.8, s: 0.15, c: [1.0, 0.85, 0.35], ph: 4.0 },
+  { r: 3.4, y: 0.35, sp: 0.24, s: 0.20, c: [0.55, 1.0, 0.6], ph: 5.2 },
+];
+const modelM = new Float32Array(16);
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const t = now / 1000;
+  const view = Number(viewEl.value);
+  const useAO = ssaoEl.checked ? 1 : 0;
+  const samples = Number(samplesEl.value);
+  const radius = Number(radiusEl.value);
+  const aoPow = Number(aoPowEl.value);
+  const useBloom = bloomEl.checked ? 1 : 0;
+  const thresh = Number(threshEl.value);
+  const bstr = Number(bstrEl.value);
+  el("samplesVal").textContent = samples;
+  el("radiusVal").textContent = radius.toFixed(2);
+  el("aoPowVal").textContent = aoPow.toFixed(2);
+  el("threshVal").textContent = thresh.toFixed(2);
+  el("bstrVal").textContent = bstr.toFixed(2);
+
+  const eye = [
+    Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    2.0 + Math.sin(cam.pitch) * cam.dist,
+    Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const view4 = lookAt(eye, [0, 0.9, 0], [0, 1, 0]);
+  const proj = perspective(Math.PI / 3.4, W / H, NEAR, FAR);
+  const vp = mul(proj, view4);
+  const invProj = invert4(proj);
+
+  let passes = 0;
+
+  // ---- ① 几何 pass：颜色 + 视图法线 + 深度
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFbo);
+  gl.viewport(0, 0, W, H);
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthMask(true);
+  gl.disable(gl.BLEND);
+  gl.clearColor(0.035, 0.045, 0.06, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(progGeo);
+  gl.uniformMatrix4fv(uG.u_vp, false, vp);
+  gl.uniformMatrix4fv(uG.u_view, false, view4);
+  gl.uniform3fv(uG.u_eye, eye);
+  gl.bindVertexArray(staticMesh.vao);
+  gl.uniformMatrix4fv(uG.u_model, false, new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]));
+  gl.uniform1i(uG.u_emissive, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, staticMesh.count);
+  gl.bindVertexArray(boxMesh.vao);
+  gl.uniform1i(uG.u_emissive, 1);
+  for (const e of EMIT) {
+    const a = t * e.sp + e.ph;
+    const x = Math.cos(a) * e.r, z = Math.sin(a) * e.r;
+    const y = e.y + 0.18 * Math.sin(t * 1.7 + e.ph);
+    modelM.set([e.s,0,0,0, 0,e.s,0,0, 0,0,e.s,0, x,y,z,1]);
+    gl.uniformMatrix4fv(uG.u_model, false, modelM);
+    gl.uniform3fv(uG.u_colorMul, e.c);
+    gl.drawArrays(gl.TRIANGLES, 0, boxMesh.count);
+  }
+  passes++;
+
+  // ---- ② SSAO（全分辨率，噪点）
+  pass(aoFbo, progSSAO);
+  gl.viewport(0, 0, W, H);
+  bindTex(0, depthTex, uA.u_depth);
+  bindTex(1, sceneNrm, uA.u_normal);
+  gl.uniformMatrix4fv(uA.u_proj, false, proj);
+  gl.uniformMatrix4fv(uA.u_invProj, false, invProj);
+  gl.uniform3fv(uA["u_kernel[0]"], kernel);
+  gl.uniform1f(uA.u_radius, radius);
+  gl.uniform1f(uA.u_pow, aoPow);
+  gl.uniform1f(uA.u_bias, 0.025);
+  gl.uniform1i(uA.u_samples, samples);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  passes++;
+
+  // ---- ③ AO 4×4 模糊
+  pass(aoBlurFbo, progAoBlur);
+  gl.viewport(0, 0, W, H);
+  bindTex(0, aoRaw, uAB.u_tex);
+  gl.uniform2f(uAB.u_texel, 1 / W, 1 / H);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  passes++;
+
+  // ---- ④ 亮部提取 → 半分辨率
+  pass(t1Fbo, progBright);
+  gl.viewport(0, 0, hw, hh);
+  bindTex(0, sceneCol, uBr.u_tex);
+  gl.uniform1f(uBr.u_thresh, thresh);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  passes++;
+
+  // ---- ⑤ 两轮可分离高斯（第一轮窄、第二轮宽）
+  // H: t1 -> t2, V: t2 -> t1
+  pass(t2Fbo, progBlur);
+  gl.viewport(0, 0, hw, hh);
+  bindTex(0, t1, uBl.u_tex);
+  gl.uniform2f(uBl.u_texel, 1 / hw, 1 / hh);
+  gl.uniform2f(uBl.u_dir, 1, 0);
+  gl.uniform1f(uBl.u_radius, 1.0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  passes++;
+  pass(t1Fbo, progBlur);
+  gl.viewport(0, 0, hw, hh);
+  bindTex(0, t2, uBl.u_tex);
+  gl.uniform2f(uBl.u_texel, 1 / hw, 1 / hh);
+  gl.uniform2f(uBl.u_dir, 0, 1);
+  gl.uniform1f(uBl.u_radius, 1.0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  passes++;
+  pass(t2Fbo, progBlur);
+  gl.viewport(0, 0, hw, hh);
+  bindTex(0, t1, uBl.u_tex);
+  gl.uniform2f(uBl.u_texel, 1 / hw, 1 / hh);
+  gl.uniform2f(uBl.u_dir, 1, 0);
+  gl.uniform1f(uBl.u_radius, 3.5);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  passes++;
+  pass(t1Fbo, progBlur);
+  gl.viewport(0, 0, hw, hh);
+  bindTex(0, t2, uBl.u_tex);
+  gl.uniform2f(uBl.u_texel, 1 / hw, 1 / hh);
+  gl.uniform2f(uBl.u_dir, 0, 1);
+  gl.uniform1f(uBl.u_radius, 3.5);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  passes++;
+
+  // ---- ⑥ 降采样到 1/4，再糊一遍（这一级负责"大范围"辉光）
+  pass(t3Fbo, progBlur);
+  gl.viewport(0, 0, qw, qh);
+  bindTex(0, t1, uBl.u_tex);
+  gl.uniform2f(uBl.u_texel, 1 / qw, 1 / qh);
+  gl.uniform2f(uBl.u_dir, 1, 0);
+  gl.uniform1f(uBl.u_radius, 2.0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  passes++;
+  pass(t4Fbo, progBlur);
+  gl.viewport(0, 0, qw, qh);
+  bindTex(0, t3, uBl.u_tex);
+  gl.uniform2f(uBl.u_texel, 1 / qw, 1 / qh);
+  gl.uniform2f(uBl.u_dir, 0, 1);
+  gl.uniform1f(uBl.u_radius, 2.0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  passes++;
+
+  // ---- ⑦ 合成到屏幕
+  pass(null, progComp);
+  gl.viewport(0, 0, W, H);
+  bindTex(0, sceneCol, uCo.u_scene);
+  bindTex(1, sceneNrm, uCo.u_normal);
+  bindTex(2, depthTex, uCo.u_depth);
+  bindTex(3, aoRaw, uCo.u_aoRaw);
+  bindTex(4, aoBlur, uCo.u_aoBlur);
+  bindTex(5, t1, uCo.u_bloomA);
+  bindTex(6, t4, uCo.u_bloomB);
+  gl.uniform1i(uCo.u_view, view);
+  gl.uniform1i(uCo.u_useAO, useAO);
+  gl.uniform1i(uCo.u_useBloom, useBloom);
+  gl.uniform1f(uCo.u_bstr, bstr);
+  gl.uniform1f(uCo.u_near, NEAR);
+  gl.uniform1f(uCo.u_far, FAR);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  passes++;
+  gl.bindVertexArray(null);
+  gl.activeTexture(gl.TEXTURE0);
+
+  // ---- 读数
+  let bytes = 0;
+  for (const r of allRT) bytes += r.w * r.h * r.bpp;
+  el("sGeo").textContent = "颜色 + 法线 + 深度（3 张）";
+  el("sPass").textContent = "几何 1 + 全屏 " + (passes - 1) + " = " + passes + " 趟";
+  el("sTaps").textContent = samples + " 次投影 + 深度取样（总 " + ((samples + 1) * W * H / 1e6).toFixed(1) + " M）";
+  el("sMem").textContent = (bytes / 1048576).toFixed(1) + " MB（" + allRT.length + " 张）";
+  el("sFmt").textContent = HDR ? "RGBA16F（真 HDR，自发光可 >1）" : "RGBA8（LDR，自发光会被截断在 1.0）";
+
+  const wn = el("warn");
+  wn.textContent = view === 4
+    ? "SSAO 原始输出：注意每像素的随机旋转让噪点变成白噪声 —— 这一步必须糊掉，否则相机一动就是一片沙沙响。"
+    : view === 6 || view === 7
+      ? "亮部提取 + 多级模糊：半分辨率那级管中近距离的辉光，1/4 分辨率那级管大范围的晕。两级叠起来才像真泛光。"
+      : view === 5
+        ? "4×4 box 模糊后的 AO：噪点没了，但细节也被抹掉了 —— 半径越大越糊，这是 SSAO 的固有取舍。"
+        : view === 3
+          ? "深度纹理（已线性化显示）：SSAO 的全部输入就是这个 + 法线，没有任何几何信息 —— 所以屏幕外的东西它一无所知。"
+          : useAO === 0 && useBloom === 0
+            ? "AO 和 Bloom 都关了：这就是几何 pass 直接输出的画面。打开它们，看的是一串全屏 pass 能加多少信息。"
+            : "AO 负责「角落变暗」（接触阴影、缝隙），Bloom 负责「亮处外溢」（自发光、光源）。两者都是屏幕空间的近似，不是物理量。";
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL 笔记 · 面试对照表</title>
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --panel: #12151f;
+      --line: #243044;
+      --text: #e8eef8;
+      --muted: #8b97a8;
+      --accent: #9fd4ff;
+      --gold: #f3d27a;
+      --ok: #7dcea0;
+      --warn: #e08a4a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.6 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 22px 24px 14px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 8px; font-size: 21px; }
+    header p { margin: 0; color: var(--muted); max-width: 940px; }
+    header b { color: var(--accent); }
+    main { padding: 22px 24px 60px; max-width: 1080px; }
+    h2 { font-size: 16px; margin: 34px 0 12px; color: var(--accent); }
+    h3 { font-size: 15px; margin: 0 0 8px; }
+    code { color: var(--gold); font-size: 12.5px; background: #0a0c12; padding: 1px 5px; border-radius: 3px; }
+    .callout {
+      background: #12151f; border: 1px solid var(--line); border-left: 2px solid var(--accent);
+      border-radius: 6px; padding: 14px 16px; color: #c9d6e8; max-width: 940px;
+    }
+    .callout b { color: var(--accent); }
+    .callout .t { display: block; margin-bottom: 6px; color: var(--accent); font-weight: 600; font-size: 13px; }
+    .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; }
+    @media (max-width: 860px) { .grid3 { grid-template-columns: 1fr; } }
+    .grid3 h3 { font-size: 14px; color: var(--text); margin-bottom: 6px; }
+    .grid3 p { margin: 0; color: var(--muted); font-size: 13px; }
+
+    .filters {
+      position: sticky; top: 0; z-index: 5;
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+      background: var(--bg); border-bottom: 1px solid var(--line);
+      padding: 12px 0 14px; margin-bottom: 4px;
+    }
+    .filters .lead { color: var(--muted); font-size: 13px; }
+    .filters .count { color: #5f6b7c; font-size: 12px; margin-left: auto; }
+    .pill {
+      background: #1a2230; border: 1px solid #2c3b52; color: #c9d6e8;
+      border-radius: 999px; padding: 5px 13px; font-size: 13px;
+      cursor: pointer; font-family: inherit;
+    }
+    .pill:hover { border-color: #3c4f6b; }
+    .pill.on { background: #17324d; border-color: #3f6f9e; color: var(--accent); }
+    .hint { color: var(--muted); font-size: 12.5px; margin: 8px 0 0; max-width: 940px; }
+
+    .topic { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px 20px; margin-top: 18px; }
+    .files { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+    .files span {
+      background: #0f131c; border: 1px solid #2c3b52; border-radius: 4px;
+      padding: 2px 8px; font-size: 11.5px; color: #93a3b8;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .pitch { margin: 0 0 10px; color: #d5deea; }
+    .layer { margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+    .layer b { color: var(--warn); font-weight: 600; }
+    .files-note { color: #5f6b7c; font-size: 12.5px; font-style: italic; }
+
+    details.fu { border-top: 1px solid #1c2635; }
+    details.fu[hidden] { display: none; }
+    details.fu > summary {
+      list-style: none; cursor: pointer; padding: 10px 2px;
+      display: flex; align-items: center; gap: 9px;
+    }
+    details.fu > summary::-webkit-details-marker { display: none; }
+    details.fu > summary:hover .q { color: var(--accent); }
+    .chev { color: #5f6b7c; font-size: 10px; transition: transform .15s; flex: none; width: 10px; }
+    details.fu[open] .chev { transform: rotate(90deg); }
+    .dot { width: 8px; height: 8px; border-radius: 2px; background: #3d4757; flex: none; }
+    .dot.hot { background: #4aa3ff; }
+    .q { flex: 1; color: var(--text); font-size: 13.5px; }
+    .meta { color: #5f6b7c; font-size: 11.5px; flex: none; }
+    .ans { padding: 0 2px 14px 29px; color: #c1cddc; font-size: 13px; }
+    .ans b { color: #fff; font-weight: 600; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13.5px; margin-top: 4px; }
+    th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+    th { color: var(--accent); font-weight: 600; font-size: 13px; }
+    tbody tr:nth-child(even) { background: #10131b; }
+    td:first-child { color: #d5deea; }
+    .lvl { display: inline-flex; align-items: center; gap: 7px; }
+    .lvl .dot { width: 7px; height: 7px; }
+    .lvl-重点 { color: #e8eef8; font-weight: 600; }
+    .lvl-会问 { color: #b7c4d4; }
+    .lvl-提一下 { color: #7f8b9c; }
+    .lvl-不考 { color: #5f6b7c; }
+    .legend { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 14px; color: #5f6b7c; font-size: 12.5px; }
+    .legend .lvl { gap: 6px; }
+    footer { border-top: 1px solid var(--line); padding: 16px 24px 40px; color: #5f6b7c; font-size: 12px; max-width: 1080px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>WebGL 笔记 · 面试对照表</h1>
+    <p>
+      把本目录的页面按<b>「面试时该讲到哪一层」</b>重新组织：每个主题一段 30 秒讲法、一条「讲到哪层就停」的界线，
+      再加一批追问。追问可以点开看答法，右侧标了哪些岗位会问。
+    </p>
+  </header>
+
+  <main>
+    <div class="callout">
+      <span class="t">面试的真实机制</span>
+      面试官不是拿标准答案对分，他是往下钻、测你的<b>地板</b>在哪。你答多细不影响结果，<b>能不能接住下一层追问才影响结果</b>。
+      所以下面的重点是「承重细节」——退化情况、数值稳定性、为什么能这样降维；公式推导属于自己推一遍就够、不用背的那类。
+    </div>
+
+    <h2>三档深度</h2>
+    <div class="grid3">
+      <div>
+        <h3>第一档 · 开口就说</h3>
+        <p>每个主题的「讲法」那一段，30 秒内说完。覆盖主干流程和核心取舍，答不出这个，后面都不用聊。</p>
+      </div>
+      <div>
+        <h3>第二档 · 等追问</h3>
+        <p>退化情况、数值边界、为什么这么做而不那么做。这一档才是分水岭，也是下面所有追问的所在。</p>
+      </div>
+      <div>
+        <h3>第三档 · 自己推过就行</h3>
+        <p>闭式解、Cramer 展开、GGX 完整推导。基本不会被要求现场写，但推过一遍之后第二档会变成「显然」。</p>
+      </div>
+    </div>
+
+    <h2>逐主题</h2>
+    <div class="filters" id="filters">
+      <span class="lead">筛岗位</span>
+      <span class="count" id="count"></span>
+    </div>
+    <p class="hint">
+      筛选只影响追问的显示，讲法和「讲到哪一层停」一直可见。方块颜色表示问到的概率：<span style="color:#4aa3ff">蓝</span> = 三个岗位都会问，灰 = 只有个别岗位。
+    </p>
+
+    <div id="topics"></div>
+
+    <h2>复习优先级</h2>
+    <p class="hint" style="margin-bottom:12px">同一份内容按岗位重排。时间有限就按自己目标岗位那一列，从「重点」往下看。</p>
+    <table>
+      <thead>
+        <tr><th>主题</th><th>前端 / 业务</th><th>图形 / 渲染</th><th>引擎 / 底层</th></tr>
+      </thead>
+      <tbody id="weight"></tbody>
+    </table>
+    <div class="legend" id="legend"></div>
+  </main>
+
+  <footer>
+    来源：本目录 17 个页面 · webgl-pipeline / triangle / VertexColor / uniform / texture / mvp-depth / sphere /
+    pick-cpu / pick-gpu / pick-gpu-instance / shadow-map / pcss / collision / intersect /
+    index（WebGPU 路径追踪）/ wind-field / three-tsl-lighting。优先级是按常见面试分布给的经验判断，不是硬指标。
+  </footer>
+
+<script>
+const ROLE_LABEL = { frontend: "前端", graphics: "图形", engine: "引擎" };
+
+const ROLES = [
+  { id: "all", label: "全部" },
+  { id: "frontend", label: "前端 / 业务" },
+  { id: "graphics", label: "图形 / 渲染" },
+  { id: "engine", label: "引擎 / 底层" },
+];
+
+const CLUSTERS = [
+  {
+    id: "pipeline",
+    title: "WebGL 最小闭环与管线",
+    files: ["webgl-pipeline.html", "triangle.html", "VertexColor.html", "uniform.html", "texture.html"],
+    pitch: "画一帧就两件事：把数据传到 GPU，然后下一条 draw。GPU 侧是固定管线——顶点着色器、图元组装、光栅化、片元着色器、逐片元测试与混合。JS 侧顺序永远不变：getContext、写两段 shader、compile + link 成 program、准备 Float32Array、bufferData 上传成 VBO、用 VAO 记下 attribute 怎么取、最后 clear + draw。",
+    layer: "停在「7 步 + 管线阶段」。后面加颜色、纹理、相机，都是在第 4~7 步上插东西，顺序不变。",
+    followups: [
+      { q: "VAO 和 VBO 各管什么？", a: "VBO 是数据本身，GPU 上的数组。VAO 是配置记录本：记住每个 attribute 从哪个 buffer 取、几个分量、什么类型、stride 和 offset，连 ELEMENT_ARRAY_BUFFER 的绑定也一起记在里面。WebGL1 没有 VAO，每次 draw 前都得重设一遍；有 VAO 之后 bindVertexArray 一下就够了。", roles: ["frontend", "graphics", "engine"] },
+      { q: "attribute、uniform、varying 的区别？", a: "**attribute** 每顶点一份、来自 VBO、只有顶点着色器能读。**uniform** 每次 draw 一份、由 CPU 设置、两个着色器都能读。**varying**（GLSL 300 es 里直接写成 out / in）从 VS 传给 FS，光栅化阶段按重心坐标插值。", roles: ["frontend", "graphics"] },
+      { q: "交错数组的 stride 和 offset 怎么算？", a: "每个顶点是 x, y, r, g, b 共 5 个 float，**stride = 5 × 4 = 20 字节**；位置 offset = 0，颜色 offset = 2 × 4 = 8。VertexColor.html 和 uniform.html 里就是这个写法。想加第二组属性不用改 buffer 布局，只加一个 vertexAttribPointer。", roles: ["frontend", "graphics"] },
+      { q: "varying 的插值是屏幕空间线性的吗？", a: "不是。默认是**透视校正插值**，GPU 按 1/w 加权，所以斜面上远处的纹理不会被拉扯。真要在屏幕空间线性插值（老式软件渲染那样）会出现明显的透视错误。", roles: ["graphics", "engine"] },
+      { q: "纹理为什么设 REPEAT，mipmap 解决什么？", a: "REPEAT 让 UV 超出 [0,1] 时平铺，是做地面铺砖的前提；换成 CLAMP_TO_EDGE 才能避免边缘采到对面像素。**mipmap** 是预生成的金字塔，远处自动用小层，避免采样频率跟不上几何密度而产生摩尔纹，代价是约多三分之一显存。另外 WebGL 里图片原点在左上、GL 在左下，要配合 UNPACK_FLIP_Y_WEBGL。", roles: ["frontend", "graphics"] },
+    ],
+  },
+  {
+    id: "mvp",
+    title: "MVP 变换与深度缓冲",
+    files: ["mvp-depth.html", "sphere.html"],
+    pitch: "顶点从局部走到屏幕要过三关：Model 摆到世界，View 把相机搬到原点朝 −Z，Projection 做近大远小并顺手把深度写进 z。着色器里只有一行 gl_Position = P·V·M·a_pos，GPU 再做一次除以 w 才落到 NDC。遮挡靠深度缓冲——每个像素只留最近的 z，和绘制顺序无关；关掉它 GPU 就退化成画家算法，后画的那个赢。",
+    layer: "讲清 M / V / P 各自职责 + 深度缓冲在比什么。逆矩阵推导不用主动讲。",
+    followups: [
+      { q: "MVP 为什么写成 P × V × M？", a: "列向量右乘，**从左到右的作用顺序是 M → V → P**。同一帧里 V 和 P 是共用的，只有 M 每个物体不一样，这也是为什么每画一个物体只换一次 M。", roles: ["frontend", "graphics", "engine"] },
+      { q: "法线为什么不能直接用 Model 矩阵变换？", a: "非等比缩放会把法线掰歪——法线要在**垂直关系**上保持不变，所以得用 Model 左上 3×3 的**逆转置**（sphere.html 里的 u_normalMat）。等比缩放时逆转置和原矩阵只差一个常数，可以直接用；一旦有非均匀缩放就必须修正。", roles: ["graphics", "engine"] },
+      { q: "深度为什么不是线性的？z-fighting 怎么来？", a: "透视投影存的是 1/z 的线性函数，所以近处精度极高、远处被压扁——把 mvp-depth 切到灰度深度视图，远处挤成一片白就是这个原因。**z-fighting** 是两个面的深度差小于当地精度，量化后打成同一个值，逐帧闪烁。缓解：把 near 拉大一点（别设 0.001）、用对数深度缓冲、或对共面几何用 polygon offset。", roles: ["graphics", "engine"] },
+      { q: "深度测试和透明混合能同时开吗？", a: "能，但不能随便开。混合要求**按从远到近的顺序**画，而深度测试会按光栅化顺序丢弃片元、正好破坏这个顺序。常规做法：不透明物体先画并写深度，半透明最后画、关掉深度写入，并且按距离排序。", roles: ["graphics", "engine"] },
+    ],
+  },
+  {
+    id: "lighting",
+    title: "光照：Blinn-Phong 到 PBR",
+    files: ["sphere.html", "three-tsl-lighting.html"],
+    pitch: "最经典的一行是 I = ka·Ia + kd·Id·(N·L) + ks·Is·(N·H)^n，其中 H = normalize(L+V)。用半程向量代替反射向量 R，省掉一次 reflect，而且掠射角下高光不会突然断掉。再往上一层是 PBR：金属度 / 粗糙度工作流、Fresnel、微表面 GGX，配 IBL 用环境贴图当光源。",
+    layer: "Blinn-Phong 讲透；PBR 讲到「金属度和粗糙度在描述什么」就够，不用推 GGX。",
+    followups: [
+      { q: "Blinn-Phong 比 Phong 好在哪？", a: "Phong 要算反射向量 R = reflect(−L, N)，Blinn 用 H = normalize(L + V) 代替，省一次向量运算；更关键的是 **Phong 在掠射角（视线几乎平行于表面）高光会突然消失，Blinn 不会**。代价是半程向量的物理含义没那么直白。", roles: ["graphics", "engine"] },
+      { q: "为什么要做 gamma 校正？", a: "光照计算要在**线性空间**做，而纹理和屏幕都是 sRGB 编码的。采样后 decode 到线性、算完再 encode 回去（sphere.html 最后那句 pow(1/2.2)）。不做的话暗部会发灰、亮部过饱和，而且插值和混合都会在错误的曲线上进行。", roles: ["graphics", "engine"] },
+      { q: "金属度和粗糙度分别在控制什么？", a: "金属度近似是个二值开关：0 是电介质，有漫反射、Fresnel 弱且偏白；1 是金属，没有漫反射、Fresnel 带基色、反射强。粗糙度控制微表面法线的分布宽度——越小越接近镜面、高光越集中，越大高光越散。两者共同决定能量怎么在漫反射和镜面之间分配。", roles: ["graphics", "engine"] },
+      { q: "IBL 是什么？PMREM 在做什么？", a: "IBL 是拿环境贴图当光源，给物体提供各方向的间接光，是「环境光」的物理正确版本。直接把 cube map 按粗糙度做 mipmap 会出现亮斑，PMREM 是先按 GGX 分布预过滤，再按法线分布编码，让一次采样就能拿到对应粗糙度的模糊反射。", roles: ["engine"] },
+    ],
+  },
+  {
+    id: "picking",
+    title: "拾取：CPU 射线 / GPU ID",
+    files: ["pick-cpu.html", "pick-gpu.html", "pick-gpu-instance.html"],
+    pitch: "两条路。CPU 派：把鼠标坐标换成 NDC，用 (P·V)⁻¹ 反投影出近平面和远平面上两点连成射线，在 JS 里跟球 / AABB 求交，取最小正 t——它有真正的 3D 交点，但复杂度随三角形数量涨。GPU 派：用同一套 MVP 把每个物体平涂成唯一 ID 色画进离屏 FBO，深度测试决定谁留在像素上，再 readPixels 读那一个像素还原 id——与几何复杂度无关，但拿不到交点，而且会同步 stall。",
+    layer: "两条路的取舍讲透。物体数量上万时再引到实例化。",
+    followups: [
+      { q: "反投影为什么需要逆 VP？", a: "NDC 是投影之后的坐标，要回到世界空间就得把整条 P·V 链反过来。取 ndc z = −1 和 +1 两个点分别乘 invVP、各自除以 w 得到近远两个世界点，连起来就是射线——pick-cpu.html 的 unproject 干的就是这件事。", roles: ["frontend", "graphics"] },
+      { q: "GPU pick 为什么不能开 MSAA？", a: "抗锯齿会在物体边缘把相邻像素的 ID 颜色混合，读出来就是一个**不存在的 id**。所以 ID 缓冲要 NEAREST 且不抗锯齿。这条规则是通用的：任何「数据贴图」（阴影图、法线图、ID 图）都不能线性插值，插出来的中间值没有物理意义。", roles: ["graphics", "engine"] },
+      { q: "readPixels 的代价是什么？", a: "它会让 CPU 等 GPU 把前面的命令跑完，**一次同步 stall**，等于打断了流水线，移动端尤其贵。所以别每帧无条件读——只在真正需要（点击）时读，或者用 PBO / fence 异步取结果。", roles: ["graphics", "engine"] },
+      { q: "上万个物体怎么拾取？", a: "把位置放进实例缓冲，用 vertexAttribDivisor(…, 1) 让每个实例换一份偏移，drawElementsInstanced 一次画完；pick 那一趟用 gl_InstanceID + 1 直接当 id 拆进 RGB，同样一次 draw。CPU 侧完全不按物体循环——**那才是真正的瓶颈，不是求交本身**。", roles: ["graphics", "engine"] },
+      { q: "ID 用 RGB8 够用吗？上限多少？", a: "三个 8 位通道共 24 位，理论上 1600 多万个 id。但 0 要留给背景、抗锯齿会污染、驱动对颜色精度也只是「大致准确」，所以别贴着上限用。要在几百万实例里精确定位，更稳的是把 instance id 反查回 JS 侧的业务数组，pick-gpu-instance.html 就是这么做的。", roles: ["engine"] },
+    ],
+  },
+  {
+    id: "shadow",
+    title: "阴影：Shadow Map 与 PCSS",
+    files: ["shadow-map.html", "pcss.html"],
+    pitch: "两趟。第一趟从灯光看世界、只写深度，得到「每个方向最近有多远」的阴影图。第二趟从相机画，把片元换到灯光空间，比较自己的深度和图上记录的深度，更远就是被挡住。硬比较出来的叫硬阴影，边缘是纹素级的锯齿，3×3 PCF 只是邻域平均、整圈一样糊。",
+    layer: "shadow map + bias + PCF 是主干，PCSS 是加分项。",
+    followups: [
+      { q: "bias 太大会怎样，太小会怎样？", a: "太小，地面自己挡住自己，出现条纹状斑点，叫 **shadow acne**——本质是同一个面在两个空间里量化结果不一致。太大，影子从物体根部脱离，叫 **peter panning**。经典缓解手段是渲染阴影图时只剔正面：背面深度更远，等于白送一点偏移量。", roles: ["graphics", "engine"] },
+      { q: "PCF 和 PCSS 的区别？", a: "固定半径 PCF 只是邻域平均，整圈一样糊，**没有物理含义**。PCSS 先用邻域搜索找到挡光面（blocker）的平均深度，再用相似三角形估半影宽度 penumbra = (z接收 − z挡) / z挡 × lightSize，最后用这个宽度做变半径 PCF——贴着物体的地方核小、影子实，离远了才变软。代价是每个像素要先扫一圈找 blocker。", roles: ["graphics", "engine"] },
+      { q: "阴影图为什么常用正交投影？", a: "平行光没有透视，投到正交里深度是线性、光照方向一致。点光 / 聚光必须用透视投影，范围大时配 cube map 或级联。方向光的正交范围如果覆盖太大，纹素变粗、锯齿就明显，所以要紧贴着场景收（shadow-map.html 里的 ORTHO_W）。", roles: ["graphics", "engine"] },
+      { q: "一张 shadow map 覆盖不了整个场景怎么办？", a: "**级联阴影（CSM）**：按相机视锥切几段，每段配一张同样分辨率的阴影图，近处纹素密、远处稀。级联切换处要做混合，否则会看到一条硬接缝。", roles: ["engine"] },
+    ],
+  },
+  {
+    id: "intersect",
+    title: "几何求交与碰撞响应",
+    files: ["intersect.html", "collision.html", "pick-cpu.html"],
+    pitch: "分两类。射线求交：球是解二次方程取最小正根，AABB 是 slab 法做区间求交。三角形对三角形是平面求交——两个平面相交必然是一条直线，方向就是两个法线的叉积；再把两个三角形各自按对方平面裁成这条直线上的参数区间，两个区间重叠就是相交，重叠那一段就是交线。整个思路是**三次降维：平面 → 直线 → 一维区间**。",
+    layer: "讲清降维三步和退化处理。公式推导不用背，但共面和平行两个分支必须能说出来。",
+    followups: [
+      { q: "slab 法求 AABB 时除以 0 怎么办？", a: "射线平行于某个轴时 1/d 是 ±Infinity，按 IEEE 规则算下去反而给出正确结果——那个轴的区间变成整个实数轴。真正要小心的是 **0 × Infinity = NaN**。同时必须判 tF < 0，那表示盒子整体在射线起点背后。", roles: ["graphics", "engine"] },
+      { q: "球–AABB 怎么判？", a: "取球心到盒子的最近点 q = clamp(center, min, max)。球心在盒外时，距离就是 |center − q|，小于半径即相交，分离方向是 (center − q) 归一化后取反。球心在盒内时，q 等于球心、距离恒为 0，得改成找穿透最浅的那个面推出去，否则会被推到错误的方向。", roles: ["graphics", "engine"] },
+      { q: "碰撞检测和碰撞响应怎么分？", a: "检测只回答三件事：叠没叠、重叠多少、沿哪个方向分离——也就是 **MTV（最小平移向量）**。响应才决定位置和速度怎么改：沿 n 各退一半把几何分开，再按 n 把相对法向速度取反做弹性碰撞。collision.html 把这两步做成了独立开关，可以只检测不响应，直观看到「穿过但仍然发红」。", roles: ["graphics", "engine"] },
+      { q: "三角形求交有哪些退化情况？", a: "两个平面平行（法线叉积趋零）时没有唯一交线：若还**共面**，问题退化成 2D 里两个三角形是否重叠，得换一套凸多边形裁剪；若不共面，直接返回不相交。另外法线接近平行时，求交线上「离原点最近点」的分母 |nA×nB|² 趋零、数值会炸——好消息是**区间重叠这个布尔判断对它免疫**，只有输出的端点坐标会漂。", roles: ["engine"] },
+      { q: "为什么不用 SAT？为什么不做逐三角形求交？", a: "SAT（分离轴定理）判「是否相交」最稳，三角形对三角形要试 11 条候选轴，但它**给不出交线**。平面求交一次解出方向和各段区间，天然得到交线段，要画那条线时更划算。球 / AABB 能用闭式解就用，比逐三角形测试快几个数量级——pick-cpu.html 就是靠这个在纯 CPU 上也够快。", roles: ["engine"] },
+      { q: "快速移动的物体会穿过去吗？", a: "会，这叫**隧穿**。上面所有测试都是「某一时刻」的静态检测。要么把 dt 切小做子步进，要么做连续碰撞检测（CCD）：用扫掠体，或者用相对速度构造射线，在时间轴上求最早接触时刻。", roles: ["engine"] },
+    ],
+  },
+  {
+    id: "pathtrace",
+    title: "路径追踪（WebGPU 计算）",
+    files: ["index.html"],
+    pitch: "每个像素发一条射线，和场景求交，按材质散射出下一条，重复若干次；撞到光源就把吞吐量乘上自发光累加。因为这是蒙特卡洛估计，单次结果噪声很大，所以逐帧累积再取平均，spp 涨上去才收敛。CPU 只负责建缓冲和 dispatch，所有求解都在 compute shader 里。",
+    layer: "渲染方程和蒙特卡洛的思想讲到。重要性采样的权重推导可以点到为止。",
+    followups: [
+      { q: "为什么每帧结果都不一样？累积在做什么？", a: "路径追踪是对渲染方程的蒙特卡洛估计，每条路径只采样了一个方向，所以单条路径**无偏但方差很大**。把多帧结果按 (prev·n + sample) / (n + 1) 递推平均，方差按 1/n 降，画面逐渐收敛。相机一动就必须 reset（frame 归零），因为旧样本对应的是另一个视角。", roles: ["graphics", "engine"] },
+      { q: "余弦加权半球采样为什么不用除 pdf？", a: "按材质自身的分布采样时（余弦加权对应的正是漫反射 BRDF·cos 的形状），采样概率和 BRDF·cos 项**恰好抵消**，所以吞吐量只乘 albedo 就对了——这是重要性采样最舒服的情形。一旦采样分布和 BRDF 不匹配（对光源采样、或多重重要性采样），就必须除 pdf，否则估计有偏。", roles: ["engine"] },
+      { q: "光源那么小，随机路径怎么打得中？", a: "纯随机散射时正好撞上面积光源的概率极低，所以收敛极慢、噪点都堆在光源附近。标准解法是**显式光源采样（NEE，next event estimation）**：每次散射时额外朝光源采一个点、连一条阴影线，把直接光单独算出来，随机路径只负责间接光。这是让路径追踪真正可用的关键一步。", roles: ["engine"] },
+      { q: "无限反弹怎么停下来？", a: "直接设 maxBounces 会**截断能量、让暗部偏黑**，而且固定步数对亮处暗处都不划算。做得好的是**俄罗斯轮盘赌**：按当前吞吐量决定继续的概率，终止时把剩余能量除以存活概率补偿——期望值不变，但路径长度能按能量自适应。", roles: ["engine"] },
+      { q: "场景复杂了怎么办？", a: "线性遍历所有物体是 O(n)，必须上 **BVH**：按空间递归二分建树，遍历时用 AABB 快速剪枝。建树常用 SAH（表面积启发）决定怎么切，遍历用 slab 法测 AABB。index.html 目前还停在 AABB 列表，下一步就是换成三角形 + BVH。", roles: ["engine"] },
+      { q: "WebGPU 和 WebGL 的区别？", a: "核心差别是 WebGPU 有**真正的 compute shader** 和显式资源绑定（bind group），可以自由读写 storage buffer，不需要拿 render pass 或 transform feedback 绕路。管线状态也是显式创建的 pipeline object，比 WebGL 的状态机更接近 Vulkan / Metal。代价是代码更长、初始化是异步的（requestAdapter / requestDevice）。", roles: ["graphics", "engine"] },
+    ],
+  },
+  {
+    id: "windfield",
+    title: "工程示例：多 pass 与动态顶点",
+    files: ["wind-field.html"],
+    pitch: "本质是「同一套 MVP + 多套 shader」：地形网格走 drawElements，风向箭头和流线各一套 program，流线每帧用 bufferSubData 更新 VBO 顶点。经纬高先转到局部 ENU 坐标再进相机，高度方向额外做了夸张系数，保证起伏看得见。",
+    layer: "以「多 pass + 动态顶点」为主。这是工程题，不是图形原理题。",
+    followups: [
+      { q: "每帧 bufferSubData 传几万个顶点会卡吗？", a: "关键不在传了多少字节，而在**有没有和 GPU 抢 buffer**——GPU 还在读上一帧的数据时你写进去，驱动就得同步或者偷偷拷贝一份。缓解手段分别是 double buffering、orphaning（先 bufferData(null) 再传）、或者干脆把流线的位置放进 vertex shader / compute 里算。", roles: ["engine"] },
+      { q: "经纬度怎么变成场景坐标？", a: "局部等距投影：E = Δlon × cos(lat0) × R，N = Δlat × R，再换轴向（代码里返回 [E, U, −N] 就是为了 Y-up）。小范围内够用；跨大范围就必须上真正的投影，否则会随纬度明显扭曲。", roles: ["engine"] },
+    ],
+  },
+];
+
+const WEIGHT = [
+  ["最小闭环与管线", "重点", "会问", "会问"],
+  ["MVP 与深度", "提一下", "重点", "重点"],
+  ["光照", "提一下", "会问", "重点"],
+  ["拾取", "会问", "重点", "重点"],
+  ["阴影", "不考", "重点", "重点"],
+  ["求交与碰撞", "提一下", "会问", "重点"],
+  ["路径追踪", "不考", "会问", "重点"],
+  ["多 pass 工程", "不考", "提一下", "会问"],
+];
+
+const LEVEL_DESC = {
+  "重点": "主动讲，准备好接三层追问",
+  "会问": "问到能答上，不主动展开",
+  "提一下": "知道是什么就够",
+  "不考": "可以跳过",
+};
+
+function esc(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// 极小的行内标记：`code` → <code>，**bold** → <b>
+function rich(s) {
+  return esc(s)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+}
+
+function roleHtml(roles) {
+  return roles.map((r) => ROLE_LABEL[r]).join(" · ");
+}
+
+function renderTopics() {
+  const host = document.getElementById("topics");
+  host.innerHTML = CLUSTERS.map((c) => {
+    const files = c.files.map((f) => `<span>${esc(f)}</span>`).join("");
+    const fus = c.followups.map((f) => {
+      const hot = f.roles.length >= 3 ? " hot" : "";
+      return `<details class="fu" data-roles="${f.roles.join(",")}">
+        <summary>
+          <span class="chev">▶</span>
+          <span class="dot${hot}"></span>
+          <span class="q">${esc(f.q)}</span>
+          <span class="meta">${roleHtml(f.roles)}</span>
+        </summary>
+        <div class="ans">${rich(f.a)}</div>
+      </details>`;
+    }).join("");
+    return `<section class="topic" data-cluster="${c.id}">
+      <h3>${esc(c.title)}</h3>
+      <div class="files">${files}</div>
+      <p class="pitch">${rich(c.pitch)}</p>
+      <p class="layer"><b>讲到哪一层停：</b>${rich(c.layer)}</p>
+      <div class="fus">${fus}</div>
+      <p class="files-note" hidden>这个岗位基本不会被问到这一块。</p>
+    </section>`;
+  }).join("");
+}
+
+function renderFilters() {
+  const host = document.getElementById("filters");
+  const count = document.getElementById("count");
+  ROLES.forEach((r) => {
+    const b = document.createElement("button");
+    b.className = "pill" + (r.id === "all" ? " on" : "");
+    b.textContent = r.label;
+    b.dataset.role = r.id;
+    b.addEventListener("click", () => setRole(r.id));
+    host.insertBefore(b, count);
+  });
+}
+
+let currentRole = "all";
+
+function setRole(role) {
+  currentRole = role;
+  document.querySelectorAll("#filters .pill").forEach((b) => {
+    b.classList.toggle("on", b.dataset.role === role);
+  });
+
+  const total = CLUSTERS.reduce((n, c) => n + c.followups.length, 0);
+  let shown = 0;
+
+  document.querySelectorAll(".topic").forEach((sec) => {
+    let visible = 0;
+    sec.querySelectorAll("details.fu").forEach((d) => {
+      const roles = d.dataset.roles.split(",");
+      const ok = role === "all" || roles.includes(role);
+      d.hidden = !ok;
+      if (ok) visible++;
+    });
+    sec.querySelector(".files-note").hidden = visible > 0;
+    shown += visible;
+  });
+
+  document.getElementById("count").textContent = `当前 ${shown} / ${total} 条`;
+}
+
+function renderWeight() {
+  document.getElementById("weight").innerHTML = WEIGHT.map(([topic, a, b, c]) =>
+    `<tr><td>${esc(topic)}</td>${[a, b, c].map((v) => `<td>${cell(v)}</td>`).join("")}</tr>`
+  ).join("");
+
+  document.getElementById("legend").innerHTML = Object.keys(LEVEL_DESC).map((lv) =>
+    `<span class="lvl lvl-${lv}">${cell(lv)} ${LEVEL_DESC[lv]}</span>`
+  ).join("");
+}
+
+function cell(level) {
+  const hot = level === "重点" ? '<span class="dot hot"></span>' : "";
+  return `<span class="lvl lvl-${level}">${hot}${esc(level)}</span>`;
+}
+
+renderTopics();
+renderFilters();
+renderWeight();
+setRole("all");
+</script>
+</body>
+</html>

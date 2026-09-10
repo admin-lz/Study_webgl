@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · 三角形相交</title>
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --line: #243044;
+      --text: #e8eef8;
+      --muted: #8b97a8;
+      --accent: #9fd4ff;
+      --ok: #7dcea0;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text);
+      font: 13px/1.55 ui-sans-serif, system-ui, sans-serif;
+    }
+    canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+    canvas:active { cursor: grabbing; }
+    #hud {
+      position: fixed; left: 16px; top: 16px; pointer-events: none;
+      text-shadow: 0 1px 4px #000; max-width: 460px;
+    }
+    #hud h1 { margin: 0 0 4px; font-size: 15px; }
+    #hud p { margin: 0 0 6px; color: var(--muted); }
+    #hud b { color: var(--accent); }
+    #status { font-size: 13px; }
+    #status .hit { color: var(--ok); }
+    #status .miss { color: var(--muted); }
+    #status .val { color: var(--text); font-variant-numeric: tabular-nums; }
+    #panel {
+      position: fixed; left: 16px; bottom: 16px;
+      display: flex; flex-direction: column; gap: 7px;
+      background: rgba(18, 21, 31, 0.88);
+      border: 1px solid var(--line); border-radius: 8px;
+      padding: 12px 14px; backdrop-filter: blur(6px);
+    }
+    #panel label { display: flex; align-items: center; gap: 8px; color: var(--muted); cursor: pointer; }
+    #panel input[type="range"] { width: 150px; accent-color: #4aa3ff; }
+    #panel .val { width: 46px; text-align: right; color: var(--text); font-variant-numeric: tabular-nums; }
+    #err {
+      display: none; position: fixed; inset: 0; place-items: center;
+      color: #fff; background: #1a1a1a; padding: 24px; font-size: 15px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+
+  <div id="hud">
+    <h1>WebGL2 · 三角形相交</h1>
+    <p>CPU 用「平面裁剪」算出交线段，GPU 只负责把它画成亮黄线。<br>拖动旋转视角 · 滚轮缩放 · 下方滑块转动橙色三角形。</p>
+    <p id="status"></p>
+  </div>
+
+  <div id="panel">
+    <label>B 绕 Y <input id="yaw" type="range" min="-3.14" max="3.14" step="0.01" value="0.60" /><span class="val" id="yawVal">0.60</span></label>
+    <label>B 绕 X <input id="pitch" type="range" min="-3.14" max="3.14" step="0.01" value="-0.55" /><span class="val" id="pitchVal">-0.55</span></label>
+    <label>间距 <input id="offset" type="range" min="-2.2" max="2.2" step="0.01" value="0.20" /><span class="val" id="offsetVal">0.20</span></label>
+    <label><input id="spin" type="checkbox" checked /> 自转</label>
+  </div>
+
+  <div id="err"></div>
+
+<script>
+// ==========================================================================
+// 一、CPU：判断两个三角形相交
+// ==========================================================================
+// 用扁平 Float32Array 存顶点(方便直接喂给 WebGL)时:
+// 顶点 i 坐标 = [arr[3i], arr[3i+1], arr[3i+2]]
+const EPS = 1e-9;
+const sub   = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+const add   = (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
+const mul   = (a, s) => [a[0]*s, a[1]*s, a[2]*s];
+const dot   = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+const cross = (a, b) => [
+  a[1]*b[2] - a[2]*b[1],
+  a[2]*b[0] - a[0]*b[2],
+  a[0]*b[1] - a[1]*b[0],
+];
+const len = a => Math.hypot(a[0], a[1], a[2]);
+const normalize = a => { const l = len(a) || 1; return mul(a, 1 / l); };
+
+// 用平面 nB·x = cB 裁剪多边形 poly，返回交线参数区间 [tmin,tmax]
+function clipFaceToPlane(poly, nB, cB, P0, d) {
+  let tmin = Infinity, tmax = -Infinity, hit = false;
+  const n = poly.length;
+  for (let i = 0; i < n; i++) {
+    const a = poly[i], b = poly[(i + 1) % n];
+    const si = dot(nB, a) - cB;
+    const sj = dot(nB, b) - cB;
+    let cand = null;
+    if (Math.abs(si) <= EPS) {
+      cand = a;                        // 顶点落在平面上
+    } else if (si * sj < 0) {
+      const t = si / (si - sj);        // 边穿过平面，插值
+      cand = add(a, mul(sub(b, a), t));
+    }
+    if (cand) {
+      const tp = dot(sub(cand, P0), d);
+      if (tp < tmin) tmin = tp;
+      if (tp > tmax) tmax = tp;
+      hit = true;
+    }
+  }
+  return hit ? [tmin, tmax] : null;
+}
+
+// 两个三角形共面：转到平面内的 2D，用 Sutherland–Hodgman 裁剪出重叠多边形，
+// 再返回其中距离最远的一对点（当作「交线」的代表段，方便和别的分支统一处理）
+function polygonsIntersectCoplanar(A, B, n) {
+  const nn = normalize(n);
+  const helper = Math.abs(nn[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+  const u = normalize(cross(nn, helper));
+  const v = cross(nn, u);
+  const origin = A[0];
+  const ou = dot(origin, u), ov = dot(origin, v);
+  const to2 = p => [dot(p, u) - ou, dot(p, v) - ov];
+
+  let poly = A.map(to2);
+  const b2 = B.map(to2);
+  let area = 0;
+  for (let i = 0; i < 3; i++) {
+    const p = b2[i], q = b2[(i + 1) % 3];
+    area += p[0] * q[1] - q[0] * p[1];
+  }
+  const sgn = area >= 0 ? 1 : -1;             // 让「内侧」统一到 >= 0
+
+  for (let i = 0; i < 3 && poly.length; i++) {
+    const p = b2[i], q = b2[(i + 1) % 3];
+    const side = pt => sgn * ((q[0]-p[0]) * (pt[1]-p[1]) - (q[1]-p[1]) * (pt[0]-p[0]));
+    const out = [];
+    for (let j = 0; j < poly.length; j++) {
+      const cur = poly[j], nxt = poly[(j + 1) % poly.length];
+      const ci = side(cur) >= 0, ni = side(nxt) >= 0;
+      if (ci) out.push(cur);
+      if (ci !== ni) {
+        const dcx = nxt[0]-cur[0], dcy = nxt[1]-cur[1];
+        const ex = q[0]-p[0], ey = q[1]-p[1];
+        const den = dcx * ey - dcy * ex;
+        if (Math.abs(den) > EPS) {
+          const t = ((p[0]-cur[0]) * ey - (p[1]-cur[1]) * ex) / den;
+          out.push([cur[0] + dcx * t, cur[1] + dcy * t]);
+        }
+      }
+    }
+    poly = out;
+  }
+  if (poly.length < 2) return null;
+
+  let best = null, bd = -1;
+  for (let i = 0; i < poly.length; i++) {
+    for (let j = i + 1; j < poly.length; j++) {
+      const d = (poly[i][0]-poly[j][0]) ** 2 + (poly[i][1]-poly[j][1]) ** 2;
+      if (d > bd) { bd = d; best = [poly[i], poly[j]]; }
+    }
+  }
+  const to3 = pt => add(origin, add(mul(u, pt[0]), mul(v, pt[1])));
+  return [to3(best[0]), to3(best[1])];
+}
+
+// 返回 null 表示不相交，否则返回交线段的两个端点
+function facesIntersect(A, B) {
+  const nA = cross(sub(A[1], A[0]), sub(A[2], A[0]));
+  const cA = dot(nA, A[0]);
+  const nB = cross(sub(B[1], B[0]), sub(B[2], B[0]));
+  const cB = dot(nB, B[0]);
+  const d = cross(nA, nB);
+  if (len(d) <= EPS) {                          // 法线平行
+    if (Math.abs(dot(nA, B[0]) - cA) <= EPS) {
+      return polygonsIntersectCoplanar(A, B, nA);  // 共面 → 2D 判断
+    }
+    return null;                                // 平行但错开
+  }
+  // 交线上一点
+  const invd2 = 1 / dot(d, d);
+  const P0 = mul(
+    add(mul(cross(nB, d), cA), mul(cross(d, nA), cB)),
+    invd2
+  );
+  const segA = clipFaceToPlane(A, nB, cB, P0, d);
+  if (!segA) return null;
+  const segB = clipFaceToPlane(B, nA, cA, P0, d);
+  if (!segB) return null;
+  const lo = Math.max(segA[0], segB[0]);
+  const hi = Math.min(segA[1], segB[1]);
+  if (lo > hi + EPS) return null;               // 区间不重叠 → 不相交
+  const at = t => add(P0, mul(d, t * invd2));   // 参数 → 世界坐标
+  return [at(lo), at(hi)];
+}
+
+// ==========================================================================
+// 二、GPU：把 CPU 算出来的东西画出来
+//    1. getContext / 2. shader / 3. program / 4. 顶点 / 5. VBO / 6. VAO / 7. draw
+// ==========================================================================
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+const statusEl = document.getElementById("status");
+const yawEl = document.getElementById("yaw");
+const pitchEl = document.getElementById("pitch");
+const offsetEl = document.getElementById("offset");
+const spinEl = document.getElementById("spin");
+const yawVal = document.getElementById("yawVal");
+const pitchVal = document.getElementById("pitchVal");
+const offsetVal = document.getElementById("offsetVal");
+
+function fail(msg) {
+  errBox.style.display = "grid";
+  errBox.textContent = msg;
+  throw new Error(msg);
+}
+
+const gl = canvas.getContext("webgl2", { antialias: true });
+if (!gl) fail("需要 WebGL2。请用较新的 Chrome / Edge / Firefox。");
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    fail(gl.getShaderInfoLog(s) || "shader compile failed");
+  }
+  return s;
+}
+
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    fail(gl.getProgramInfoLog(p) || "program link failed");
+  }
+  return p;
+}
+
+// 三角形面：顶点已经是世界坐标，只差一个 viewProj
+const MESH_VS = `#version 300 es
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec3 a_normal;
+uniform mat4 u_viewProj;
+out vec3 v_normal;
+void main() {
+  v_normal = a_normal;
+  gl_Position = u_viewProj * vec4(a_pos, 1.0);
+}`;
+
+const MESH_FS = `#version 300 es
+precision mediump float;
+in vec3 v_normal;
+uniform vec3 u_color;
+uniform vec3 u_lightDir;
+uniform float u_alpha;
+out vec4 outColor;
+void main() {
+  // 不剔背面，所以用 abs：两面都给一点明暗，方便看朝向
+  vec3 N = normalize(v_normal);
+  float ndl = abs(dot(N, normalize(u_lightDir)));
+  vec3 c = u_color * (0.45 + 0.55 * ndl);
+  outColor = vec4(c, u_alpha);
+}`;
+
+// 线和点共用：画点时 gl_PointSize 才生效，画线时被忽略
+const LINE_VS = `#version 300 es
+layout(location = 0) in vec3 a_pos;
+uniform mat4 u_viewProj;
+uniform float u_pointSize;
+void main() {
+  gl_PointSize = u_pointSize;
+  gl_Position = u_viewProj * vec4(a_pos, 1.0);
+}`;
+
+const LINE_FS = `#version 300 es
+precision mediump float;
+uniform vec3 u_color;
+uniform float u_alpha;
+out vec4 outColor;
+void main() { outColor = vec4(u_color, u_alpha); }`;
+
+// 屏幕空间加粗线段：把 1px 的线扩成宽度固定的四边形
+// a_corner.x = 0/1 选端点，a_corner.y = -1/+1 选法线两侧
+const THICK_VS = `#version 300 es
+layout(location = 0) in vec2 a_corner;
+uniform mat4 u_viewProj;
+uniform vec3 u_p0;
+uniform vec3 u_p1;
+uniform vec2 u_resolution;
+uniform float u_width;
+void main() {
+  vec4 c0 = u_viewProj * vec4(u_p0, 1.0);
+  vec4 c1 = u_viewProj * vec4(u_p1, 1.0);
+  vec2 s0 = c0.xy / c0.w * u_resolution * 0.5;   // 裁剪空间 → 像素
+  vec2 s1 = c1.xy / c1.w * u_resolution * 0.5;
+  vec2 dir = s1 - s0;
+  float l = length(dir);
+  dir = l > 0.0001 ? dir / l : vec2(1.0, 0.0);
+  vec2 nrm = vec2(-dir.y, dir.x);
+
+  vec4 clip = mix(c0, c1, a_corner.x);
+  vec2 sp = mix(s0, s1, a_corner.x) + nrm * a_corner.y * (u_width * 0.5);
+  clip.xy = sp / (u_resolution * 0.5) * clip.w;  // 像素 → 裁剪空间
+  gl_Position = clip;
+}`;
+
+const THICK_FS = `#version 300 es
+precision mediump float;
+uniform vec3 u_color;
+uniform float u_alpha;
+out vec4 outColor;
+void main() { outColor = vec4(u_color, u_alpha); }`;
+
+const meshProg  = link(MESH_VS, MESH_FS);
+const lineProg  = link(LINE_VS, LINE_FS);
+const thickProg = link(THICK_VS, THICK_FS);
+
+const uMesh = {
+  viewProj: gl.getUniformLocation(meshProg, "u_viewProj"),
+  color:    gl.getUniformLocation(meshProg, "u_color"),
+  lightDir: gl.getUniformLocation(meshProg, "u_lightDir"),
+  alpha:    gl.getUniformLocation(meshProg, "u_alpha"),
+};
+const uLine = {
+  viewProj:  gl.getUniformLocation(lineProg, "u_viewProj"),
+  color:     gl.getUniformLocation(lineProg, "u_color"),
+  alpha:     gl.getUniformLocation(lineProg, "u_alpha"),
+  pointSize: gl.getUniformLocation(lineProg, "u_pointSize"),
+};
+const uThick = {
+  viewProj:   gl.getUniformLocation(thickProg, "u_viewProj"),
+  p0:         gl.getUniformLocation(thickProg, "u_p0"),
+  p1:         gl.getUniformLocation(thickProg, "u_p1"),
+  resolution: gl.getUniformLocation(thickProg, "u_resolution"),
+  width:      gl.getUniformLocation(thickProg, "u_width"),
+  color:      gl.getUniformLocation(thickProg, "u_color"),
+  alpha:      gl.getUniformLocation(thickProg, "u_alpha"),
+};
+
+// ---------- 矩阵（列主序，和 WebGL 一致）----------
+function mulMat(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      o[c * 4 + r] =
+        a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+        a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    }
+  }
+  return o;
+}
+
+function identity() {
+  return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+}
+
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2);
+  const nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let l = Math.hypot(zx, zy, zz) || 1; zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  l = Math.hypot(xx, xy, xz) || 1; xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+    1,
+  ]);
+}
+
+function rotX(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]);
+}
+
+function rotY(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+}
+
+function transformPoint(m, p) {
+  return [
+    m[0]*p[0] + m[4]*p[1] + m[8]*p[2]  + m[12],
+    m[1]*p[0] + m[5]*p[1] + m[9]*p[2]  + m[13],
+    m[2]*p[0] + m[6]*p[1] + m[10]*p[2] + m[14],
+  ];
+}
+
+// ---------- 几何：两个三角形 ----------
+// 蓝色 A 固定；橙色 B 在本地绕原点转，再整体抬起、平移
+const TRI_A  = [[-1.10, -0.60, 0.00], [1.10, -0.60, 0.00], [0.00, 1.00, 0.20]];
+const TRI_B0 = [[-0.95,  0.00, -0.60], [0.95,  0.00, -0.60], [0.00, 0.00, 0.90]];
+const LIFT = 0.35;
+
+const triNormal = t => normalize(cross(sub(t[1], t[0]), sub(t[2], t[0])));
+
+// pos(3) + normal(3) 交错，一个三角形 6 个 float 一个顶点
+function packMesh(tri) {
+  const n = triNormal(tri);
+  const out = new Float32Array(18);
+  for (let i = 0; i < 3; i++) {
+    out[i * 6]     = tri[i][0];
+    out[i * 6 + 1] = tri[i][1];
+    out[i * 6 + 2] = tri[i][2];
+    out[i * 6 + 3] = n[0];
+    out[i * 6 + 4] = n[1];
+    out[i * 6 + 5] = n[2];
+  }
+  return out;
+}
+
+// 三条边的线段列表：每对端点 3 个 float
+function packEdges(tri) {
+  const out = new Float32Array(18);
+  for (let i = 0; i < 3; i++) {
+    const a = tri[i], b = tri[(i + 1) % 3];
+    const o = i * 6;
+    out[o] = a[0];   out[o+1] = a[1]; out[o+2] = a[2];
+    out[o+3] = b[0]; out[o+4] = b[1]; out[o+5] = b[2];
+  }
+  return out;
+}
+
+function makeMesh(data, dynamic) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, data, dynamic ? gl.DYNAMIC_DRAW : gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
+  gl.bindVertexArray(null);
+  return { vao, buf, count: data.length / 6 };
+}
+
+function makeLineBuf(data, dynamic) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, data, dynamic ? gl.DYNAMIC_DRAW : gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return { vao, buf, count: data.length / 3 };
+}
+
+const meshA = makeMesh(packMesh(TRI_A), false);
+const meshB = makeMesh(packMesh(TRI_B0), true);
+const edgeA = makeLineBuf(packEdges(TRI_A), false);
+const edgeB = makeLineBuf(packEdges(TRI_B0), true);
+const dotBuf = makeLineBuf(new Float32Array(6), true);   // 交线两个端点的小圆点
+
+// 加粗线段的四个角：(沿, 侧)
+const thickVao = gl.createVertexArray();
+gl.bindVertexArray(thickVao);
+const thickBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, thickBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,-1, 0,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.bindVertexArray(null);
+
+const COLOR_A = [0.30, 0.62, 1.00];
+const COLOR_B = [1.00, 0.56, 0.20];
+const COLOR_HIT = [1.00, 0.90, 0.32];
+
+// ---------- 相机：拖转动，滚轮缩放 ----------
+const cam = { yaw: 0.66, pitch: 0.40, dist: 4.3 };
+let dragging = false, lastX = 0, lastY = 0;
+
+canvas.addEventListener("pointerdown", (e) => {
+  dragging = true;
+  lastX = e.clientX; lastY = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.006;
+  cam.pitch = Math.max(0.06, Math.min(1.35, cam.pitch + (e.clientY - lastY) * 0.006));
+  lastX = e.clientX; lastY = e.clientY;
+});
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  cam.dist = Math.max(2.0, Math.min(9.0, cam.dist * (1 + Math.sign(e.deltaY) * 0.08)));
+}, { passive: false });
+
+let bYaw = 0.60, bPitch = -0.55, bOffset = 0.20;
+yawEl.addEventListener("input", () => { bYaw = Number(yawEl.value); });
+pitchEl.addEventListener("input", () => { bPitch = Number(pitchEl.value); });
+offsetEl.addEventListener("input", () => { bOffset = Number(offsetEl.value); });
+
+gl.disable(gl.DEPTH_TEST);          // 半透明几何，靠混合而不是深度
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+gl.clearColor(0.045, 0.055, 0.08, 1);
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+}
+
+let lastT = 0;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  resize();
+  const dt = lastT ? Math.min(0.05, (now - lastT) / 1000) : 0;
+  lastT = now;
+
+  if (spinEl.checked) {
+    bYaw += dt * 0.7;
+    if (bYaw > Math.PI) bYaw -= Math.PI * 2;
+    yawEl.value = bYaw;
+  }
+  yawVal.textContent = bYaw.toFixed(2);
+  pitchVal.textContent = bPitch.toFixed(2);
+  offsetVal.textContent = bOffset.toFixed(2);
+
+  // 橙色三角形：本地旋转 → 抬起 → 平移
+  const modelB = mulMat(rotY(bYaw), rotX(bPitch));
+  modelB[13] += LIFT;
+  modelB[12] += bOffset;
+  const triB = TRI_B0.map(p => transformPoint(modelB, p));
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, meshB.buf);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, packMesh(triB));
+  gl.bindBuffer(gl.ARRAY_BUFFER, edgeB.buf);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, packEdges(triB));
+
+  const target = [0, 0.42, 0];
+  const eye = [
+    Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    target[1] + Math.sin(cam.pitch) * cam.dist,
+    Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const aspect = canvas.width / canvas.height;
+  const viewProj = mulMat(perspective(Math.PI / 4, aspect, 0.1, 100), lookAt(eye, target, [0, 1, 0]));
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  // ---- 7. 画：两个半透明面 ----
+  gl.useProgram(meshProg);
+  gl.uniformMatrix4fv(uMesh.viewProj, false, viewProj);
+  gl.uniform3f(uMesh.lightDir, 0.42, 0.82, 0.38);
+
+  gl.uniform3fv(uMesh.color, COLOR_A);
+  gl.uniform1f(uMesh.alpha, 0.38);
+  gl.bindVertexArray(meshA.vao);
+  gl.drawArrays(gl.TRIANGLES, 0, meshA.count);
+
+  gl.uniform3fv(uMesh.color, COLOR_B);
+  gl.uniform1f(uMesh.alpha, 0.38);
+  gl.bindVertexArray(meshB.vao);
+  gl.drawArrays(gl.TRIANGLES, 0, meshB.count);
+
+  // ---- 边线：勾出轮廓 ----
+  gl.useProgram(lineProg);
+  gl.uniformMatrix4fv(uLine.viewProj, false, viewProj);
+  gl.uniform1f(uLine.pointSize, 1);
+  gl.uniform1f(uLine.alpha, 0.85);
+  gl.uniform3f(uLine.color, 0.62, 0.82, 1.0);
+  gl.bindVertexArray(edgeA.vao);
+  gl.drawArrays(gl.LINES, 0, edgeA.count);
+  gl.uniform3f(uLine.color, 1.0, 0.78, 0.5);
+  gl.bindVertexArray(edgeB.vao);
+  gl.drawArrays(gl.LINES, 0, edgeB.count);
+
+  // ---- 交线：CPU 算，GPU 画成加粗亮黄线 ----
+  const seg = facesIntersect(TRI_A, triB);
+  if (seg) {
+    gl.useProgram(thickProg);
+    gl.uniformMatrix4fv(uThick.viewProj, false, viewProj);
+    gl.uniform3fv(uThick.p0, seg[0]);
+    gl.uniform3fv(uThick.p1, seg[1]);
+    gl.uniform2f(uThick.resolution, canvas.width, canvas.height);
+    gl.uniform1f(uThick.width, 5 * Math.min(devicePixelRatio || 1, 2));
+    gl.uniform3fv(uThick.color, COLOR_HIT);
+    gl.uniform1f(uThick.alpha, 1.0);
+    gl.bindVertexArray(thickVao);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    // 两个端点各点一个方块，强调交线的范围
+    const pts = new Float32Array([...seg[0], ...seg[1]]);
+    gl.useProgram(lineProg);
+    gl.bindVertexArray(dotBuf.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, dotBuf.buf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, pts);
+    gl.uniform1f(uLine.pointSize, 9 * Math.min(devicePixelRatio || 1, 2));
+    gl.uniform3fv(uLine.color, 1.0, 1.0, 0.86);
+    gl.uniform1f(uLine.alpha, 1.0);
+    gl.drawArrays(gl.POINTS, 0, 2);
+  }
+
+  // ---- HUD ----
+  if (seg) {
+    const l = len(sub(seg[1], seg[0]));
+    statusEl.innerHTML =
+      `<span class="hit">相交</span> · 交线长 <span class="val">${l.toFixed(3)}</span> · ` +
+      `<span class="val">[${seg[0].map(v => v.toFixed(2)).join(", ")}]</span> → ` +
+      `<span class="val">[${seg[1].map(v => v.toFixed(2)).join(", ")}]</span>`;
+  } else {
+    statusEl.innerHTML =
+      `<span class="miss">不相交</span> · 两平面平行错开，或交线落在某个三角形之外`;
+  }
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

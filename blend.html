@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · 混合与透明</title>
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --panel: #12151f;
+      --line: #243044;
+      --text: #e8eef8;
+      --muted: #8b97a8;
+      --accent: #9fd4ff;
+      --gold: #f3d27a;
+      --ok: #7dcea0;
+      --bad: #e07a7a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 940px; }
+    header b { color: var(--accent); }
+    .layout {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 20px;
+      padding: 20px 24px 40px;
+      align-items: start;
+    }
+    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
+    canvas {
+      width: 100%; height: auto; display: block;
+      background: #08090e; border: 1px solid var(--line);
+      border-radius: 8px; cursor: grab;
+    }
+    canvas:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    .pipe { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+    .pipe span {
+      background: #1a2230; border: 1px solid #2c3b52; border-radius: 999px;
+      padding: 4px 10px; font-size: 12px; color: #c9d6e8;
+    }
+    .pipe span.b { color: var(--gold); border-color: #5a4a22; background: #221c10; }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code, .note code, pre code { color: var(--gold); font-size: 12px; }
+    pre {
+      margin: 10px 0 0; background: #0a0c12; border: 1px solid var(--line);
+      border-radius: 6px; padding: 12px 14px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #d5deea; white-space: pre;
+    }
+    .note { color: var(--muted); font-size: 13px; margin-top: 10px; }
+    .note b { color: var(--text); }
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 10px 16px;
+      margin-top: 12px; align-items: center;
+      color: var(--muted); font-size: 13px;
+    }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls select { accent-color: #4aa3ff; }
+    .hint {
+      margin: 10px 0 0; padding: 10px 12px; border-radius: 6px;
+      background: #1a2230; border: 1px solid #2c3b52; color: var(--text);
+      font-size: 13px; min-height: 4.6em;
+    }
+    .hint.bad { background: #2a1212; border-color: #5a2424; color: #ffb4b4; }
+    .hint.warn { background: #241c10; border-color: #5a4a22; color: #f0cd90; }
+    .hint.ok { background: #102018; border-color: #2a4a38; color: var(--ok); }
+    .order { color: var(--muted); font-size: 12px; margin-top: 8px; }
+    .order b { color: var(--text); }
+    #err {
+      display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212;
+      border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>混合与透明：为什么半透明要关深度写入、还要排序</h1>
+    <p>
+      深度测试只能回答「谁挡住谁」，回答不了「两层半透明怎么叠」。这一页把
+      <b>混合方程</b>、<b>绘制顺序</b>、<b>深度写入</b> 三个开关拆开，让你亲手把画面弄坏。
+      <b>alpha 混合不可交换</b>，这是全部麻烦的源头。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <section class="stage">
+        <h2>1. 混合在算什么</h2>
+        <div class="pipe">
+          <span>片元颜色</span>
+          <span class="b">× srcFactor</span>
+          <span>+</span>
+          <span class="b">已有像素 × dstFactor</span>
+          <span>→ 新像素</span>
+        </div>
+        <ol class="steps">
+          <li>不透明靠深度测试决定「谁留下」；<b>半透明要靠混合把两层颜色加起来</b>。</li>
+          <li><code>enable(BLEND)</code> 之后，片元不再覆盖，而是和帧缓冲里已有的颜色按系数混合。</li>
+          <li>最常用的 <code>blendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)</code>，就是再入门的「over」算子。</li>
+          <li>关键在于：<b>新像素同时依赖旧像素</b>。所以 A 叠 B 和 B 叠 A 结果不一样。</li>
+        </ol>
+        <p class="note">
+          <code>gl.depthMask(false)</code> 管的是「要不要写深度」，和 <code>enable(DEPTH_TEST)</code> 的「要不要比深度」是两件事。
+        </p>
+      </section>
+
+      <section class="stage" style="margin-top:16px">
+        <h2>2. 透明的三个坑</h2>
+        <ol class="steps">
+          <li><b>排序</b>：必须从远到近画。但「远」是按物体算的，两个互相穿插的面板根本没有正确顺序。</li>
+          <li><b>深度写入</b>：半透明关掉 <code>depthMask</code>。否则先画的那层把深度占了，后面更远的层直接被扔掉，混不出来。</li>
+          <li><b>加色例外</b>：<code>blendFunc(ONE, ONE)</code> 是 <code>dst += src</code>，加法可交换 —— <b>加色混合不需要排序</b>。</li>
+        </ol>
+        <p class="note">
+          这句要补一个前提：<b>不发生过曝截断时</b>才严格可交换。
+          8 位颜色缓冲在亮部会截到 1.0，一截断顺序就又有影响了 —— 实测只有千分之几的像素有差别，但确实存在。
+        </p>
+        <p class="note">这就是为什么火焰、光晕用加色，而玻璃、水必须排序。</p>
+      </section>
+    </div>
+
+    <div>
+      <canvas id="c" width="720" height="520"></canvas>
+      <div id="err"></div>
+      <div class="controls">
+        <label><input id="blend" type="checkbox" checked /> 混合</label>
+        <label><input id="depthWrite" type="checkbox" /> 深度写入</label>
+        <label><input id="sort" type="checkbox" checked /> 排序（远→近）</label>
+        <label><input id="spin" type="checkbox" checked /> 自动绕行</label>
+        <label>
+          模式
+          <select id="mode">
+            <option value="alpha">alpha（over）</option>
+            <option value="premul">预乘 alpha</option>
+            <option value="add">加色（可交换）</option>
+            <option value="mul">乘色</option>
+          </select>
+        </label>
+      </div>
+      <p class="hint ok" id="hint"></p>
+      <p class="order" id="order"></p>
+    </div>
+  </div>
+
+  <div class="layout" style="padding-top:0">
+    <section class="stage">
+      <h2>3. 本页真正在跑的核心</h2>
+<pre><code>// ① 不透明：写深度，不混合
+gl.disable(gl.BLEND);
+gl.depthMask(true);
+drawOpaque();
+
+// ② 半透明：按远到近排序，关掉深度写入
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+gl.depthMask(false);          // 只比深度，不写深度
+for (const pane of sortedFarToNear) {
+  draw(pane);
+}
+
+// 换混合模式只改这两个系数：
+//   加色  blendFunc(SRC_ALPHA, ONE)        ← 可交换，不用排序
+//   乘色  blendFunc(DST_COLOR, ZERO)
+//   预乘  blendFunc(ONE,       ONE_MINUS_SRC_ALPHA)</code></pre>
+      <p class="note">
+        注意 <b>排序 + 深度写入开着也能对</b>（先画远的，后面的都更近，能通过测试）。
+        但这是「碰巧对」—— 一旦有两个互相穿插的面板，按物体排序就失效了，深度写入会把真正该看见的层剔掉。
+      </p>
+    </section>
+
+    <section class="stage">
+      <h2>4. 对照着拧开关看</h2>
+      <ol class="steps">
+        <li>关掉「混合」：面板变实心，后画的直接盖住先画的 —— 退回画家算法。</li>
+        <li>开着混合和排序，勾上「深度写入」：看起来还行（碰巧对），但换成加色模式再关排序就露馅。</li>
+        <li>勾上「深度写入」并关掉「排序」：<b>最近的面板占了深度，后面的整个消失</b>，重叠区变纯色。</li>
+        <li>关掉「排序」用 alpha 模式，等相机转到另一侧：颜色叠加顺序反了，混出来的色偏了。</li>
+        <li>切到「加色」再关排序：<b>画面不变</b>。因为加法可交换，这是加色的最大便利。</li>
+        <li>切到「乘色」：规律相反，越叠越暗，连背景都被乘掉。</li>
+      </ol>
+    </section>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+const hintEl = document.getElementById("hint");
+const orderEl = document.getElementById("order");
+const blendEl = document.getElementById("blend");
+const depthWriteEl = document.getElementById("depthWrite");
+const sortEl = document.getElementById("sort");
+const spinEl = document.getElementById("spin");
+const modeEl = document.getElementById("mode");
+
+function fail(msg) {
+  errBox.style.display = "block";
+  errBox.textContent = msg;
+  throw new Error(msg);
+}
+
+const gl = canvas.getContext("webgl2", { antialias: true });
+if (!gl) fail("需要 WebGL2。请用较新的 Chrome / Edge / Firefox。");
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    fail(gl.getShaderInfoLog(s) || "shader compile failed");
+  }
+  return s;
+}
+
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    fail(gl.getProgramInfoLog(p) || "program link failed");
+  }
+  return p;
+}
+
+// ---------- math ----------
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      o[c * 4 + r] =
+        a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+        a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    }
+  }
+  return o;
+}
+function identity() {
+  return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+}
+function translate(m, x, y, z) {
+  const t = identity();
+  t[12] = x; t[13] = y; t[14] = z;
+  return mul(m, t);
+}
+function scaleMat(sx, sy, sz) {
+  const m = identity();
+  m[0] = sx; m[5] = sy; m[10] = sz;
+  return m;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2);
+  const nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let len = Math.hypot(zx, zy, zz); zx /= len; zy /= len; zz /= len;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  len = Math.hypot(xx, xy, xz); xx /= len; xy /= len; xz /= len;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+    1,
+  ]);
+}
+
+// ---------- shaders ----------
+const VS = `#version 300 es
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec3 a_normal;
+uniform mat4 u_mvp;
+uniform mat4 u_model;
+out vec3 v_normal;
+out vec3 v_world;
+void main() {
+  vec4 w = u_model * vec4(a_pos, 1.0);
+  v_world = w.xyz;
+  v_normal = mat3(u_model) * a_normal;
+  gl_Position = u_mvp * vec4(a_pos, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision mediump float;
+in vec3 v_normal;
+in vec3 v_world;
+uniform vec4 u_color;
+uniform vec3 u_lightDir;
+uniform vec3 u_cameraPos;
+uniform float u_opaque;
+uniform float u_premul;
+out vec4 outColor;
+void main() {
+  vec3 N = normalize(v_normal);
+  vec3 V = normalize(u_cameraPos - v_world);
+  float ndl = max(dot(N, normalize(u_lightDir)), 0.0);
+
+  vec3 col = u_color.rgb * (0.62 + 0.38 * ndl);
+  // 边缘光，让面板有玻璃感
+  col += pow(1.0 - abs(dot(N, V)), 3.0) * 0.45;
+
+  if (u_opaque > 0.5) {
+    outColor = vec4(col, 1.0);
+    return;
+  }
+  float a = u_color.a;
+  outColor = u_premul > 0.5 ? vec4(col * a, a) : vec4(col, a);
+}`;
+
+const prog = link(VS, FS);
+gl.useProgram(prog);
+const uMvp = gl.getUniformLocation(prog, "u_mvp");
+const uModel = gl.getUniformLocation(prog, "u_model");
+const uColor = gl.getUniformLocation(prog, "u_color");
+const uLightDir = gl.getUniformLocation(prog, "u_lightDir");
+const uCameraPos = gl.getUniformLocation(prog, "u_cameraPos");
+const uOpaque = gl.getUniformLocation(prog, "u_opaque");
+const uPremul = gl.getUniformLocation(prog, "u_premul");
+
+// ---------- geometry ----------
+function makeQuad(w, h) {
+  const hw = w / 2, hh = h / 2;
+  return {
+    positions: new Float32Array([
+      -hw, -hh, 0,  hw, -hh, 0,  hw, hh, 0,  -hw, hh, 0,
+    ]),
+    normals: new Float32Array([0,0,1, 0,0,1, 0,0,1, 0,0,1]),
+    indices: new Uint16Array([0, 1, 2, 0, 2, 3]),
+  };
+}
+
+function makeCube() {
+  const faces = [
+    { n: [ 0, 0, 1], v: [[-1,-1, 1],[ 1,-1, 1],[ 1, 1, 1],[-1, 1, 1]] },
+    { n: [ 0, 0,-1], v: [[ 1,-1,-1],[-1,-1,-1],[-1, 1,-1],[ 1, 1,-1]] },
+    { n: [ 1, 0, 0], v: [[ 1,-1, 1],[ 1,-1,-1],[ 1, 1,-1],[ 1, 1, 1]] },
+    { n: [-1, 0, 0], v: [[-1,-1,-1],[-1,-1, 1],[-1, 1, 1],[-1, 1,-1]] },
+    { n: [ 0, 1, 0], v: [[-1, 1, 1],[ 1, 1, 1],[ 1, 1,-1],[-1, 1,-1]] },
+    { n: [ 0,-1, 0], v: [[-1,-1,-1],[ 1,-1,-1],[ 1,-1, 1],[-1,-1, 1]] },
+  ];
+  const pos = [], nrm = [], idx = [];
+  let base = 0;
+  for (const f of faces) {
+    for (const p of f.v) { pos.push(p[0], p[1], p[2]); nrm.push(f.n[0], f.n[1], f.n[2]); }
+    idx.push(base, base+1, base+2, base, base+2, base+3);
+    base += 4;
+  }
+  return {
+    positions: new Float32Array(pos),
+    normals: new Float32Array(nrm),
+    indices: new Uint16Array(idx),
+  };
+}
+
+function makeGround() {
+  return {
+    positions: new Float32Array([-6,0,-6, 6,0,-6, 6,0,6, -6,0,6]),
+    normals: new Float32Array([0,1,0, 0,1,0, 0,1,0, 0,1,0]),
+    // 顺序反一下，让法线朝 +Y（从上面看是逆时针），否则会被背面剔除吃掉
+    indices: new Uint16Array([0, 2, 1, 0, 3, 2]),
+  };
+}
+
+function makeMesh(geom) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const pb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, pb);
+  gl.bufferData(gl.ARRAY_BUFFER, geom.positions, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  const nb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, nb);
+  gl.bufferData(gl.ARRAY_BUFFER, geom.normals, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+  const ib = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geom.indices, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return { vao, count: geom.indices.length };
+}
+
+const paneDraw = makeMesh(makeQuad(2.7, 2.0));
+const cubeDraw = makeMesh(makeCube());
+const groundDraw = makeMesh(makeGround());
+
+// ---------- scene ----------
+const PANE_ALPHA = 0.55;
+const Y = 0.12;
+const panes = [
+  { name: "红", z: -1.25, color: [0.95, 0.34, 0.30] },
+  { name: "绿", z:  0.00, color: [0.34, 0.88, 0.46] },
+  { name: "蓝", z:  1.25, color: [0.36, 0.60, 0.98] },
+];
+const cubeModel = mul(translate(identity(), 0.0, -0.12, -0.62), scaleMat(0.34, 0.34, 0.34));
+const groundModel = translate(identity(), 0, -1.02, 0);
+
+let yaw = 2.45;   // 起始角度故意选在「写死的顺序恰好是错的」那一侧
+let pitch = 0.30;
+let dragging = false;
+let lastX = 0, lastY = 0;
+let spin = 0;
+
+canvas.addEventListener("pointerdown", (e) => {
+  dragging = true; lastX = e.clientX; lastY = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  yaw -= (e.clientX - lastX) * 0.005;
+  pitch = Math.max(-0.05, Math.min(1.05, pitch + (e.clientY - lastY) * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+function applyBlendMode(mode) {
+  if (mode === "add") gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+  else if (mode === "mul") gl.blendFunc(gl.DST_COLOR, gl.ZERO);
+  else if (mode === "premul") gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  else gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+}
+
+const BLEND_EQ = {
+  alpha: "dst = src·srcA + dst·(1 − srcA)",
+  premul: "dst = src + dst·(1 − srcA)　（src 已预乘）",
+  add: "dst = src·srcA + dst　← 加法可交换",
+  mul: "dst = src·dst　← 越叠越暗",
+};
+
+function updateReadout(drawOrder, orderOk) {
+  const mode = modeEl.value;
+  const blendOn = blendEl.checked;
+  const dw = depthWriteEl.checked;
+  const sorted = sortEl.checked;
+  const commutative = mode === "add" || mode === "mul";
+
+  orderEl.innerHTML =
+    `<b>混合方程</b>　${BLEND_EQ[mode]}<br>` +
+    `<b>本帧绘制顺序</b>　${drawOrder.map((p) => p.name).join(" → ")}` +
+    (sorted
+      ? "　（每帧按相机距离重排）"
+      : `　（写死的顺序，未重排）　现在恰好是<b>${orderOk ? "对的" : "错的"}</b>`);
+
+  hintEl.className = "hint";
+  if (!blendOn) {
+    hintEl.className = "hint bad";
+    hintEl.textContent = "混合关掉：片元直接覆盖，alpha 被忽略。三块玻璃变成三块实心板，谁后画谁赢 —— 这就是没有混合时的画家算法。";
+    return;
+  }
+  if (commutative) {
+    hintEl.className = "hint ok";
+    hintEl.textContent =
+      `${mode === "add" ? "加色" : "乘色"}是逐通道的加法 / 乘法，可交换 —— 所以排序开不开、相机转到哪一侧，结果都一样。` +
+      "这就是光晕、火焰用加色的原因：不用排序。";
+    return;
+  }
+  if (dw && !orderOk) {
+    hintEl.className = "hint bad";
+    hintEl.textContent =
+      "深度写入开着 + 顺序是错的：先画的那层把深度占了，后面更远的层直接被深度测试扔掉。" +
+      "重叠区只剩一层颜色，混不出来。让相机继续转，顺序对上的那半个周期画面又会「恢复」。";
+    return;
+  }
+  if (dw && orderOk) {
+    hintEl.className = "hint warn";
+    hintEl.textContent =
+      "排序 + 深度写入都开着：现在是「碰巧对」—— 先画远的，后面每层都更近所以都能通过测试。" +
+      "但只是这个相机角度碰巧对，转过去就崩。";
+    return;
+  }
+  if (!orderOk) {
+    hintEl.className = "hint warn";
+    hintEl.textContent =
+      "关了排序，而且当前这个相机角度下写死的顺序正好是「近 → 远」：混合不可交换，" +
+      "A 叠 B ≠ B 叠 A，颜色叠加的次序反了，混出来的色会偏。转半圈就能看到它自己变回正常。";
+    return;
+  }
+  hintEl.className = "hint ok";
+  hintEl.textContent =
+    "正确做法：不透明先画并写深度；半透明关掉深度写入、按远到近排序。" +
+    (sorted ? "" : "（此刻写死的顺序碰巧也是远→近）");
+}
+
+function frame(t) {
+  requestAnimationFrame(frame);
+
+  if (spinEl.checked && !dragging) {
+    spin += 0.0045;
+    yaw = 2.45 + spin;
+  } else if (!spinEl.checked) {
+    spin = yaw - 2.45;
+  }
+
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+
+  const dist = 5.0;
+  const eye = [
+    Math.sin(yaw) * Math.cos(pitch) * dist,
+    0.45 + Math.sin(pitch) * dist,
+    Math.cos(yaw) * Math.cos(pitch) * dist,
+  ];
+  const proj = perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 60);
+  const view = lookAt(eye, [0, Y, 0], [0, 1, 0]);
+  const viewProj = mul(proj, view);
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.035, 0.04, 0.06, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+  gl.uniform3fv(uCameraPos, eye);
+  gl.uniform3f(uLightDir, 0.4, 0.82, 0.42);
+
+  // ① 不透明几何：开背面剔除，写深度，不混合
+  gl.disable(gl.BLEND);
+  gl.enable(gl.CULL_FACE);
+  gl.depthMask(true);
+
+  gl.uniformMatrix4fv(uModel, false, groundModel);
+  gl.uniformMatrix4fv(uMvp, false, mul(viewProj, groundModel));
+  gl.uniform4f(uColor, 0.13, 0.15, 0.19, 1);
+  gl.uniform1f(uOpaque, 1);
+  gl.uniform1f(uPremul, 0);
+  gl.bindVertexArray(groundDraw.vao);
+  gl.drawElements(gl.TRIANGLES, groundDraw.count, gl.UNSIGNED_SHORT, 0);
+
+  gl.uniformMatrix4fv(uModel, false, cubeModel);
+  gl.uniformMatrix4fv(uMvp, false, mul(viewProj, cubeModel));
+  gl.uniform4f(uColor, 0.86, 0.72, 0.34, 1);
+  gl.uniform1f(uOpaque, 1);
+  gl.bindVertexArray(cubeDraw.vao);
+  gl.drawElements(gl.TRIANGLES, cubeDraw.count, gl.UNSIGNED_SHORT, 0);
+
+  // ② 半透明面板
+  const withDist = panes.map((p) => ({
+    ...p,
+    d: (eye[0] ** 2 + (eye[1] - Y) ** 2 + (eye[2] - p.z) ** 2),
+  }));
+  const ideal = withDist.slice().sort((a, b) => b.d - a.d);   // 远 → 近
+  const drawOrder = sortEl.checked ? ideal : withDist;
+  const orderOk = drawOrder.every((p, i) => p === ideal[i]);
+
+  updateReadout(drawOrder, orderOk);
+
+  if (blendEl.checked) {
+    gl.enable(gl.BLEND);
+    applyBlendMode(modeEl.value);
+  } else {
+    gl.disable(gl.BLEND);
+  }
+  gl.depthMask(depthWriteEl.checked ? true : false);
+  // 面板两面都要看得见，所以这里关掉剔除（上一节的不透明几何仍然剔）
+  gl.disable(gl.CULL_FACE);
+
+  gl.uniform1f(uOpaque, 0);
+  gl.uniform1f(uPremul, modeEl.value === "premul" ? 1 : 0);
+  for (const p of drawOrder) {
+    const model = translate(identity(), 0, Y, p.z);
+    gl.uniformMatrix4fv(uModel, false, model);
+    gl.uniformMatrix4fv(uMvp, false, mul(viewProj, model));
+    gl.uniform4f(uColor, p.color[0], p.color[1], p.color[2], PANE_ALPHA);
+    gl.bindVertexArray(paneDraw.vao);
+    gl.drawElements(gl.TRIANGLES, paneDraw.count, gl.UNSIGNED_SHORT, 0);
+  }
+
+  gl.depthMask(true);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

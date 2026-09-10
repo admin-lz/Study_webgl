@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGL2 · 纹理数组 vs 图集</title>
+  <style>
+    :root {
+      --bg: #0b0d14; --panel: #12151f; --line: #243044;
+      --text: #e8eef8; --muted: #8b97a8; --accent: #9fd4ff; --gold: #f3d27a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 980px; }
+    header b { color: var(--accent); }
+    .layout { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 20px; padding: 20px 24px 40px; align-items: start; }
+    @media (max-width: 1020px) { .layout { grid-template-columns: 1fr; } }
+    canvas#c { width: 100%; height: auto; display: block; background: #08090e; border: 1px solid var(--line); border-radius: 8px; }
+    canvas#atlasView { width: 100%; height: auto; display: block; background: #0a0c12; border: 1px solid var(--line); border-radius: 8px; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+    .stage + .stage { margin-top: 16px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre { margin: 8px 0 0; background: #0a0c12; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #d5deea; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; align-items: center; color: var(--muted); font-size: 13px; }
+    .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .controls b { color: var(--text); font-variant-numeric: tabular-nums; min-width: 3em; display: inline-block; }
+    table.stats { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 10px; }
+    table.stats td { padding: 4px 6px; border-bottom: 1px solid #1b2434; }
+    table.stats td:first-child { color: var(--muted); }
+    table.stats td:last-child { text-align: right; font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .note b { color: var(--text); }
+    .warn { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: #1a2230; border: 1px solid #2c3b52; font-size: 13px; }
+    .warn.bad { background: #2a1212; border-color: #5a2424; color: #ffb4b4; }
+    #err { display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212; border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>纹理数组：一次 draw 上百种贴图，还不会串色</h1>
+    <p>
+      要给场景里每个物体一张不同的贴图，最直接的办法是"每画一个换一次 <code>bindTexture</code>"。
+      想省掉切换就要合并成大图（图集），但图集在 <b>mipmap</b> 上会出事：相邻格子的颜色会互相渗进来。
+      纹理数组是第三选择 —— <b>一个纹理对象里有 N 层</b>，每层有自己独立的 mip 链。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <canvas id="c" width="900" height="520"></canvas>
+      <section class="stage" style="margin-top:16px">
+        <h2>合并后的样子（左边：纹理数组的一层；右边：图集的一张）</h2>
+        <canvas id="atlasView" width="880" height="180"></canvas>
+        <div class="controls">
+          <label>方案
+            <select id="mode">
+              <option value="0" selected>纹理数组 sampler2DArray</option>
+              <option value="1">图集（一张大图切格子）</option>
+              <option value="2">逐层 bindTexture（不合并）</option>
+            </select>
+          </label>
+          <label>强制 mip <input type="range" id="mip" min="0" max="6" step="1" value="1" style="width:130px" /> <b id="mipVal">1</b></label>
+          <label>图集 padding <input type="range" id="pad" min="0" max="8" step="1" value="0" style="width:130px" /> <b id="padVal">0</b></label>
+          <label>格子 <input type="range" id="grid" min="2" max="10" step="1" value="6" style="width:130px" /> <b id="gridVal">6</b></label>
+          <label>层数 <input type="range" id="layers" min="1" max="6" step="1" value="6" style="width:130px" /> <b id="layersVal">6</b></label>
+          <label>缩放 <input type="range" id="zoom" min="0.5" max="4" step="0.05" value="1.15" style="width:130px" /> <b id="zoomVal">1.15</b></label>
+          <label>过滤
+            <select id="filter">
+              <option value="0" selected>LINEAR_MIPMAP_LINEAR</option>
+              <option value="1">NEAREST_MIPMAP_NEAREST</option>
+              <option value="2">LINEAR（不用 mip）</option>
+            </select>
+          </label>
+          <label><input type="checkbox" id="showPad" /> 高亮 padding 区域</label>
+        </div>
+        <table class="stats">
+          <tr><td>纹理对象数（上传后）</td><td id="sObjs">-</td></tr>
+          <tr><td>每帧 bindTexture 次数</td><td id="sBinds">-</td></tr>
+          <tr><td>每帧 draw call</td><td id="sDraws">-</td></tr>
+          <tr><td>显存占用（64×64 × 层数，含 mip）</td><td id="sMem">-</td></tr>
+          <tr><td>mip 独立性</td><td id="sMip">-</td></tr>
+        </table>
+        <div class="warn" id="warn">-</div>
+        <div id="err"></div>
+      </section>
+    </div>
+
+    <div>
+      <section class="stage">
+        <h2>1. 三种做法的取舍</h2>
+        <ol class="steps">
+          <li><b>逐层 bindTexture</b>：每画一个物体换一次绑定。CPU 侧开销大（驱动要校验/翻译状态），
+            但最直观，且每张图可以有自己的尺寸和格式。</li>
+          <li><b>图集（atlas）</b>：合并成一张大图，一次绑定画完所有。省状态切换，
+            但要求所有图格式一致、尺寸可以不规则（要自己打包），而且 <b>mip 会跨格子采样</b> —— 需要给每格留 padding 并把边缘像素铺出去。</li>
+          <li><b>纹理数组</b>：一个纹理对象装 N 层，采样是 <code>texture(sampler2DArray, vec3(u, v, layer))</code>。
+            每层独立 mip、独立 wrap，<b>物理上不可能串色</b>；代价是所有层必须同尺寸同格式，且层数有上限。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>2. 代码：只差一行</h2>
+        <pre>// 上传：一次 texStorage3D 定规格，再逐层 texSubImage3D
+gl.texStorage3D(gl.TEXTURE_2D_ARRAY, levels, gl.RGBA8, 64, 64, layers);
+for (let i = 0; i < layers; i++)
+  gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i, 64, 64, 1,
+                   gl.RGBA, gl.UNSIGNED_BYTE, pixelsForLayer(i));
+gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+
+// 采样
+uniform sampler2DArray u_tex;
+vec4 c = texture(u_tex, vec3(uv, float(layer)));   // ← 比 sampler2D 多一个 layer</pre>
+        <p class="note">
+          注意 <code>texImage3D</code> 的最后一维是 <b>层数 1</b>（一次传一层），深度维度才是层的下标。
+          这个参数顺序（width, height, depth, x, y, z）是初学时最容易写反的地方。
+        </p>
+      </section>
+
+      <section class="stage">
+        <h2>3. 什么时候该用它</h2>
+        <ol class="steps">
+          <li><b>材质变体很多、尺寸一致</b>：地表贴图、角色皮肤、UI 图标集 —— 一次 draw 里按 layer 取。</li>
+          <li><b>体渲染 / 切片数据</b>：本来就是 3D 数据，TEXTURE_3D 更合适；但如果是"一叠 2D 图"且要各自 wrap，数组更好。</li>
+          <li><b>阴影 / 反射的多张 RT</b>：级联阴影的每一级、立方体阴影贴图（WebGL2 里常直接用 TEXTURE_CUBE_MAP_ARRAY）。</li>
+          <li><b>不适用</b>：尺寸不一、需要各自 mip 偏置以外的独立 wrap、或者层数超过 <code>MAX_ARRAY_TEXTURE_LAYERS</code>。</li>
+        </ol>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const atlasView = document.getElementById("atlasView");
+const av = atlasView.getContext("2d");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => { errBox.style.display = "block"; errBox.textContent += (e.message || e.error) + "\n"; });
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  return o;
+}
+function ortho(l, r, b, t, n, f) {
+  return new Float32Array([2 / (r - l), 0, 0, 0, 0, 2 / (t - b), 0, 0, 0, 0, -2 / (f - n), 0,
+    -(r + l) / (r - l), -(t + b) / (t - b), -(f + n) / (f - n), 1]);
+}
+
+const TILE = 64, MAX_LAYERS = 6;
+const VS = `#version 300 es
+in vec2 a_pos;      // 每一格的四个角
+in vec2 a_uv;
+in float a_layer;
+uniform mat4 u_vp;
+uniform float u_scale;
+out vec2 v_uv;
+out float v_layer;
+void main() {
+  v_uv = a_uv;
+  v_layer = a_layer;
+  gl_Position = u_vp * vec4(a_pos * u_scale, 0.0, 1.0);
+}`;
+const FS = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+in vec2 v_uv;
+in float v_layer;
+uniform sampler2DArray u_array;
+uniform sampler2D u_atlas;
+uniform sampler2D u_single;
+uniform int u_mode;        // 0 数组 / 1 图集 / 2 逐层绑定
+uniform int u_grid;
+uniform float u_padTexels;
+uniform float u_mip;
+uniform int u_showPad;
+out vec4 outColor;
+
+const float TILE = 64.0;
+
+// 图集：层号 → 格子 → 再按 padding 内缩采样窗口
+vec2 atlasUV(vec2 uv, float layer, out float padFlag) {
+  float n = float(u_grid);
+  float cellTexels = TILE + 2.0 * u_padTexels;
+  float inner = TILE / cellTexels;            // 内容占整格的比例
+  float off = u_padTexels / cellTexels;       // padding 占整格的比例
+  float idx = mod(layer, n * n);
+  vec2 cellIdx = vec2(mod(idx, n), floor(idx / n));
+  // 打开「高亮 padding」时不内缩，直接把整格（含 padding 区）显示出来
+  float f = (u_showPad == 1) ? 1.0 : inner;
+  float o = (u_showPad == 1) ? 0.0 : off;
+  padFlag = (u_showPad == 1 && (uv.x < off || uv.y < off || uv.x > 1.0 - off || uv.y > 1.0 - off)) ? 1.0 : 0.0;
+  return (cellIdx + o + uv * f) / n;
+}
+
+void main() {
+  vec4 c;
+  float padFlag = 0.0;
+  if (u_mode == 0) {
+    c = textureLod(u_array, vec3(v_uv, v_layer), u_mip);
+  } else if (u_mode == 1) {
+    c = textureLod(u_atlas, atlasUV(v_uv, v_layer, padFlag), u_mip);
+  } else {
+    c = texture(u_single, v_uv);
+  }
+  if (padFlag > 0.5) c.rgb = mix(c.rgb, vec3(1.0, 0.35, 0.35), 0.45);
+  outColor = vec4(c.rgb, 1.0);
+}`;
+
+const prog = link(VS, FS);
+
+// ---------- 逐层的图案（纯 2D canvas 生成） ----------
+function layerImage(i, layers) {
+  const cv = document.createElement("canvas");
+  cv.width = cv.height = TILE;
+  const g = cv.getContext("2d");
+  const h = i / layers;
+  g.fillStyle = `hsl(${h * 360}, 72%, 42%)`;
+  g.fillRect(0, 0, TILE, TILE);
+  // 外圈边框：留一条和底色反差极大的边，最容易看出串色
+  g.strokeStyle = `hsl(${(h * 360 + 180) % 360}, 95%, 72%)`;
+  g.lineWidth = 6;
+  g.strokeRect(3, 3, TILE - 6, TILE - 6);
+  // 中间一个亮圆 + 斜条纹
+  g.fillStyle = `hsl(${(h * 360 + 40) % 360}, 92%, 78%)`;
+  g.beginPath(); g.arc(TILE / 2, TILE / 2, TILE * 0.22, 0, 6.2832); g.fill();
+  g.strokeStyle = "rgba(255,255,255,0.9)";
+  g.lineWidth = 2;
+  for (let k = -TILE; k < TILE; k += 10) {
+    g.beginPath(); g.moveTo(k, 0); g.lineTo(k + TILE, TILE); g.stroke();
+  }
+  return cv;
+}
+
+const pixelsOf = (cv) => cv.getContext("2d").getImageData(0, 0, cv.width, cv.height).data;
+
+// ---------- 纹理数组 ----------
+function buildArray(layers) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, t);
+  const levels = Math.floor(Math.log2(TILE)) + 1;
+  gl.texStorage3D(gl.TEXTURE_2D_ARRAY, levels, gl.RGBA8, TILE, TILE, layers);
+  for (let i = 0; i < layers; i++) {
+    const cv = layerImage(i, layers);
+    const data = new Uint8Array(pixelsOf(cv));
+    gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i, TILE, TILE, 1, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  }
+  gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+
+// ---------- 图集 ----------
+function buildAtlas(grid, layers, pad) {
+  const cell = TILE + pad * 2;
+  const N = grid * grid;
+  const size = cell * grid;
+  const cv = document.createElement("canvas");
+  cv.width = cv.height = size;
+  const g = cv.getContext("2d");
+  g.fillStyle = "#000"; g.fillRect(0, 0, size, size);
+  for (let i = 0; i < N; i++) {
+    const cx = (i % grid) * cell, cy = ((i / grid) | 0) * cell;
+    const src = layerImage(i % layers, layers);
+    const dx = cx + pad, dy = cy + pad;
+    g.drawImage(src, dx, dy);
+    if (pad > 0) {
+      // 把边缘像素铺出去：这样高 mip 采样到格子外时，拿到的是"自己的边缘"而不是邻居
+      g.drawImage(src, 0, 0, TILE, 1, dx, dy - pad, TILE, pad);
+      g.drawImage(src, 0, TILE - 1, TILE, 1, dx, dy + TILE, TILE, pad);
+      g.drawImage(src, 0, 0, 1, TILE, dx - pad, dy, pad, TILE);
+      g.drawImage(src, TILE - 1, 0, 1, TILE, dx + TILE, dy, pad, TILE);
+      g.drawImage(src, 0, 0, 1, 1, dx - pad, dy - pad, pad, pad);
+      g.drawImage(src, TILE - 1, 0, 1, 1, dx + TILE, dy - pad, pad, pad);
+      g.drawImage(src, 0, TILE - 1, 1, 1, dx - pad, dy + TILE, pad, pad);
+      g.drawImage(src, TILE - 1, TILE - 1, 1, 1, dx + TILE, dy + TILE, pad, pad);
+    }
+  }
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  const levels = Math.floor(Math.log2(size)) + 1;
+  gl.texStorage2D(gl.TEXTURE_2D, levels, gl.RGBA8, size, size);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, size, size, gl.RGBA, gl.UNSIGNED_BYTE, pixelsOf(cv));
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return { tex: t, size, cell };
+}
+const singleTexs = [];
+function buildSingles(layers) {
+  for (let i = 0; i < layers; i++) {
+    const cv = layerImage(i, layers);
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texStorage2D(gl.TEXTURE_2D, Math.floor(Math.log2(TILE)) + 1, gl.RGBA8, TILE, TILE);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, TILE, TILE, gl.RGBA, gl.UNSIGNED_BYTE, pixelsOf(cv));
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    singleTexs.push(t);
+  }
+}
+const dummy = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, dummy);
+gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, 1, 1);
+gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+
+// ---------- 网格：每格一个 quad，带自己的 layer 属性 ----------
+let mesh = null;
+function buildGrid(grid, layers) {
+  const pos = [], uv = [], lay = [], idx = [];
+  const N = grid * grid;
+  for (let i = 0; i < N; i++) {
+    const gx = i % grid, gy = (i / grid) | 0;
+    const x = (gx + 0.06) / grid * 2 - 1, y = 1 - (gy + 0.06) / grid * 2;
+    const s = (0.88 / grid) * 2;
+    const b = pos.length / 2;
+    pos.push(x, y, x + s, y, x + s, y - s, x, y - s);
+    uv.push(0, 1, 1, 1, 1, 0, 0, 0);
+    const layer = i % layers;
+    for (let k = 0; k < 4; k++) lay.push(layer);
+    idx.push(b, b + 1, b + 2, b, b + 2, b + 3);
+  }
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const put = (name, data, size) => {
+    const loc = gl.getAttribLocation(prog, name);
+    if (loc < 0) return;
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+  };
+  put("a_pos", new Float32Array(pos), 2);
+  put("a_uv", new Float32Array(uv), 2);
+  put("a_layer", new Float32Array(lay), 1);
+  const ib = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx), gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return { vao, count: idx.length, tiles: N };
+}
+
+// ---------- 状态 ----------
+const el = (id) => document.getElementById(id);
+const modeEl = el("mode"), mipEl = el("mip"), padEl = el("pad"), gridEl = el("grid");
+const layersEl = el("layers"), zoomEl = el("zoom"), filterEl = el("filter"), showPadEl = el("showPad");
+let uScaleTmp = 1;
+const U = {};
+for (const n of ["u_vp", "u_array", "u_atlas", "u_single", "u_mode", "u_grid", "u_padTexels",
+  "u_mip", "u_showPad", "u_scale"]) U[n] = gl.getUniformLocation(prog, n);
+
+let texArray = null, atlas = null, curGrid = -1, curLayers = -1, curPad = -1, builtSingles = -1, meshLayers = -1;
+function ensureTextures(grid, layers, pad) {
+  if (curLayers !== layers) {
+    if (texArray) gl.deleteTexture(texArray);
+    texArray = buildArray(layers);
+    curLayers = layers;
+    builtSingles = -1;
+  }
+  if (curGrid !== grid || meshLayers !== layers) {
+    if (atlas) gl.deleteTexture(atlas.tex);
+    atlas = buildAtlas(grid, layers, pad);
+    mesh = buildGrid(grid, layers);
+    curGrid = grid; curPad = pad; meshLayers = layers;
+  } else if (curPad !== pad) {
+    if (atlas) gl.deleteTexture(atlas.tex);
+    atlas = buildAtlas(grid, layers, pad);
+    curPad = pad;
+  }
+  if (builtSingles !== layers) {
+    for (const t of singleTexs) gl.deleteTexture(t);
+    singleTexs.length = 0;
+    buildSingles(layers);
+    builtSingles = layers;
+  }
+}
+function applyFilter() {
+  const f = Number(filterEl.value);
+  const setF = (target) => {
+    const minF = f === 0 ? gl.LINEAR_MIPMAP_LINEAR : f === 1 ? gl.NEAREST_MIPMAP_NEAREST : gl.LINEAR;
+    const magF = f === 1 ? gl.NEAREST : gl.LINEAR;
+    gl.texParameteri(target, gl.TEXTURE_MIN_FILTER, minF);
+    gl.texParameteri(target, gl.TEXTURE_MAG_FILTER, magF);
+  };
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, texArray); setF(gl.TEXTURE_2D_ARRAY);
+  gl.bindTexture(gl.TEXTURE_2D, atlas.tex); setF(gl.TEXTURE_2D);
+  for (const t of singleTexs) { gl.bindTexture(gl.TEXTURE_2D, t); setF(gl.TEXTURE_2D); }
+  gl.bindTexture(gl.TEXTURE_2D, dummy); setF(gl.TEXTURE_2D);
+}
+
+// 右侧：把「数组的一层」和「图集的一格」画出来对比
+function drawAtlasPreview(grid, layers, pad) {
+  const W = atlasView.width, H = atlasView.height;
+  av.fillStyle = "#0a0c12"; av.fillRect(0, 0, W, H);
+  const src = layerImage(0, layers);
+  const box = Math.min(H - 44, 132);
+  av.drawImage(src, 40, 30, box, box);
+  av.strokeStyle = "#3b4a60"; av.strokeRect(40.5, 30.5, box, box);
+  av.fillStyle = "#8b97a8"; av.font = "12px monospace";
+  av.fillText("数组第 0 层：独立 mip，邻居与它无关", 40, 20);
+  av.fillStyle = "#9fd4ff";
+  av.fillText("64×64", 40, 30 + box + 18);
+
+  const x0 = 470, y0 = 30;
+  av.fillStyle = "#8b97a8";
+  av.fillText("图集 2×2 格：格子之间的 padding = " + pad + " px", 470, 20);
+  for (let i = 0; i < 4; i++) {
+    const cx = x0 + (i % 2) * box, cy = y0 + ((i / 2) | 0) * box;
+    av.drawImage(layerImage(i % layers, layers), cx, cy, box, box);
+    av.strokeStyle = pad > 0 ? "#6ee7a8" : "#ff9c9c";
+    av.strokeRect(cx + 0.5, cy + 0.5, box, box);
+  }
+  av.fillStyle = pad > 0 ? "#6ee7a8" : "#ff9c9c";
+  av.font = "12px monospace";
+  av.fillText(pad > 0 ? "padding = " + pad + "px：mip 越界时采到自己铺出去的边缘" : "padding = 0：mip 越界时直接采到邻居的颜色 → 边界杂色", 470, y0 + 2 * box + 18);
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const W = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const H = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+
+  const mode = Number(modeEl.value);
+  const mip = Number(mipEl.value);
+  const pad = Number(padEl.value);
+  const grid = Number(gridEl.value);
+  const layers = Number(layersEl.value);
+  const zoom = Number(zoomEl.value);
+  el("mipVal").textContent = mip;
+  el("padVal").textContent = pad;
+  el("gridVal").textContent = grid;
+  el("layersVal").textContent = layers;
+  el("zoomVal").textContent = zoom.toFixed(2);
+
+  ensureTextures(grid, layers, pad);
+  applyFilter();
+  drawAtlasPreview(grid, layers, pad);
+
+  gl.viewport(0, 0, W, H);
+  gl.clearColor(0.02, 0.024, 0.034, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.disable(gl.DEPTH_TEST);
+  gl.useProgram(prog);
+  gl.bindVertexArray(mesh.vao);
+
+  const aspect = W / H;
+  const half = 1 / zoom;
+  const vp = ortho(-half * aspect, half * aspect, -half, half, -1, 1);
+  gl.uniformMatrix4fv(U.u_vp, false, vp);
+  gl.uniform1i(U.u_mode, mode);
+  gl.uniform1i(U.u_grid, grid);
+  gl.uniform1f(U.u_padTexels, pad);
+  gl.uniform1f(U.u_mip, mip);
+  gl.uniform1i(U.u_showPad, showPadEl.checked ? 1 : 0);
+  gl.uniform1f(U.u_scale, 1.0);
+
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, texArray); gl.uniform1i(U.u_array, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, atlas.tex); gl.uniform1i(U.u_atlas, 1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, dummy); gl.uniform1i(U.u_single, 2);
+
+  let binds = 3, draws = 1;
+  if (mode === 2) {
+    // 逐层绑定：每格一次 bind + 一次 draw
+    gl.uniform1i(U.u_mode, 2);
+    for (let i = 0; i < mesh.tiles; i++) {
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, singleTexs[i % layers]);
+      gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, i * 6 * 2);
+    }
+    binds += mesh.tiles; draws = mesh.tiles;
+  } else {
+    gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0);
+  }
+
+  // ---- readouts ----
+  const mipFactor = 4 / 3;
+  const arrayMem = TILE * TILE * layers * 4 * mipFactor;
+  const cell = TILE + pad * 2;
+  const atlasMem = cell * cell * grid * grid * 4 * mipFactor;
+  el("sObjs").textContent = mode === 2 ? (layers + " 张 2D 纹理") : "1 张（" + (mode === 0 ? "TEXTURE_2D_ARRAY" : "图集 2D") + "）";
+  el("sBinds").textContent = String(binds);
+  el("sDraws").textContent = String(draws);
+  el("sMem").textContent = "数组 " + (arrayMem / 1024).toFixed(0) + " KB ｜ 图集 " + (atlasMem / 1024).toFixed(0) + " KB";
+  el("sMip").textContent = mode === 0 ? "每层独立 mip ✓" : mode === 1 ? (pad > 0 ? "靠 padding 隔开" : "会跨格串色 ✗") : "每张各自独立 ✓";
+  const wn = el("warn");
+  const bad = mode === 1 && pad === 0 && mip > 0;
+  wn.className = "warn" + (bad ? " bad" : "");
+  wn.textContent = mode === 0
+    ? "纹理数组：一次 bind、一次 draw 画完 " + mesh.tiles + " 格，每格按 layer 取。mip 在层与层之间互不可见，所以永远不会串色。"
+    : mode === 1
+      ? (bad
+        ? "图集 padding = 0：格子紧挨着。mip 级别越高采样核越大，就越会采到邻居的颜色 —— 看格子边框，已经从「自身颜色」变成邻格的颜色了。把 padding 拉到 4 以上再对比。"
+        : "图集 + padding：" + pad + " 像素的边缘复制让高 mip 采样只落到自己的颜色上。代价是格子变大，显存从 " + (arrayMem / 1024).toFixed(0) + " KB 涨到 " + (atlasMem / 1024).toFixed(0) + " KB。")
+      : "逐层绑定：" + mesh.tiles + " 格需要 " + mesh.tiles + " 次 bindTexture + " + mesh.tiles + " 次 draw call。没有串色问题，但 CPU 侧开销最大 —— 看上面的次数统计。";
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

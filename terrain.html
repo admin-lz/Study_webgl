@@ -1,0 +1,998 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>噪声地形：fBm / 域扭曲 / 解析法线 / 分块 LOD</title>
+  <style>
+    :root {
+      --bg: #0b0d14; --panel: #12151f; --line: #243044;
+      --text: #e8eef8; --muted: #8b97a8; --accent: #9fd4ff; --gold: #f3d27a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
+    header { padding: 20px 24px 8px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 6px; font-size: 20px; }
+    header p { margin: 0; color: var(--muted); max-width: 1080px; }
+    header b { color: var(--accent); }
+    .layout { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 20px; padding: 20px 24px 40px; align-items: start; }
+    @media (max-width: 1060px) { .layout { grid-template-columns: 1fr; } }
+    canvas#c { width: 100%; height: auto; display: block; background: #05060a; border: 1px solid var(--line); border-radius: 8px; cursor: grab; }
+    canvas#c:active { cursor: grabbing; }
+    .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+    .stage + .stage { margin-top: 16px; }
+    .stage h2 { margin: 0 0 10px; font-size: 15px; color: var(--accent); }
+    ol.steps { margin: 0; padding-left: 18px; color: var(--muted); }
+    ol.steps li { margin: 0 0 8px; }
+    ol.steps b { color: var(--text); }
+    code { color: var(--gold); font-size: 12px; }
+    pre { margin: 8px 0 0; background: #0a0c12; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #d5deea; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; align-items: center; color: var(--muted); font-size: 13px; }
+    .row label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .row b { color: var(--text); font-variant-numeric: tabular-nums; min-width: 3.4em; display: inline-block; }
+    .prev { display: flex; gap: 12px; align-items: flex-start; margin-top: 12px; }
+    canvas#prev { width: 168px; height: 168px; image-rendering: pixelated; border: 1px solid var(--line); border-radius: 6px; background: #05060a; }
+    table.stats { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 10px; }
+    table.stats td { padding: 4px 6px; border-bottom: 1px solid #1b2434; }
+    table.stats td:first-child { color: var(--muted); }
+    table.stats td:last-child { text-align: right; font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .note b { color: var(--text); }
+    .warn { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: #1a2230; border: 1px solid #2c3b52; font-size: 13px; }
+    #err { display: none; margin-top: 10px; color: #ffb4b4; background: #2a1212; border: 1px solid #5a2424; border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>噪声地形：山不是画出来的，是"叠"出来的</h1>
+    <p>
+      这张地形没有任何模型文件：网格是一张平铺的 129×129 方格，起伏全部来自<b>噪声函数</b>。
+      页面把三个真正会被问到的点摊开：<b>fBm 怎么叠出山</b>、<b>法线从高度函数来（不是从三角形来）</b>、
+      <b>分块 LOD 为什么会裂、怎么缝</b>。右侧下面那张小图是同一套噪声在 CPU 上算出来的高度场缩略图，
+      和左边画面用的是<b>同一个函数</b>。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <canvas id="c" width="760" height="440"></canvas>
+      <section class="stage" style="margin-top:16px">
+        <div class="row">
+          <label>显示
+            <select id="view">
+              <option value="0" selected>正常着色</option>
+              <option value="1">LOD 分级配色</option>
+              <option value="2">高度灰度</option>
+              <option value="3">法线</option>
+            </select>
+          </label>
+          <label>生成
+            <select id="mode">
+              <option value="0" selected>GPU：顶点着色器算</option>
+              <option value="1">CPU：预计算成属性</option>
+            </select>
+          </label>
+          <label>LOD
+            <select id="lod">
+              <option value="0" selected>单块（全分辨率）</option>
+              <option value="1">分块 LOD（8×8）</option>
+            </select>
+          </label>
+          <label><input type="checkbox" id="stitch" checked /> 缝合裂缝</label>
+          <label><input type="checkbox" id="wire" /> 线框</label>
+        </div>
+        <div class="row">
+          <label>噪声基
+            <select id="noise">
+              <option value="0" selected>值噪声</option>
+              <option value="1">梯度噪声（Perlin）</option>
+            </select>
+          </label>
+          <label>形状
+            <select id="shape">
+              <option value="0" selected>fBm（普通分形）</option>
+              <option value="1">山脊（ridged）</option>
+              <option value="2">丘峦（billow）</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <label>倍频 <input type="range" id="oct" min="1" max="8" step="1" value="6" style="width:88px" /> <b id="octVal">6</b></label>
+          <label>间隙度 <input type="range" id="lac" min="1.6" max="3" step="0.05" value="2" style="width:88px" /> <b id="lacVal">2.00</b></label>
+          <label>衰减 <input type="range" id="gain" min="0.2" max="0.7" step="0.01" value="0.5" style="width:88px" /> <b id="gainVal">0.50</b></label>
+        </div>
+        <div class="row">
+          <label>频率 <input type="range" id="freq" min="0.004" max="0.05" step="0.001" value="0.018" style="width:88px" /> <b id="freqVal">0.018</b></label>
+          <label>高度 <input type="range" id="amp" min="4" max="30" step="0.5" value="17" style="width:88px" /> <b id="ampVal">17.0</b></label>
+          <label>域扭曲 <input type="range" id="warp" min="0" max="0.8" step="0.02" value="0.25" style="width:88px" /> <b id="warpVal">0.25</b></label>
+        </div>
+        <div class="row">
+          <label>台阶 <input type="range" id="bands" min="1" max="14" step="1" value="1" style="width:88px" /> <b id="bandsVal">1</b></label>
+          <label>水位 <input type="range" id="water" min="-12" max="12" step="0.25" value="4" style="width:88px" /> <b id="waterVal">4.00</b></label>
+        </div>
+        <table class="stats">
+          <tr><td>本帧绘制调用 / 三角形</td><td id="sDraw">-</td></tr>
+          <tr><td>顶点着色器调用（≤ 网格顶点）</td><td id="sVert">-</td></tr>
+          <tr><td>噪声求值（每顶点消耗）</td><td id="sEval">-</td></tr>
+          <tr><td>高度场生成</td><td id="sGen">-</td></tr>
+          <tr><td>LOD 分级分布</td><td id="sLod">-</td></tr>
+        </table>
+        <div class="warn" id="warn">-</div>
+        <div id="err"></div>
+      </section>
+    </div>
+
+    <div>
+      <section class="stage">
+        <h2>0. 高度场缩略图（CPU 同一函数）</h2>
+        <div class="prev">
+          <canvas id="prev" width="120" height="120"></canvas>
+          <div class="note" style="flex:1">
+            和左边画面用的是同一个 <code>terrainH(x,z)</code>。<br />
+            小图里能直接看出：<b>域扭曲</b>把等高线拧弯、<b>山脊</b>把波峰收成刀背、<b>台阶</b>把斜坡切成层岩。<br />
+            蓝线是水位 —— 山是"露出水面的那部分"。
+          </div>
+        </div>
+      </section>
+
+      <section class="stage">
+        <h2>1. 噪声：一个 hash 加一次插值</h2>
+        <pre>// 值噪声：格子顶点各给一个 0~1 的随机数，再平滑插值
+float hash21(ivec2 p) {                       // 整数 hash，GPU / CPU 逐位一致
+  uint h = (uint(p.x) * 73856093u) ^ (uint(p.y) * 19349663u);
+  h ^= h >> 13; h *= 0x85ebca6bu; h ^= h >> 16;
+  return float(h & 0xFFFFFFu) / 16777216.0;
+}
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);           // smoothstep：一阶导连续 → 没有方格棱
+  float a = hash21(ivec2(i)),               b = hash21(ivec2(i) + ivec2(1, 0));
+  float c = hash21(ivec2(i) + ivec2(0,1)),  d = hash21(ivec2(i) + ivec2(1, 1));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y) * 2.0 - 1.0;
+}</pre>
+        <ol class="steps">
+          <li><b>关键在插值函数。</b> 用 <code>f</code> 线性插值会露出方格；<code>smoothstep</code> 让导数连续，才看不出格子。
+            梯度噪声（Perlin）则是在格点上放随机<i>梯度向量</i>、和偏移向量点乘，再用五次曲线插值 —— 对比"值噪声"切一下就能看出高频细节更干净。</li>
+          <li><b>hash 要能两边复现。</b> 这里用整数位运算而不是 <code>fract(sin(dot(...))*43758.5)</code>，
+            因为后者在 GPU（float32）和 CPU（float64）上结果会飘 —— 一旦 CPU 和 GPU 结果不一致，
+            预计算的属性和着色器算的高度就会"打架"，山谷里长出两套山。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>2. fBm：把无穷细节塞进有限三角函数</h2>
+        <pre>sum = 0; norm = 0; amp = 1; q = p;
+for (int o = 0; o &lt; 8; o++) {
+  if (o &gt;= u_oct) break;
+  float n = noise(q);
+  float v = (u_shape == 0) ? n :                    // fBm
+            (u_shape == 1) ? 1.0 - 2.0 * abs(n) :   // 山脊：|n| 处成尖峰
+                             2.0 * abs(n) - 1.0;     // 丘峦
+  sum += v * amp; norm += amp;
+  q *= u_lac;        // 每层频率 ×2
+  amp *= u_gain;     // 每层振幅 ×0.5
+}
+float h = sum / norm;                                // 归一化，免得层数一改整体高度就变
+h *= 0.35 + 0.9 * (noise(p * 0.13) * 0.5 + 0.5);     // 低频"大陆"调制：平原 / 山脉分区</pre>
+        <ol class="steps">
+          <li><b>间隙度 &gt; 衰减的倒数</b> 才收敛。频率 ×2、振幅 ×0.5 时总振幅收敛到 2 倍基础振幅。
+            把衰减调到 0.7 会"糊"（高频占了太多能量），调到 0.3 又太光滑 —— 这两个滑块就是给你感受这个的。</li>
+          <li><b>山脊 = 1-|n|</b>。把噪声在 0 处翻转，普通噪声的平滑过零点变成尖峰，叠起来就是刀刃状山脊。
+            真实地形生成里通常再按高度加权（高的地方更 ridged），这里为了看清效果就先一刀切。</li>
+          <li><b>域扭曲</b>：用噪声本身去偏移采样坐标 <code>p += noise(p) * warp</code>。代价是每层多 2 次求值，
+            换来的是"被侵蚀过"的弯曲河道感 —— 视频里那种"随手一调就像真山"基本都靠它。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>3. 法线：对高度函数求导，不是对三角形求</h2>
+        <pre>vec3 terrainN(vec2 p, float e) {
+  float hL = terrainH(p - vec2(e, 0.0));
+  float hR = terrainH(p + vec2(e, 0.0));
+  float hD = terrainH(p - vec2(0.0, e));
+  float hU = terrainH(p + vec2(0.0, e));
+  return normalize(vec3(hL - hR, 2.0 * e, hD - hU));   // (-dh/dx, 1, -dh/dz)
+}</pre>
+        <ol class="steps">
+          <li><b>为什么不从三角形算法线？</b> 面法线是分片的，山会变成一堆折面；而且 LOD 一换，
+            同一块地形的着色就会跳变。对<i>高度函数</i>求导则连续、和网格密度无关 —— 低模也是光滑的。</li>
+          <li><b>代价是 4 次额外求值</b>，也就是每顶点 5 次（高度 1 + 法线 4）。读数里会算给你看：
+            8 层 fBm 就是每顶点约 200 次 hash。</li>
+          <li><b>步长 <code>e</code> 要跟着网格走。</b> 这里取当前 LOD 的格距：
+            粗网格配小步长只会抖出一堆高频噪点。真想保住细节，就得再叠一张法线贴图 —— 这也是地形着色器的常规做法。</li>
+          <li><b>CPU 预计算版</b>顺手用网格邻居算中心差分（不必再多 4 次求值），所以它比 GPU 版便宜 ——
+            但代价是 LOD 换了、分辨率变了，法线就固定住了。切到 CPU 模式还能看到"改一个参数要重算全图"的卡顿。</li>
+        </ol>
+      </section>
+
+      <section class="stage">
+        <h2>4. 分块 LOD：裂缝从哪来，怎么缝</h2>
+        <ol class="steps">
+          <li><b>块 = 索引缓冲的一段。</b> 一整张 129×129 顶点缓冲不动，按 LOD 级别另建索引：
+            级别 L 只取全分辨率网格里"每隔 2^L 个"的顶点。所以几何数据只有一份，切 LOD 就是换索引。
+            （索引按"块"排序，每块连续 → 每块一次 drawElements，代价是绘制调用从 1 涨到 64。）</li>
+          <li><b>级别选择 + 平滑。</b> 按块中心到相机的距离取 <code>log2</code>，
+            再反复扫描把相邻块的高差压到 ≤1 —— 差 2 级时"取中点"就缝不平了，这是硬约束。</li>
+          <li><b>裂缝的本质是 T 型接点。</b> 细块的边上有中点顶点，粗块的边是直线，
+            两边的高度不一样 → 细看是一条能看穿的缝。把细块边上的中点<b>吸附到粗块那条直线上</b>
+            （用高度函数的两个端点值取平均，因为中点正好在半程），缝就精确闭合了 —— 因为高度是解析函数，
+            两个端点一插值就是粗块直边的表达式。<b>取消勾选"缝合"就能看到这条缝。</b></li>
+          <li><b>工业界的其他解法：</b> 裙边（每块四周往下拉一圈"墙"，便宜、但陡坡要拉很长）、
+            CLOD/CDLOD 的顶点形变（把裂缝摊到整块上，看不出跳变）、几何 clipmap（环形网格跟着相机走）。
+            共同点都是"别让两块用不同的采样率直接相连"。</li>
+        </ol>
+      </section>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2");
+const errBox = document.getElementById("err");
+window.addEventListener("error", (e) => { errBox.style.display = "block"; errBox.textContent += (e.message || e.error) + "\n"; });
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src);
+  return sh;
+}
+function link(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  return o;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+function lookAt(eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  let l = Math.sqrt(zx * zx + zy * zy + zz * zz); zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  l = Math.sqrt(xx * xx + xy * xy + xz * xz); xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+    -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+    -(zx * eye[0] + zy * eye[1] + zz * eye[2]), 1,
+  ]);
+}
+function invert4(m) {
+  const o = new Float32Array(16);
+  const a00=m[0],a01=m[1],a02=m[2],a03=m[3], a10=m[4],a11=m[5],a12=m[6],a13=m[7];
+  const a20=m[8],a21=m[9],a22=m[10],a23=m[11], a30=m[12],a31=m[13],a32=m[14],a33=m[15];
+  const b00=a00*a11-a01*a10, b01=a00*a12-a02*a10, b02=a00*a13-a03*a10, b03=a01*a12-a02*a11;
+  const b04=a01*a13-a03*a11, b05=a02*a13-a03*a12, b06=a20*a31-a21*a30, b07=a20*a32-a22*a30;
+  const b08=a20*a33-a23*a30, b09=a21*a32-a22*a31, b10=a21*a33-a23*a31, b11=a22*a33-a23*a32;
+  let det = b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06;
+  if (!det) return o;
+  det = 1 / det;
+  o[0]=(a11*b11-a12*b10+a13*b09)*det;  o[1]=(a02*b10-a01*b11-a03*b09)*det;
+  o[2]=(a31*b05-a32*b04+a33*b03)*det;  o[3]=(a22*b04-a21*b05-a23*b03)*det;
+  o[4]=(a12*b08-a10*b11-a13*b07)*det;  o[5]=(a00*b11-a02*b08+a03*b07)*det;
+  o[6]=(a32*b02-a30*b05-a33*b01)*det;  o[7]=(a20*b05-a22*b02+a23*b01)*det;
+  o[8]=(a10*b10-a11*b08+a13*b06)*det;  o[9]=(a01*b08-a00*b10-a03*b06)*det;
+  o[10]=(a30*b04-a31*b02+a33*b00)*det; o[11]=(a21*b02-a20*b04-a23*b00)*det;
+  o[12]=(a11*b07-a10*b09-a12*b06)*det; o[13]=(a00*b09-a01*b07+a02*b06)*det;
+  o[14]=(a31*b01-a30*b03-a32*b00)*det; o[15]=(a20*b03-a21*b01+a22*b00)*det;
+  return o;
+}
+
+// ==================================================================== 噪声（CPU 版，与 GLSL 逐行对应）
+function hash21(x, y) {
+  let h = (Math.imul(x, 73856093) ^ Math.imul(y, 19349663)) >>> 0;
+  h = (h ^ (h >>> 13)) >>> 0;
+  h = Math.imul(h, 0x85ebca6b) >>> 0;
+  h = (h ^ (h >>> 16)) >>> 0;
+  return (h & 0xFFFFFF) / 16777216;
+}
+function hash22(x, y) { return [hash21(x, y), hash21(x + 37, y + 17)]; }
+function vnoise(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash21(ix, iy), b = hash21(ix + 1, iy), c = hash21(ix, iy + 1), d = hash21(ix + 1, iy + 1);
+  const p = a + (b - a) * ux, q = c + (d - c) * ux;
+  return (p + (q - p) * uy) * 2 - 1;
+}
+function gnoise(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const ux = fx * fx * fx * (fx * (fx * 6 - 15) + 10), uy = fy * fy * fy * (fy * (fy * 6 - 15) + 10);
+  const g = (px, py) => {
+    const h = hash22(px, py);
+    const a = (h[0] * 2 - 1) + 1e-5, b = (h[1] * 2 - 1) + 1e-5;
+    const l = Math.sqrt(a * a + b * b);
+    return [a / l, b / l];
+  };
+  const g00 = g(ix, iy), g10 = g(ix + 1, iy), g01 = g(ix, iy + 1), g11 = g(ix + 1, iy + 1);
+  const va = g00[0] * fx + g00[1] * fy;
+  const vb = g10[0] * (fx - 1) + g10[1] * fy;
+  const vc = g01[0] * fx + g01[1] * (fy - 1);
+  const vd = g11[0] * (fx - 1) + g11[1] * (fy - 1);
+  const p = va + (vb - va) * ux, q = vc + (vd - vc) * ux;
+  return (p + (q - p) * uy) * 1.4;
+}
+const P = { kind: 0, shape: 0, oct: 5, lac: 2, gain: 0.5, freq: 0.018, amp: 17, warp: 0.25, bands: 1 };
+let noiseEvals = 0;                 // 统计 CPU 侧求值次数，方便对比
+function baseNoise(x, y) { noiseEvals++; return P.kind === 0 ? vnoise(x, y) : gnoise(x, y); }
+function terrainH(x, z) {
+  let px = x * P.freq, pz = z * P.freq;
+  if (P.warp > 0) {
+    const wx = baseNoise(px + 1.7, pz + 9.2), wy = baseNoise(px + 8.3, pz + 2.8);
+    px += wx * P.warp; pz += wy * P.warp;
+  }
+  let sum = 0, norm = 0, amp = 1, qx = px, qz = pz;
+  const oct = Math.min(8, P.oct | 0);
+  for (let o = 0; o < 8; o++) {
+    if (o >= oct) break;
+    const n = baseNoise(qx, qz);
+    let v;
+    if (P.shape === 0) v = n;
+    else if (P.shape === 1) v = 1 - 2 * Math.abs(n);
+    else v = 2 * Math.abs(n) - 1;
+    sum += v * amp; norm += amp;
+    qx *= P.lac; qz *= P.lac;
+    amp *= P.gain;
+  }
+  let h = sum / Math.max(norm, 1e-4);
+  const cont = baseNoise(px * 0.13 + 21, pz * 0.13 + 4) * 0.5 + 0.5;
+  h *= 0.35 + 0.9 * cont;
+  if (P.bands > 1.5) h = Math.floor(h * P.bands) / P.bands;
+  return h * P.amp;
+}
+
+// ==================================================================== 着色器里的噪声（与上面同一个函数）
+const NOISE = `
+uniform int u_noiseKind, u_shape, u_oct;
+uniform float u_lac, u_gain, u_freq, u_amp, u_warp, u_bands;
+
+float hash21(ivec2 p) {
+  uint h = (uint(p.x) * 73856093u) ^ (uint(p.y) * 19349663u);
+  h ^= h >> 13; h *= 0x85ebca6bu; h ^= h >> 16;
+  return float(h & 0xFFFFFFu) / 16777216.0;      // 24 位：JS 也这么做，两边逐位一致
+}
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = hash21(ivec2(i)),              b = hash21(ivec2(i) + ivec2(1, 0));
+  float c = hash21(ivec2(i) + ivec2(0, 1)), d = hash21(ivec2(i) + ivec2(1, 1));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y) * 2.0 - 1.0;
+}
+vec2 hash22(ivec2 p) { return vec2(hash21(p), hash21(p + ivec2(37, 17))); }
+float gnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  vec2 g00 = normalize(hash22(ivec2(i)) * 2.0 - 1.0 + 1e-5);
+  vec2 g10 = normalize(hash22(ivec2(i) + ivec2(1, 0)) * 2.0 - 1.0 + 1e-5);
+  vec2 g01 = normalize(hash22(ivec2(i) + ivec2(0, 1)) * 2.0 - 1.0 + 1e-5);
+  vec2 g11 = normalize(hash22(ivec2(i) + ivec2(1, 1)) * 2.0 - 1.0 + 1e-5);
+  float a = dot(g00, f), b = dot(g10, f - vec2(1.0, 0.0));
+  float c = dot(g01, f - vec2(0.0, 1.0)), d = dot(g11, f - vec2(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y) * 1.4;
+}
+float baseNoise(vec2 p) { return (u_noiseKind == 0) ? vnoise(p) : gnoise(p); }
+float terrainH(vec2 p) {
+  p *= u_freq;
+  if (u_warp > 0.0) {
+    float wx = baseNoise(p + vec2(1.7, 9.2));
+    float wy = baseNoise(p + vec2(8.3, 2.8));
+    p += vec2(wx, wy) * u_warp;
+  }
+  float sum = 0.0, norm = 0.0, amp = 1.0;
+  vec2 q = p;
+  for (int o = 0; o < 8; o++) {
+    if (o >= u_oct) break;
+    float n = baseNoise(q);
+    float v = (u_shape == 0) ? n : ((u_shape == 1) ? 1.0 - 2.0 * abs(n) : 2.0 * abs(n) - 1.0);
+    sum += v * amp; norm += amp;
+    q *= u_lac;
+    amp *= u_gain;
+  }
+  float h = sum / max(norm, 1e-4);
+  float cont = baseNoise(p * 0.13 + vec2(21.0, 4.0)) * 0.5 + 0.5;   // 平原 / 山脉分区
+  h *= 0.35 + 0.9 * cont;
+  if (u_bands > 1.5) h = floor(h * u_bands) / u_bands;
+  return h * u_amp;
+}
+vec3 terrainN(vec2 p, float e) {
+  float hL = terrainH(p - vec2(e, 0.0)), hR = terrainH(p + vec2(e, 0.0));
+  float hD = terrainH(p - vec2(0.0, e)), hU = terrainH(p + vec2(0.0, e));
+  return normalize(vec3(hL - hR, 2.0 * e, hD - hU));
+}
+`;
+
+const VS = `#version 300 es
+precision highp float;
+` + NOISE + `
+layout(location = 0) in vec2 a_xz;    // 世界 XZ（全分辨率网格的坐标）
+layout(location = 1) in vec2 a_ij;    // 网格下标（整数，用来判断 T 型接点的奇偶）
+layout(location = 2) in float a_h;    // CPU 预计算高度
+layout(location = 3) in vec3 a_nrm;   // CPU 预计算法线
+uniform mat4 u_vp;
+uniform vec2 u_org;                   // 本块在全分辨率网格里的原点
+uniform int u_level, u_useCpu, u_stitch;
+uniform vec4 u_snap;                  // +x, -x, +z, -z 四个方向要不要缝
+out vec3 v_world, v_nrm;
+void main() {
+  float h; vec3 n;
+  if (u_useCpu == 1) {
+    h = a_h; n = a_nrm;               // 纯取属性，顶点着色器一次噪声都不算
+  } else {
+    float e = exp2(float(u_level));   // LOD 越粗，差分步长越大（法线该跟着变粗）
+    h = terrainH(a_xz);
+    n = terrainN(a_xz, e);
+  }
+
+  // 缝合：我比邻居细 1 级时，边上的"中点"要吸附到粗邻居那条直线上。
+  // 因为高度是解析函数，两个端点求平均 = 粗块直边在这一点的高度。
+  if (u_stitch == 1 && u_level > 0) {
+    vec2 lc = a_ij - u_org;           // 块内网格坐标
+    float e = exp2(float(u_level));
+    if ((u_snap.x > 0.5 && lc.x > 15.5) || (u_snap.y > 0.5 && lc.x < 0.5)) {
+      if (mod(lc.y / e, 2.0) > 0.5) h = 0.5 * (terrainH(a_xz - vec2(0.0, e)) + terrainH(a_xz + vec2(0.0, e)));
+    }
+    if ((u_snap.z > 0.5 && lc.y > 15.5) || (u_snap.w > 0.5 && lc.y < 0.5)) {
+      if (mod(lc.x / e, 2.0) > 0.5) h = 0.5 * (terrainH(a_xz - vec2(e, 0.0)) + terrainH(a_xz + vec2(e, 0.0)));
+    }
+  }
+
+  v_world = vec3(a_xz.x, h, a_xz.y);
+  v_nrm = n;
+  gl_Position = u_vp * vec4(v_world, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+precision highp int;
+` + NOISE + `
+in vec3 v_world, v_nrm;
+uniform vec3 u_eye, u_light, u_fogCol, u_levelCol;
+uniform float u_fogDen, u_water;
+uniform int u_view, u_wire;
+out vec4 outColor;
+void main() {
+  if (u_wire == 1) { outColor = vec4(0.05, 0.06, 0.08, 1.0); return; }
+  vec3 n = normalize(v_nrm);
+  float h = v_world.y;
+  if (u_view == 2) { outColor = vec4(vec3(h / max(u_amp, 1.0) * 0.5 + 0.5), 1.0); return; }
+  if (u_view == 3) { outColor = vec4(n * 0.5 + 0.5, 1.0); return; }
+
+  vec3 c;
+  if (u_view == 1) {
+    c = u_levelCol;
+  } else {
+    float slope = 1.0 - n.y;
+    vec3 sand = vec3(0.70, 0.64, 0.45), grass = vec3(0.26, 0.44, 0.19);
+    vec3 rock = vec3(0.34, 0.33, 0.31), snow = vec3(0.90, 0.93, 0.97);
+    c = mix(sand, grass, smoothstep(u_water + 0.5, u_water + 5.0, h));
+    c = mix(c, rock, smoothstep(8.0, 14.0, h));
+    c = mix(c, snow, smoothstep(15.0, 21.0, h));
+    c = mix(c, rock, smoothstep(0.40, 0.75, slope));                       // 陡坡露岩
+    c = mix(c, snow, smoothstep(0.55, 0.85, slope) * smoothstep(10.0, 15.0, h));
+  }
+  float dif = max(dot(n, u_light), 0.0);
+  float amb = 0.32 + 0.28 * (n.y * 0.5 + 0.5);
+  vec3 col = c * (amb + dif * 0.85);
+  col += vec3(0.9, 0.95, 1.0) * pow(max(dot(n, normalize(u_light + normalize(u_eye - v_world))), 0.0), 24.0) * 0.12;
+  if (u_view == 0) {                              // 调试视图不叠雾，否则远处的 LOD 配色根本看不清
+    float d = length(v_world - u_eye);
+    col = mix(col, u_fogCol, clamp(1.0 - exp(-d * u_fogDen), 0.0, 1.0));
+  }
+  outColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
+}`;
+
+const SKY_VS = `#version 300 es
+precision highp float;
+out vec2 v_uv;
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  v_uv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const SKY_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform mat4 u_invVP;
+uniform vec3 u_eye, u_light, u_horizon;
+out vec4 outColor;
+void main() {
+  vec4 a = u_invVP * vec4(v_uv * 2.0 - 1.0, -1.0, 1.0);
+  vec4 b = u_invVP * vec4(v_uv * 2.0 - 1.0, 1.0, 1.0);
+  vec3 dir = normalize(b.xyz / b.w - a.xyz / a.w);
+  float t = clamp(dir.y * 1.4, 0.0, 1.0);
+  vec3 col = mix(u_horizon, vec3(0.16, 0.34, 0.62), pow(t, 0.75));
+  float s = max(dot(dir, u_light), 0.0);
+  col += vec3(1.0, 0.92, 0.78) * pow(s, 900.0) * 3.0;             // 太阳
+  col += vec3(1.0, 0.86, 0.66) * pow(s, 12.0) * 0.10;             // 晕
+  outColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
+}`;
+
+const WATER_VS = `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 a_xz;
+uniform mat4 u_vp;
+uniform float u_waterY;
+out vec3 v_world;
+void main() {
+  v_world = vec3(a_xz.x, u_waterY, a_xz.y);
+  gl_Position = u_vp * vec4(v_world, 1.0);
+}`;
+
+const WATER_FS = `#version 300 es
+precision highp float;
+precision highp int;
+` + NOISE + `
+in vec3 v_world;
+uniform vec3 u_eye;
+uniform float u_waterY;
+out vec4 outColor;
+void main() {
+  float h = terrainH(v_world.xz);
+  float depth = u_waterY - h;
+  if (depth <= 0.0) discard;                       // 高于水面：让地形露出来（其实深度测试也会挡掉）
+  vec3 shallow = vec3(0.32, 0.62, 0.66), deep = vec3(0.03, 0.13, 0.30);
+  vec3 c = mix(shallow, deep, smoothstep(0.0, 13.0, depth));
+  float foam = smoothstep(0.0, 0.9, depth) * (1.0 - smoothstep(0.9, 2.6, depth));
+  c = mix(c, vec3(0.92, 0.96, 0.98), foam * 0.75);
+  vec3 n = vec3(0.0, 1.0, 0.0);
+  vec3 v = normalize(u_eye - v_world);
+  float fres = pow(1.0 - max(dot(n, v), 0.0), 4.0);
+  c += fres * 0.45;
+  float a = mix(0.42, 0.94, smoothstep(0.0, 7.0, depth)) + fres * 0.25;
+  outColor = vec4(pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2)) * a, clamp(a, 0.0, 1.0));
+}`;
+
+const prog = link(VS, FS);
+const progSky = link(SKY_VS, SKY_FS);
+const progWater = link(WATER_VS, WATER_FS);
+const uni = (p, names) => { const o = {}; for (const n of names) o[n] = gl.getUniformLocation(p, n); return o; };
+const NOISE_UNIFORMS = ["u_noiseKind", "u_shape", "u_oct", "u_lac", "u_gain", "u_freq", "u_amp", "u_warp", "u_bands"];
+const uT = uni(prog, ["u_vp", "u_org", "u_level", "u_useCpu", "u_stitch", "u_snap", "u_eye", "u_light",
+  "u_fogCol", "u_fogDen", "u_water", "u_view", "u_wire", "u_levelCol"].concat(NOISE_UNIFORMS));
+const uS = uni(progSky, ["u_invVP", "u_eye", "u_light", "u_horizon"]);
+const uW = uni(progWater, ["u_vp", "u_waterY", "u_eye"].concat(NOISE_UNIFORMS));
+
+function setNoise(prog, u) {
+  gl.uniform1i(u.u_noiseKind, P.kind);
+  gl.uniform1i(u.u_shape, P.shape);
+  gl.uniform1i(u.u_oct, P.oct);
+  gl.uniform1f(u.u_lac, P.lac);
+  gl.uniform1f(u.u_gain, P.gain);
+  gl.uniform1f(u.u_freq, P.freq);
+  gl.uniform1f(u.u_amp, P.amp);
+  gl.uniform1f(u.u_warp, P.warp);
+  gl.uniform1f(u.u_bands, P.bands);
+}
+
+// ==================================================================== 网格
+const G = 128, S = 64, SEG = 1.0;          // 128 段，跨度 [-64,64]，格距 1
+const C = 8, CHUNK = 16, MAXL = 3;         // 8×8 块，每块 16 格
+const NV = (G + 1) * (G + 1);
+
+const verts = new Float32Array(NV * 8);    // x, z, i, j, h, nx, ny, nz
+for (let j = 0; j <= G; j++) {
+  for (let i = 0; i <= G; i++) {
+    const v = j * (G + 1) + i, o = v * 8;
+    verts[o] = -S + i * SEG;
+    verts[o + 1] = -S + j * SEG;
+    verts[o + 2] = i;
+    verts[o + 3] = j;
+    verts[o + 4] = 0;
+    verts[o + 5] = 0; verts[o + 6] = 1; verts[o + 7] = 0;
+  }
+}
+const vao = gl.createVertexArray();
+const vbo = gl.createBuffer();
+gl.bindVertexArray(vao);
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 32, 0);
+gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 32, 8);
+gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 32, 16);
+gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 3, gl.FLOAT, false, 32, 20);
+gl.bindVertexArray(null);
+
+// 索引：每个 LOD 级别、每块一段连续区间
+const triOff = [], triCnt = [], lineOff = [], lineCnt = [];
+const triArr = [], lineArr = [];
+function levelGeom(L) {
+  const step = 1 << L, nSeg = CHUNK >> L;
+  const tris = [], lines = [];
+  const offs = new Int32Array(C * C), cnts = new Int32Array(C * C);
+  const loffs = new Int32Array(C * C), lcnts = new Int32Array(C * C);
+  for (let cz = 0; cz < C; cz++) for (let cx = 0; cx < C; cx++) {
+    const ch = cz * C + cx;
+    offs[ch] = tris.length / 3;
+    loffs[ch] = lines.length / 2;
+    const bi = cx * CHUNK, bj = cz * CHUNK;
+    const idx = (i, j) => (bj + j * step) * (G + 1) + (bi + i * step);
+    for (let j = 0; j < nSeg; j++) for (let i = 0; i < nSeg; i++) {
+      const v00 = idx(i, j), v10 = idx(i + 1, j), v01 = idx(i, j + 1), v11 = idx(i + 1, j + 1);
+      tris.push(v00, v01, v11, v00, v11, v10);
+    }
+    for (let j = 0; j <= nSeg; j++) for (let i = 0; i < nSeg; i++) lines.push(idx(i, j), idx(i + 1, j));
+    for (let i = 0; i <= nSeg; i++) for (let j = 0; j < nSeg; j++) lines.push(idx(i, j), idx(i, j + 1));
+    cnts[ch] = tris.length / 3 - offs[ch];
+    lcnts[ch] = lines.length / 2 - loffs[ch];
+  }
+  return { tris, lines, offs, cnts, loffs, lcnts };
+}
+const levels = [];
+let triBase = 0, lineBase = 0;
+for (let L = 0; L <= MAXL; L++) {
+  const g = levelGeom(L);
+  g.triBase = triBase; g.lineBase = lineBase;
+  triArr.push(g.tris); lineArr.push(g.lines);
+  triBase += g.tris.length / 3;
+  lineBase += g.lines.length / 2;
+  levels.push(g);
+}
+const fullTris = [], fullLines = [];
+for (let j = 0; j < G; j++) for (let i = 0; i < G; i++) {
+  const v00 = j * (G + 1) + i, v10 = v00 + 1, v01 = v00 + (G + 1), v11 = v01 + 1;
+  fullTris.push(v00, v01, v11, v00, v11, v10);
+}
+for (let j = 0; j <= G; j++) for (let i = 0; i < G; i++) fullLines.push(j * (G + 1) + i, j * (G + 1) + i + 1);
+for (let i = 0; i <= G; i++) for (let j = 0; j < G; j++) fullLines.push(j * (G + 1) + i, (j + 1) * (G + 1) + i);
+const fullTriBase = triBase, fullLineBase = lineBase;
+triArr.push(fullTris); lineArr.push(fullLines);
+triBase += fullTris.length / 3; lineBase += fullLines.length / 2;
+
+function packIndex(arr) {
+  const total = arr.reduce((s, a) => s + a.length, 0);
+  const out = new Uint32Array(total);
+  let o = 0;
+  for (const a of arr) { out.set(a, o); o += a.length; }
+  return out;
+}
+const triBuf = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, triBuf);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, packIndex(triArr), gl.STATIC_DRAW);
+const lineBuf = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, lineBuf);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, packIndex(lineArr), gl.STATIC_DRAW);
+gl.bindVertexArray(null);
+
+const waterVao = gl.createVertexArray();
+gl.bindVertexArray(waterVao);
+const waterVbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, waterVbo);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-S, -S, S, -S, S, S, -S, -S, S, S, -S, S]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.bindVertexArray(null);
+const fullVao = gl.createVertexArray();
+
+// ==================================================================== CPU 高度场
+let cpuMs = 0, cpuEvals = 0, cpuDirty = true;
+function rebuildCpu() {
+  noiseEvals = 0;
+  const t0 = performance.now();
+  const hIdx = new Float32Array(NV);
+  for (let v = 0; v < NV; v++) hIdx[v] = terrainH(verts[v * 8], verts[v * 8 + 1]);
+  // 法线用网格邻居做中心差分 —— CPU 版就该这么算，不必再多 4 次求值
+  for (let j = 0; j <= G; j++) for (let i = 0; i <= G; i++) {
+    const v = j * (G + 1) + i;
+    const xl = hIdx[j * (G + 1) + Math.max(0, i - 1)], xr = hIdx[j * (G + 1) + Math.min(G, i + 1)];
+    const zd = hIdx[Math.max(0, j - 1) * (G + 1) + i], zu = hIdx[Math.min(G, j + 1) * (G + 1) + i];
+    let nx = xl - xr, ny = 2 * SEG, nz = zd - zu;
+    const l = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+    verts[v * 8 + 4] = hIdx[v];
+    verts[v * 8 + 5] = nx / l; verts[v * 8 + 6] = ny / l; verts[v * 8 + 7] = nz / l;
+  }
+  cpuMs = performance.now() - t0;
+  cpuEvals = noiseEvals;
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, verts);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  cpuDirty = false;
+}
+
+// ==================================================================== LOD 分级
+const levelOf = new Int32Array(C * C);
+const LOD_BASE = 26;
+function assignLod(ex, ez) {
+  for (let cz = 0; cz < C; cz++) for (let cx = 0; cx < C; cx++) {
+    const wx = -S + (cx + 0.5) * CHUNK, wz = -S + (cz + 0.5) * CHUNK;
+    const d = Math.max(0, Math.sqrt((ex - wx) * (ex - wx) + (ez - wz) * (ez - wz)) - CHUNK * 0.5);
+    levelOf[cz * C + cx] = Math.max(0, Math.min(MAXL, Math.floor(Math.log2(Math.max(d, 1) / LOD_BASE))));
+  }
+  for (let pass = 0; pass < 6; pass++) {
+    for (let cz = 0; cz < C; cz++) for (let cx = 0; cx < C; cx++) {
+      let mn = 99;
+      if (cx > 0) mn = Math.min(mn, levelOf[cz * C + cx - 1]);
+      if (cx < C - 1) mn = Math.min(mn, levelOf[cz * C + cx + 1]);
+      if (cz > 0) mn = Math.min(mn, levelOf[(cz - 1) * C + cx]);
+      if (cz < C - 1) mn = Math.min(mn, levelOf[(cz + 1) * C + cx]);
+      levelOf[cz * C + cx] = Math.min(levelOf[cz * C + cx], mn + 1);   // 相邻块最多差 1 级，否则缝不平
+    }
+  }
+}
+
+// ==================================================================== 交互
+const el = (id) => document.getElementById(id);
+const viewEl = el("view"), modeEl = el("mode"), lodEl = el("lod"), stitchEl = el("stitch"), wireEl = el("wire");
+const noiseEl = el("noise"), shapeEl = el("shape");
+const sliders = {
+  oct: el("oct"), lac: el("lac"), gain: el("gain"), freq: el("freq"),
+  amp: el("amp"), warp: el("warp"), bands: el("bands"), water: el("water"),
+};
+const cam = { yaw: 0.55, pitch: 0.45, dist: 84 };
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  cam.yaw -= (e.clientX - lastX) * 0.006;
+  cam.pitch = Math.max(0.06, Math.min(1.35, cam.pitch - (e.clientY - lastY) * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+});
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  cam.dist = Math.max(10, Math.min(260, cam.dist * (1 + Math.sign(e.deltaY) * 0.09)));
+}, { passive: false });
+
+let dirty = true;
+const syncParams = () => {
+  P.kind = Number(noiseEl.value);
+  P.shape = Number(shapeEl.value);
+  P.oct = Number(sliders.oct.value);
+  P.lac = Number(sliders.lac.value);
+  P.gain = Number(sliders.gain.value);
+  P.freq = Number(sliders.freq.value);
+  P.amp = Number(sliders.amp.value);
+  P.warp = Number(sliders.warp.value);
+  P.bands = Number(sliders.bands.value);
+  el("octVal").textContent = P.oct;
+  el("lacVal").textContent = P.lac.toFixed(2);
+  el("gainVal").textContent = P.gain.toFixed(2);
+  el("freqVal").textContent = P.freq.toFixed(3);
+  el("ampVal").textContent = P.amp.toFixed(1);
+  el("warpVal").textContent = P.warp.toFixed(2);
+  el("bandsVal").textContent = P.bands;
+  el("waterVal").textContent = Number(sliders.water.value).toFixed(2);
+  dirty = true;
+};
+for (const k in sliders) sliders[k].addEventListener("input", syncParams);
+noiseEl.addEventListener("change", syncParams);
+shapeEl.addEventListener("change", syncParams);
+syncParams();
+
+// ==================================================================== 2D 高度场缩略图
+const pctx = el("prev").getContext("2d");
+function drawPreview() {
+  const N = 120, span = 2 * S;
+  const hs = new Float32Array(N * N);
+  noiseEvals = 0;
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++)
+    hs[j * N + i] = terrainH(-S + (i + 0.5) / N * span, -S + (j + 0.5) / N * span);
+  const img = pctx.createImageData(N, N);
+  const water = Number(sliders.water.value);
+  const d = span / N;
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const h = hs[j * N + i];
+    const hx = hs[j * N + Math.min(N - 1, i + 1)] - hs[j * N + Math.max(0, i - 1)];
+    const hz = hs[Math.min(N - 1, j + 1) * N + i] - hs[Math.max(0, j - 1) * N + i];
+    const shade = Math.max(0.35, Math.min(1.35, 1 + (hx + hz) / (4 * d)));
+    let r, g, b;
+    if (h < water) {
+      const t = Math.max(0, Math.min(1, (water - h) / 12));
+      r = 60 + (10 - 60) * t; g = 110 + (40 - 110) * t; b = 140 + (90 - 140) * t;
+    } else {
+      const a = Math.max(0, Math.min(1, (h - water) / 6)), c1 = Math.max(0, Math.min(1, (h - 9) / 7));
+      const s = Math.max(0, Math.min(1, (h - 15) / 6));
+      const gr = [200, 96, 10], gs = [80, 128, 48], ro = [120, 112, 100], sn = [238, 242, 248];
+      let cr = 200, cg = 176, cb = 118;
+      cr = cr + (gs[0] - cr) * a; cg = cg + (gs[1] - cg) * a; cb = cb + (gs[2] - cb) * a;
+      cr = cr + (ro[0] - cr) * c; cg = cg + (ro[1] - cg) * c; cb = cb + (ro[2] - cb) * c;
+      cr = cr + (sn[0] - cr) * s; cg = cg + (sn[1] - cg) * s; cb = cb + (sn[2] - cb) * s;
+      r = cr * shade; g = cg * shade; b = cb * shade;
+    }
+    const o = (j * N + i) * 4;
+    img.data[o] = Math.max(0, Math.min(255, r));
+    img.data[o + 1] = Math.max(0, Math.min(255, g));
+    img.data[o + 2] = Math.max(0, Math.min(255, b));
+    img.data[o + 3] = 255;
+  }
+  pctx.putImageData(img, 0, 0);
+  pctx.strokeStyle = "rgba(120,200,255,0.9)";
+  pctx.beginPath();
+  pctx.moveTo(0, 4); pctx.lineTo(N - 1, 4);
+  pctx.stroke();
+  return noiseEvals;
+}
+
+// ==================================================================== 主循环
+const LEVEL_COL = [[0.20, 0.75, 0.45], [0.85, 0.75, 0.25], [0.90, 0.45, 0.20], [0.75, 0.25, 0.55]];
+const modelI = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+const snap4 = new Float32Array(4);
+const org2 = new Float32Array(2);
+let previewEvals = 0;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const view = Number(viewEl.value);
+  const cpuMode = Number(modeEl.value) === 1;
+  const useLod = Number(lodEl.value) === 1;
+  const stitch = stitchEl.checked ? 1 : 0;
+  const wire = wireEl.checked ? 1 : 0;
+  const waterY = Number(sliders.water.value);
+
+  if (cpuMode && cpuDirty) rebuildCpu();
+  if (dirty) { previewEvals = drawPreview(); dirty = false; }
+
+  const eye = [
+    Math.sin(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+    6 + Math.sin(cam.pitch) * cam.dist,
+    Math.cos(cam.yaw) * Math.cos(cam.pitch) * cam.dist,
+  ];
+  const view4 = lookAt(eye, [0, 4, 0], [0, 1, 0]);
+  const proj = perspective(Math.PI / 3.6, canvas.width / canvas.height, 1, 600);
+  const vp = mul(proj, view4);
+  const invVP = invert4(vp);
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.09, 0.14, 0.22, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  // ---- 天空
+  gl.disable(gl.DEPTH_TEST); gl.depthMask(false);
+  gl.useProgram(progSky);
+  gl.uniformMatrix4fv(uS.u_invVP, false, invVP);
+  gl.uniform3fv(uS.u_eye, eye);
+  gl.uniform3fv(uS.u_light, LIGHT);
+  gl.uniform3fv(uS.u_horizon, FOG);
+  gl.bindVertexArray(fullVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // ---- 地形
+  gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
+  gl.disable(gl.BLEND);
+  gl.useProgram(prog);
+  setNoise(prog, uT);
+  gl.uniformMatrix4fv(uT.u_vp, false, vp);
+  gl.uniform1i(uT.u_useCpu, cpuMode ? 1 : 0);
+  gl.uniform1i(uT.u_stitch, stitch);
+  gl.uniform1i(uT.u_view, view);
+  gl.uniform1i(uT.u_wire, 0);
+  gl.uniform3fv(uT.u_eye, eye);
+  gl.uniform3fv(uT.u_light, LIGHT);
+  gl.uniform3fv(uT.u_fogCol, FOG);
+  gl.uniform1f(uT.u_fogDen, 0.0028);
+  gl.uniform1f(uT.u_water, waterY);
+  gl.bindVertexArray(vao);
+  gl.enable(gl.POLYGON_OFFSET_FILL);
+  gl.polygonOffset(1, 1);
+
+  let draws = 0, tris = 0, verts = 0, evals = 0;
+  const counts = [0, 0, 0, 0];
+
+  if (!useLod) {
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, triBuf);
+    gl.uniform2f(uT.u_org, 0, 0);
+    gl.uniform1i(uT.u_level, 0);
+    gl.uniform4f(uT.u_snap, 0, 0, 0, 0);
+    gl.uniform3fv(uT.u_levelCol, LEVEL_COL[0]);
+    gl.drawElements(gl.TRIANGLES, fullTris.length, gl.UNSIGNED_INT, fullTriBase * 4);
+    draws++; tris = fullTris.length / 3; verts = NV;
+    evals = NV * (cpuMode ? 0 : 5);
+    counts[0] = 1;
+  } else {
+    assignLod(eye[0], eye[2]);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, triBuf);
+    for (let cz = 0; cz < C; cz++) for (let cx = 0; cx < C; cx++) {
+      const ch = cz * C + cx, L = levelOf[ch], g = levels[L];
+      const right = cx < C - 1 ? levelOf[cz * C + cx + 1] : L;
+      const left = cx > 0 ? levelOf[cz * C + cx - 1] : L;
+      const up = cz < C - 1 ? levelOf[(cz + 1) * C + cx] : L;
+      const down = cz > 0 ? levelOf[(cz - 1) * C + cx] : L;
+      snap4[0] = right > L ? 1 : 0; snap4[1] = left > L ? 1 : 0;
+      snap4[2] = up > L ? 1 : 0; snap4[3] = down > L ? 1 : 0;
+      org2[0] = cx * CHUNK; org2[1] = cz * CHUNK;
+      gl.uniform2fv(uT.u_org, org2);
+      gl.uniform1i(uT.u_level, L);
+      gl.uniform4fv(uT.u_snap, snap4);
+      gl.uniform3fv(uT.u_levelCol, LEVEL_COL[L]);
+      gl.drawElements(gl.TRIANGLES, g.cnts[ch], gl.UNSIGNED_INT, (g.triBase + g.offs[ch]) * 4);
+      const nSeg = CHUNK >> L;
+      draws++; tris += 0; verts += (nSeg + 1) * (nSeg + 1);
+      counts[L]++;
+    }
+    tris = 0;
+    for (let cz = 0; cz < C; cz++) for (let cx = 0; cx < C; cx++) {
+      const L = levelOf[cz * C + cx], nSeg = CHUNK >> L;
+      tris += nSeg * nSeg * 2;
+    }
+    evals = verts * (cpuMode ? 0 : 5);
+  }
+
+  // ---- 线框
+  if (wire) {
+    gl.useProgram(prog);
+    gl.uniform1i(uT.u_wire, 1);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, lineBuf);
+    if (!useLod) {
+      gl.uniform1i(uT.u_level, 0); gl.uniform4f(uT.u_snap, 0, 0, 0, 0); gl.uniform2f(uT.u_org, 0, 0);
+      gl.drawElements(gl.LINES, fullLines.length, gl.UNSIGNED_INT, fullLineBase * 4);
+      draws++;
+    } else {
+      for (let cz = 0; cz < C; cz++) for (let cx = 0; cx < C; cx++) {
+        const ch = cz * C + cx, L = levelOf[ch], g = levels[L];
+        const right = cx < C - 1 ? levelOf[cz * C + cx + 1] : L;
+        const left = cx > 0 ? levelOf[cz * C + cx - 1] : L;
+        const up = cz < C - 1 ? levelOf[(cz + 1) * C + cx] : L;
+        const down = cz > 0 ? levelOf[(cz - 1) * C + cx] : L;
+        snap4[0] = right > L ? 1 : 0; snap4[1] = left > L ? 1 : 0;
+        snap4[2] = up > L ? 1 : 0; snap4[3] = down > L ? 1 : 0;
+        org2[0] = cx * CHUNK; org2[1] = cz * CHUNK;
+        gl.uniform2fv(uT.u_org, org2);
+        gl.uniform1i(uT.u_level, L);
+        gl.uniform4fv(uT.u_snap, snap4);
+        gl.drawElements(gl.LINES, g.lcnts[ch], gl.UNSIGNED_INT, (g.lineBase + g.loffs[ch]) * 4);
+        draws++;
+      }
+    }
+    gl.uniform1i(uT.u_wire, 0);
+  }
+  gl.disable(gl.POLYGON_OFFSET_FILL);
+
+  // ---- 水面
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.depthMask(false);
+  gl.useProgram(progWater);
+  setNoise(progWater, uW);
+  gl.uniformMatrix4fv(uW.u_vp, false, vp);
+  gl.uniform1f(uW.u_waterY, waterY);
+  gl.uniform3fv(uW.u_eye, eye);
+  gl.bindVertexArray(waterVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  draws++;
+  gl.depthMask(true);
+  gl.disable(gl.BLEND);
+  gl.bindVertexArray(null);
+
+  // ---- 读数
+  el("sDraw").textContent = draws + " 次 / " + Math.round(tris).toLocaleString() + " 三角形";
+  el("sVert").textContent = verts.toLocaleString() + " / " + NV.toLocaleString() + "（网格顶点）";
+  el("sEval").textContent = cpuMode ? "0 次（高度和法线全从属性读）"
+    : "5 × " + verts.toLocaleString() + " ≈ " + Math.round(evals / 1000) + "k 次/帧（高度 1 + 法线 4）";
+  el("sGen").textContent = cpuMode
+    ? "CPU 预计算：" + cpuMs.toFixed(1) + " ms（" + (cpuEvals / 1000).toFixed(0) + "k 次求值，参数一改就重来）"
+    : "GPU 每帧现算；缩略图 CPU 版 " + (previewEvals / 1000).toFixed(0) + "k 次求值";
+  el("sLod").textContent = useLod
+    ? counts.map((c, i) => "L" + i + ":" + c).join("  ") + "（块）"
+    : "单块（不分级）";
+
+  const wn = el("warn");
+  wn.textContent = !useLod
+    ? "单块模式：一次 drawElements 画完 32,768 个三角形，没有 LOD 也没有裂缝 —— 但近处和天边用的是同一份密度，远处的顶点全浪费了。切成「分块 LOD」看它变成 64 次绘制。"
+    : view === 1
+      ? "LOD 分级配色：靠近相机的块（绿）用 16 格，远处的块（紫）只用 2 格。相邻块最多差一级 —— 差两级就没法用「取中点」缝合了。"
+      : !stitch
+        ? "缝合已关：不同级别的块交界处，细块边上的中点比粗块的直边高/低，缝隙能直接看穿。打开「缝合裂缝」看它精确闭合。"
+        : wire
+          ? "线框：能直接数出每块的网格密度差。注意 T 型接点处细块多出来的顶点 —— 缝合做的就是把这些顶点压回粗块那条直边上。"
+          : cpuMode
+            ? "CPU 模式：顶点着色器一次噪声都不算，全从属性读 —— 但高度场要整张重算（" + cpuMs.toFixed(0) + " ms），LOD 省下的顶点一秒也没省到 CPU 头上。"
+            : "GPU 模式：每帧对每个画到的顶点做 5 次噪声求值（高度 1 + 法线 4）。LOD 直接减少顶点数，所以这套流程天生吃 LOD 的收益。";
+}
+const LIGHT = new Float32Array([0.48, 0.75, 0.45]);
+const FOG = new Float32Array([0.62, 0.72, 0.84]);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
